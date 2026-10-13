@@ -255,19 +255,11 @@ async function runBundle(scaffold, { pinned }) {
   let registration = null
   globalThis.window.__ModuleLoader__ = { load: (v) => { registration = v } }
 
-  const rendered = []
-  const modules = {
-    react: { createElement: (t, p, ...c) => ({ t, p, c }), Fragment: Symbol('Fragment') },
-    'react-dom/client': { createRoot: () => ({ render: (n) => rendered.push(n), unmount() {} }) },
-    '@deepseek-ai/dsh-client-ui-primitives': {
-      IconPinFillRegular: 'Pin', IconPinOutlineRegular: 'PinO', Menu: 'Menu',
-      relativeTime: () => ({ unit: 'now', n: 0 }),
-    },
-  }
-
   const source = await readFile(join(here, '..', 'src', 'client.js'), 'utf8')
-  new Function('window', 'document', 'require', 'Element', 'MutationObserver', 'KeyboardEvent', source)(
-    globalThis.window, globalThis.document, (s) => modules[s], El, globalThis.MutationObserver, globalThis.KeyboardEvent,
+  // The bundle requires no module and takes no require parameter, so the
+  // factory is invoked with none — exactly as the shell's loader does it.
+  new Function('window', 'document', 'Element', 'MutationObserver', 'KeyboardEvent', source)(
+    globalThis.window, globalThis.document, El, globalThis.MutationObserver, globalThis.KeyboardEvent,
   )
   assert.ok(registration, 'bundle did not register')
 
@@ -311,7 +303,7 @@ async function runBundle(scaffold, { pinned }) {
   console.info = (...a) => { logs.push(['info', a.join(' ')]) }
   console.warn = (...a) => { logs.push(['warn', a.join(' ')]) }
 
-  registration.factory((s) => modules[s]).apply(ctx)
+  registration.factory().apply(ctx)
 
   // apply must have logged BEFORE the controller exists — that is the whole
   // point: it must not have gone silent.
@@ -324,7 +316,7 @@ async function runBundle(scaffold, { pinned }) {
   await new Promise(r => { setTimeout(r, 150) })
   console.info = realInfo
   console.warn = realWarn
-  return { rendered, listeners, registration, modules, logs, afterApply }
+  return { listeners, registration, logs, afterApply }
 }
 
 /**
@@ -578,20 +570,34 @@ function staticCss(scaffold) {
 // own-menu branch, whose stopPropagation killed the host menu.
 {
   const sc = codexScaffold()
-  const { listeners, rendered } = await runBundle(sc, { pinned: [S1] })
+  const { listeners } = await runBundle(sc, { pinned: [S1] })
 
-  // Walk the rendered region tree for flavor markers.
-  const json = JSON.stringify(rendered, (k, v) => (typeof v === 'function' ? '[fn]' : v))
-  assert.ok(
-    !json.includes('data-row-key'),
-    'region rows must not carry data-row-key: that makes them look like the stock sidebar',
-  )
-  assert.ok(
-    !json.includes('data-dcu-session'),
-    'region rows must not carry data-dcu-session: that makes them look like codex-ui',
-  )
-  assert.ok(json.includes('data-stp-row'), 'region rows are identified by data-stp-row instead')
-  assert.ok(json.includes('data-stp-session'), 'region rows carry their own session id attribute')
+  // Walk the region the plugin actually built. The region is plain DOM now
+  // (the bundle requires no module, so there is no renderer and no virtual
+  // tree to inspect), so the region element itself is the render product.
+  const region = sc.body.querySelector('[data-stp-region]')
+  assert.ok(region !== null, 'region element must be mounted')
+  const rows = region.querySelectorAll('[data-stp-row]')
+  assert.equal(rows.length, 1, 'one pinned session must produce exactly one row')
+
+  for (const row of rows) {
+    assert.equal(
+      row.getAttribute('data-row-key'),
+      null,
+      'region rows must not carry data-row-key: that makes them look like the stock sidebar',
+    )
+    assert.equal(
+      row.getAttribute('data-dcu-session'),
+      null,
+      'region rows must not carry data-dcu-session: that makes them look like codex-ui',
+    )
+    assert.equal(row.getAttribute('data-stp-session'), S1, 'region rows carry their own session id attribute')
+    assert.equal(row.getAttribute('role'), 'treeitem', 'a region row is still a treeitem')
+  }
+  // The title must be real content in the row, not an attribute-only stub.
+  const title = rows[0].querySelector('[data-stp-row-title]')
+  assert.ok(title !== null, 'the row must carry a title element')
+  assert.equal(title.textContent, 'one', 'the title element must hold the session display title')
   console.log('✔ own region rows carry no host flavor marker')
 
   // With the host's own rows gone, detection must be "none", not "official".

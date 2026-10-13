@@ -380,45 +380,49 @@ test('package metadata targets the 0.2.x line and never an upper-bounded 0.2', a
 // @deepseek-ai scope at all), so the row never materialized and the entry sat
 // in FiberState.LOADING forever: "web boot: 1 entry did not activate".
 //
-// The bundle requires only seed-table modules, which `ClientModuleSystem`
-// resolves straight out of `staticModules` with no graph row and no inject
-// edge — so the list must stay empty.
-test('dsh.client declares no inject edges (they would hang the fiber)', async () => {
+// The manifest therefore names exactly ONE row — @deepseek-ai/dsh-client-runtime,
+// the client core every profile already loads — and nothing else. It also used
+// to carry a self-invented `immediately: true`; that field exists in the loader
+// but buys nothing here and pins the row into a prefetch tier the plugin does
+// not need, so it is gone.
+test('dsh.client names only the client-runtime row, and no prefetch tier', async () => {
   const manifest = JSON.parse(await readFile(join(here, '..', 'package.json'), 'utf8'))
   const client = manifest.dsh?.client ?? {}
   assert.equal(client.platform, 'web', 'the browser half needs platform "web"')
-  assert.equal(
-    client.immediately,
-    true,
-    'the row is stage-one prefetched so the plugin is live before the first render',
-  )
   assert.deepEqual(
     client.inject ?? [],
-    [],
+    ['@deepseek-ai/dsh-client-runtime'],
     'every dsh.client.inject entry must resolve as a real package row in the profile; '
     + 'an unresolvable name leaves the entry stuck in LOADING and fails the whole web boot',
+  )
+  assert.equal(
+    client.immediately,
+    undefined,
+    'no self-invented prefetch tier: this plugin does not need to boot before the first render',
   )
   assert.deepEqual(client.external ?? [], [], 'the bundle requests no non-baseline module rows')
 })
 
-test('every bundle require resolves as a platform seed word', async () => {
-  // Mirrors packages/client/web/src/platform.ts PLATFORM_MODULES and the
-  // `this.seed.has(spec)` branch in ClientModuleSystem's require.
-  const seedWords = new Set([
-    'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client', '@deepseek-ai/cordis',
-    '@deepseek-ai/dsh-client-store', '@deepseek-ai/dsh-client-ui-slots',
-    '@deepseek-ai/dsh-client-ui-primitives', '@deepseek-ai/dsh-client-ui-dockkit',
-  ])
+// The desktop shell materializes this factory while the module system is still
+// coming up. A `require` against a word the module table does not hold throws
+// synchronously right there, the entry never reaches its boot-ready promise,
+// and the shell's watchdog drops the whole app into recovery mode — which is
+// exactly how this plugin hung startup. The factory therefore requires NOTHING
+// and takes no require parameter at all.
+test('the client bundle requires no module and takes no require parameter', async () => {
   const source = await readFile(join(here, '..', 'src', 'client.js'), 'utf8')
   const required = [...source.matchAll(/require\(\s*'([^']+)'\s*\)/g)].map(m => m[1])
-  assert.ok(required.length > 0, 'expected the bundle to require something')
-  for (const specifier of required) {
-    assert.ok(
-      seedWords.has(specifier),
-      `${specifier} is neither a platform seed word nor a declared dsh.client.inject row; `
-      + 'a client bundle cannot resolve a bare specifier through the module table',
-    )
-  }
+  assert.deepEqual(
+    required,
+    [],
+    'the bundle must require nothing: a synchronous throw during factory materialization '
+    + 'never settles the entry\'s boot-ready promise and hangs the desktop shell',
+  )
+  assert.match(
+    source,
+    /factory:\s*\(\)\s*=>/,
+    'the factory must be declared with zero parameters — it has no require to receive',
+  )
 })
 
 test('the cordis bundle patch targets this package by name', async () => {
@@ -504,19 +508,26 @@ test('the client bundle is a self-registering factory, not an ES module', async 
   )
 })
 
-test('the client bundle only requires platform-frozen modules', async () => {
+// The bundle builds its whole visible surface with document.createElement and
+// styles it through its own injected <style>, so a stray module table word —
+// or a stray static import — is always a regression, never an accepted input.
+test('the client bundle builds plain DOM, with no renderer and no import', async () => {
   const source = await readFile(join(here, '..', 'src', 'client.js'), 'utf8')
-  const allowed = new Set([
-    'react', 'react-dom', 'react-dom/client', 'react/jsx-runtime',
-    '@deepseek-ai/cordis', '@deepseek-ai/dsh-client-store',
-    '@deepseek-ai/dsh-client-ui-slots', '@deepseek-ai/dsh-client-ui-primitives',
-    '@deepseek-ai/dsh-client-ui-dockkit',
-  ])
-  const required = [...source.matchAll(/require\(\s*'([^']+)'\s*\)/g)].map(m => m[1])
-  assert.ok(required.length > 0, 'expected the bundle to require something')
-  for (const specifier of required) {
-    assert.ok(allowed.has(specifier), `not a platform module: ${specifier}`)
+  for (const forbidden of ['React.createElement', 'createRoot(', 'jsx(']) {
+    assert.ok(
+      !source.includes(forbidden),
+      `${forbidden} is not available: the bundle requires no module, so the pinned region `
+      + 'and the context menu are built as plain DOM nodes',
+    )
   }
+  assert.ok(
+    source.includes('document.createElement('),
+    'the region and menu must be built with createElement',
+  )
+  assert.ok(
+    !/^\s*import\s+.*\s+from\s+/m.test(source),
+    'a client bundle cannot use static import: it would not resolve at all',
+  )
 })
 
 test('the client bundle exports the cordis plugin contract', async () => {

@@ -4,12 +4,15 @@
  * The bundle never runs under node in the real app — the browser's module
  * loader executes the factory. This harness reproduces that path closely
  * enough to catch the failures unit tests cannot see: a factory that throws on
- * materialization, an apply that throws against a stub context, or a React
- * render that blows up on malformed input.
+ * materialization (which is what hung the desktop shell — a bundle that
+ * requires anything throws the moment the loader materializes it), an apply
+ * that throws against a stub context, or a DOM rebuild that blows up on
+ * malformed input.
  *
- * It stubs `window.__ModuleLoader__`, the three platform modules the bundle
- * requires, and the DOM surface the plugin touches, then drives apply →
- * reconcile → pin → unpin.
+ * It stubs `window.__ModuleLoader__` and the DOM surface the plugin touches,
+ * then drives apply → reconcile → pin → unpin. The factory is invoked with NO
+ * require parameter on purpose: the bundle is self-contained, and this harness
+ * binds no `require` at all, so any reach for one is a ReferenceError here.
  *
  * Run: node test/bundle-smoke.mjs
  */
@@ -112,43 +115,6 @@ globalThis.window = {
 globalThis.MutationObserver = class { observe() {} disconnect() {} }
 globalThis.Element = FakeElement
 
-// --------------------------------------------------------------- react stub
-
-/** Records what the plugin renders without a real reconciler. */
-const rendered = []
-const React = {
-  createElement(type, props, ...children) {
-    return { type, props: props ?? {}, children: children.flat() }
-  },
-  Fragment: Symbol('Fragment'),
-  useState: (initial) => [initial, () => {}],
-  useRef: () => ({ current: null }),
-  useEffect: () => {},
-  useMemo: (fn) => fn(),
-  useLayoutEffect: () => {},
-}
-const createRoot = () => ({ render: (node) => rendered.push(node), unmount() {} })
-
-// ---------------------------------------------------------- primitives stub
-
-const primitives = {
-  IconPinFillRegular: 'IconPinFillRegular',
-  IconPinOutlineRegular: 'IconPinOutlineRegular',
-  Menu: 'Menu',
-  relativeTime: (updatedAt, now) => {
-    const delta = Math.max(0, now - updatedAt)
-    if (delta < 60000) return { unit: 'now', n: 0 }
-    if (delta < 3600000) return { unit: 'minute', n: Math.floor(delta / 60000) }
-    return { unit: 'hour', n: Math.floor(delta / 3600000) }
-  },
-}
-
-const platformModules = {
-  react: React,
-  'react-dom/client': { createRoot },
-  '@deepseek-ai/dsh-client-ui-primitives': primitives,
-}
-
 // ------------------------------------------------------------ module loader
 
 let registration = null
@@ -158,15 +124,15 @@ globalThis.window.__ModuleLoader__ = {
 
 const source = await readFile(bundlePath, 'utf8')
 // The browser evaluates this as a classic script; node needs it as one too.
-const run = new Function('window', 'document', 'require', 'Element', 'MutationObserver', source)
-run(globalThis.window, globalThis.document, specifier => {
-  if (!(specifier in platformModules)) throw new Error(`unexpected require: ${specifier}`)
-  return platformModules[specifier]
-}, FakeElement, globalThis.MutationObserver)
+// No `require` parameter is bound: the bundle must be self-contained, and a
+// bundle that reached for one would throw ReferenceError right here.
+const run = new Function('window', 'document', 'Element', 'MutationObserver', source)
+run(globalThis.window, globalThis.document, FakeElement, globalThis.MutationObserver)
 
 assert.ok(registration !== null, 'bundle did not register itself')
 assert.equal(registration.id, 'dsh-session-top', 'bundle id must equal the package name')
-const exportsObject = registration.factory(specifier => platformModules[specifier])
+assert.equal(registration.factory.length, 0, 'the factory must take no require parameter')
+const exportsObject = registration.factory()
 assert.equal(exportsObject.name, 'dsh-session-top')
 assert.deepEqual(exportsObject.inject, [])
 assert.equal(typeof exportsObject.apply, 'function')
@@ -265,8 +231,19 @@ listeners.forEach(fn => fn())
 await new Promise(resolve => setTimeout(resolve, 120))
 console.log('✔ survived a pin set referencing a vanished session')
 
+// The stylesheet is now the plugin's ONLY styling mechanism (there is no
+// renderer and no imported component to carry a class), so proving it is
+// written at all is load-bearing rather than incidental.
+const staticSheet = head.children.find(c => c.getAttribute('data-stp-sheet') === 'static')
+assert.ok(staticSheet !== null, 'the static stylesheet must be injected at mount')
+assert.ok(
+  staticSheet.textContent.includes('[data-stp-region]') && staticSheet.textContent.includes('[data-stp-menu]'),
+  'the static sheet must carry both the region and the menu rules',
+)
+console.log('✔ stylesheets injected through textContent, region and menu both covered')
+
 // Teardown must run cleanly and drop every subscription: a leaked listener
-// would keep reconciling (and keep the React roots alive) after an HMR reload.
+// would keep reconciling (and keep the plugin's DOM alive) after an HMR reload.
 assert.ok(disposers.length > 0, 'expected at least one effect disposer')
 for (const dispose of disposers) {
   if (typeof dispose === 'function') dispose()

@@ -93,6 +93,25 @@ function safeLogger(ctx) {
 }
 
 /**
+ * Resolve an optional service without ever letting the lookup throw.
+ *
+ * A cordis Context is a Proxy: an undeclared property read raises, so every
+ * optional service goes through `ctx.get`, which walks the fiber chain and
+ * returns `undefined` instead. This wraps even that, because a retried lookup
+ * runs from a timer where a throw would become an unhandled rejection.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - host context.
+ * @param {string} name - the service name.
+ * @returns {unknown} the service, or undefined when this host has none.
+ */
+function safeService(ctx, name) {
+  try {
+    return ctx.get(name)
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Resolve the plugin's home directory. `$DSH_HOME` when the launcher set it
  * (the documented override), otherwise `~/.dsh`, matching the host's own
  * `dsh-home-paths` default.
@@ -301,15 +320,21 @@ function applyImpl(ctx, config = {}) {
   /**
    * Seed cold-session fallback times from persistence so a session that has
    * never run in this process still ranks by its birth rather than sinking.
+   *
+   * `sessionPersistence.list()` resolves to `SessionHeader[]` — the headers
+   * THEMSELVES, not records wrapping a header (that is `listSnapshots()`).
+   * And a header's `createdAt` is epoch milliseconds as a NUMBER, so it is
+   * read as a number rather than parsed from a date string.
    * @returns {Promise<boolean>} whether persistence was reachable.
    */
   const seedOnce = async () => {
     const persistence = ctx.get('sessionPersistence')
     if (persistence === undefined) return false
-    for (const snapshot of await persistence.list()) {
-      const id = snapshot?.header?.id
-      const created = Date.parse(snapshot?.header?.createdAt ?? '')
-      if (id !== undefined && Number.isFinite(created)) fallbackTimes.set(String(id), created)
+    for (const header of await persistence.list()) {
+      const id = header?.id
+      const created = header?.createdAt
+      if (id === undefined || typeof created !== 'number' || !Number.isFinite(created)) continue
+      fallbackTimes.set(String(id), created)
     }
     return true
   }
@@ -496,62 +521,83 @@ function applyImpl(ctx, config = {}) {
 
   // Diagnostics are strictly optional: a host with no web server (headless,
   // acp) simply has no routes and the plugin is otherwise unaffected.
-  try {
-    const webServer = ctx.get('webServer')
-    if (webServer !== undefined && typeof webServer.register === 'function') {
-      ctx.effect(() => {
-        const routes = [
-          {
-            kind: 'exact',
-            path: '/api/dsh-session-top/status',
-            handler: async (req, res) => {
-              if (!isLoopbackRequest(req)) {
-                res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' })
-                res.end(JSON.stringify({ error: 'forbidden: loopback-only' }))
-                return
-              }
-              if ((req.method ?? 'GET') !== 'GET') {
-                res.writeHead(405, { 'content-type': 'application/json; charset=utf-8' })
-                res.end(JSON.stringify({ error: `method not allowed: ${req.method}` }))
-                return
-              }
-              res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'referrer-policy': 'no-referrer' })
-              res.end(JSON.stringify(getStatus()))
-            },
-          },
-          {
-            kind: 'exact',
-            path: '/api/dsh-session-top/resync',
-            handler: async (req, res) => {
-              if (!isLoopbackRequest(req)) {
-                res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' })
-                res.end(JSON.stringify({ error: 'forbidden: loopback-only' }))
-                return
-              }
-              if ((req.method ?? 'GET') !== 'POST') {
-                res.writeHead(405, { 'content-type': 'application/json; charset=utf-8' })
-                res.end(JSON.stringify({ error: `method not allowed: ${req.method}` }))
-                return
-              }
-              res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'referrer-policy': 'no-referrer' })
-              res.end(JSON.stringify({ ok: true, ...(await resync()) }))
-            },
-          },
-        ]
-        const registered = routes.map(route => webServer.register(route))
-        return () => {
-          for (const dispose of registered.splice(0)) {
-            try {
-              dispose()
-            } catch (error) {
-              console.error('[dsh-session-top] route dispose failed:', error)
+  const registerDiagnosticsRoutes = (webServer) => {
+    if (webServer === undefined || typeof webServer.register !== 'function') return false
+    ctx.effect(() => {
+      const routes = [
+        {
+          kind: 'exact',
+          path: '/api/dsh-session-top/status',
+          handler: async (req, res) => {
+            if (!isLoopbackRequest(req)) {
+              res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify({ error: 'forbidden: loopback-only' }))
+              return
             }
+            if ((req.method ?? 'GET') !== 'GET') {
+              res.writeHead(405, { 'content-type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify({ error: `method not allowed: ${req.method}` }))
+              return
+            }
+            res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'referrer-policy': 'no-referrer' })
+            res.end(JSON.stringify(getStatus()))
+          },
+        },
+        {
+          kind: 'exact',
+          path: '/api/dsh-session-top/resync',
+          handler: async (req, res) => {
+            if (!isLoopbackRequest(req)) {
+              res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify({ error: 'forbidden: loopback-only' }))
+              return
+            }
+            if ((req.method ?? 'GET') !== 'POST') {
+              res.writeHead(405, { 'content-type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify({ error: `method not allowed: ${req.method}` }))
+              return
+            }
+            res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'referrer-policy': 'no-referrer' })
+            res.end(JSON.stringify({ ok: true, ...(await resync()) }))
+          },
+        },
+      ]
+      const registered = routes.map(route => webServer.register(route))
+      return () => {
+        for (const dispose of registered.splice(0)) {
+          try {
+            dispose()
+          } catch (error) {
+            console.error('[dsh-session-top] route dispose failed:', error)
           }
         }
-      }, 'dsh-session-top: diagnostics routes')
+      }
+    }, 'dsh-session-top: diagnostics routes')
+    return true
+  }
+
+  if (!registerDiagnosticsRoutes(safeService(ctx, 'webServer'))) {
+    // The host publishes `webServer` asynchronously, and a plugin activated by
+    // an early bundle row can easily run BEFORE the web server exists — in
+    // which case a single apply-time probe loses the diagnostics for the whole
+    // process. Retry twice, gently; the first success stops the sequence.
+    //
+    // Still entirely invisible to a host that has no web server: two timers that
+    // resolve nothing and are cleared on dispose, no listener, no log line.
+    try {
+      ctx.effect(() => {
+        let done = false
+        const timers = [5000, 15000].map(delay => setTimeout(() => {
+          if (done) return
+          if (registerDiagnosticsRoutes(safeService(ctx, 'webServer'))) done = true
+        }, delay))
+        return () => {
+          for (const timer of timers) clearTimeout(timer)
+        }
+      }, 'dsh-session-top: diagnostics route registration retry')
+    } catch (error) {
+      // A web server that rejects route registration costs diagnostics only.
+      logger.warn?.(`dsh-session-top: diagnostics routes unavailable: ${String(error)}`)
     }
-  } catch (error) {
-    // A web server that rejects route registration costs diagnostics only.
-    logger.warn?.(`dsh-session-top: diagnostics routes unavailable: ${String(error)}`)
   }
 }

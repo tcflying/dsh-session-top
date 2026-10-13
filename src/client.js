@@ -3,11 +3,22 @@
  *
  * This file IS the shipped client bundle: the DSH client module system expects
  * `exports["./client"]` to be a self-registering closure factory
- * (`window.__ModuleLoader__.load({id, factory})`), where `require` resolves
- * only platform-frozen modules (react, react-dom, ui-primitives, ui-slots).
- * It is hand-authored in that format rather than produced by a bundler, so it
- * has no build step: `require` calls are the only externals and every one of
- * them is on the platform module table.
+ * (`window.__ModuleLoader__.load({id, factory})`). It is hand-authored in that
+ * format rather than produced by a bundler, so it has no build step.
+ *
+ * SELF-CONTAINED BY CONTRACT. The factory takes NO `require` parameter and
+ * calls no module loader of any kind: every module it once required off the
+ * platform table (react, react-dom/client,
+ * @deepseek-ai/dsh-client-ui-primitives) is gone, and the whole visible
+ * surface is now plain DOM + CSS injection. The desktop shell materializes
+ * this factory while the module system is still coming up; a factory whose
+ * body throws synchronously there leaves the entry short of its boot-ready
+ * promise, and the shell's 60-second watchdog then drops it into recovery
+ * mode. A require against a table that does not hold the word is exactly such
+ * a synchronous throw, so requiring nothing is what keeps the boot green. The
+ * pinned region, the row affordances and the context menu are therefore built
+ * with `document.createElement` / `appendChild` and styled through the
+ * stylesheet this file injects.
  *
  * What it does, against the five acceptance points:
  *
@@ -15,10 +26,10 @@
  *     through `insertSessionBefore`, so a session with new activity is above
  *     its inactive neighbours in BOTH the sidebar's "recent" and "manual"
  *     order modes. Here we only keep the flat pinned region in pin order.
- *  2. Right-click to pin — a delegated `contextmenu` listener opens the
- *     official `Menu` primitive at the cursor, offering Pin / Unpin. The
- *     native menu is suppressed on session rows only; everywhere else the app's
- *     own context menu is untouched.
+ *  2. Right-click to pin — a delegated `contextmenu` listener opens a
+ *     plugin-owned Pin / Unpin menu at the cursor. The native menu is
+ *     suppressed on session rows only; everywhere else the app's own context
+ *     menu is untouched.
  *  3. Pin extracts from the group — a pinned session's official row is hidden
  *     (by stylesheet rule, so React re-renders cannot undo it) and re-rendered
  *     in a flat "Pinned" region above the workspace groups. Its workspace group
@@ -31,10 +42,11 @@
  *     / `unpinSession` RPCs. Nothing here keeps a private copy, so the state
  *     survives restarts with no plugin-owned persistence to drift.
  *
- * Degradation contract: every DOM touch is guarded. If the official sidebar
- * renames `data-row-key`, drops `[role="tree"]`, or changes its layout, the
- * plugin finds nothing and no-ops — the sidebar keeps rendering exactly as it
- * does without the plugin.
+ * Degradation contract: every DOM touch is guarded, and the whole init runs
+ * inside a try/catch that downgrades to a console warning. If the official
+ * sidebar renames `data-row-key`, drops `[role="tree"]`, or changes its
+ * layout, the plugin finds nothing and no-ops — the sidebar keeps rendering
+ * exactly as it does without the plugin.
  *
  * On slots: this plugin registers NO slot entry on purpose. The official
  * sidebar already ships a Pin row in `sidebar.workspaces.session.menu.item`
@@ -49,12 +61,8 @@
  */
 window.__ModuleLoader__.load({
   id: 'dsh-session-top',
-  factory: (require) => {
+  factory: () => {
     'use strict'
-
-    const React = require('react')
-    const { createRoot } = require('react-dom/client')
-    const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
 
     const {
       SESSION_ROW_PREFIX, ROW_KEY_ATTR, WORKSPACE_ROW_PREFIX,
@@ -112,6 +120,7 @@ window.__ModuleLoader__.load({
         secondary: '--dcu-sidebar-secondary',
         tertiary: '--dcu-sidebar-tertiary',
         border: '--dcu-sidebar-border',
+        background: '--dcu-sidebar-background',
         font: '--dsw-font-family',
       },
     }
@@ -137,6 +146,10 @@ window.__ModuleLoader__.load({
         secondary: '--dsh-sidebar-secondary',
         tertiary: '--dsh-sidebar-tertiary',
         border: '--dsh-sidebar-border',
+        // The stock sidebar exposes no surface token of its own; the CSS
+        // `Canvas` fallback (which tracks the OS light/dark scheme) is correct
+        // there, so this indirection stays unresolved and never fires.
+        background: undefined,
         font: '--dsh-font-family',
       },
     }
@@ -208,13 +221,16 @@ window.__ModuleLoader__.load({
      *    whose factories must arrive before this bundle materializes. A name
      *    that does not resolve as a real package leaves the entry in
      *    FiberState.LOADING — the "web boot: 1 entry did not activate" failure
-     *    this file's sibling test guards against. In the desktop profile the
-     *    `@deepseek-ai` scope is not a profile dependency at all, so listing
-     *    e.g. `@deepseek-ai/dsh-client-ui-sidebar` there can never resolve.
+     *    this file's sibling test guards against. Only
+     *    `@deepseek-ai/dsh-client-runtime` is named there, because that row is
+     *    the client core every profile already loads; naming a UI package
+     *    instead (the stock ui-sidebar, ui-workspace) can never resolve in the
+     *    desktop profile, whose @deepseek-ai scope is not a profile
+     *    dependency at all.
      *
      * Every service this plugin uses (`workspaces`, `sessions`, `uiWorkspace`,
      * `locale`) is therefore read defensively at apply time and null-checked,
-     * and the bundle requires only seed-table modules that need no graph row.
+     * and the bundle requires NO module whatsoever.
      */
     const inject = []
 
@@ -279,6 +295,17 @@ window.__ModuleLoader__.load({
   outline: none;
 }
 [data-stp-anchor] { position: fixed; left: -9999px; top: -9999px; width: 0; height: 0; pointer-events: none; }
+[data-stp-menu] {
+  position: fixed; z-index: 2147483000;
+  min-width: 148px; max-width: 260px; padding: 4px;
+  border: 1px solid var(--stp-token-border, rgba(127,127,127,.32));
+  border-radius: 8px; box-sizing: border-box;
+  background: var(--stp-token-bg, Canvas);
+  color: var(--stp-token-primary, inherit);
+  box-shadow: 0 8px 24px rgba(0,0,0,.24);
+  font: 400 13px/20px var(--stp-token-font, inherit);
+  pointer-events: auto;
+}
 `
 
     /**
@@ -339,7 +366,7 @@ window.__ModuleLoader__.load({
        * the stylesheet's own fallbacks apply.
        * @param {object | null} flavor - the detected sidebar, or null.
        */
-    const TOKEN_PROPS = ['Hover', 'Primary', 'Secondary', 'Tertiary', 'Border', 'Font']
+    const TOKEN_PROPS = ['Hover', 'Primary', 'Secondary', 'Tertiary', 'Border', 'Font', 'Background']
 
     function applyStpTokens(flavor) {
       if (typeof document === 'undefined') return
@@ -391,9 +418,9 @@ window.__ModuleLoader__.load({
     /**
      * Entry point. Deliberately does almost nothing itself.
      *
-     * This bundle is prefetched in the bootstrap stage (`immediately: true`),
-     * so its fiber can activate BEFORE the Workspace controller has published
-     * its `workspaces` service. A previous revision read that service at apply
+     * This bundle activates in the same batch as every other plugin row, so
+     * its fiber can start BEFORE the Workspace controller has published its
+     * `workspaces` service. A previous revision read that service at apply
      * time and returned early when it was absent — which left the plugin
      * permanently silent: no region, no menu graft, and (because the early
      * return also skipped the log) not even a warning on the machine.
@@ -420,39 +447,48 @@ window.__ModuleLoader__.load({
         try { ctx.get('logger')?.warn?.(`${tag} ${message}`) } catch { /* best effort */ }
       }
 
-      if (typeof document === 'undefined') {
-        warn('no document: nothing to attach to, staying inert')
-        return
-      }
-
-      let mounted = false
-      info('activated; waiting for the workspaces controller service')
-
-      // The dependency that actually gates everything is the workspace
-      // controller: it owns both the durable pin set this plugin renders and the
-      // pin/unpin RPCs it writes.
-      ctx.inject(['workspaces'], (child) => {
-        if (mounted) return
-        mounted = true
-        try {
-          const summary = mount(child, warn)
-          info(`active (${summary})`)
-        } catch (error) {
-          warn(`mount failed, staying inert: ${String(error)}`)
+      // Everything below is DOM and service work against surfaces this plugin
+      // does not own. The degradation contract is total: an init failure warns
+      // once and the plugin stays inert, which is indistinguishable from "not
+      // installed" to the user — and, critically, never throws back into
+      // cordis, which would strand this fiber in LOADING and fail the web boot.
+      try {
+        if (typeof document === 'undefined') {
+          warn('no document: nothing to attach to, staying inert')
+          return
         }
-      })
 
-      // A silent plugin is the failure mode this whole revision exists to
-      // eliminate, so say so loudly if the controller never shows up. Bounded:
-      // one warning, not a poll loop.
-      ctx.effect(() => {
-        const timer = setTimeout(() => {
-          if (!mounted) {
-            warn('workspace controller still unpublished after 20s; the pinned region and right-click pin will not appear')
+        let mounted = false
+        info('activated; waiting for the workspaces controller service')
+
+        // The dependency that actually gates everything is the workspace
+        // controller: it owns both the durable pin set this plugin renders and the
+        // pin/unpin RPCs it writes.
+        ctx.inject(['workspaces'], (child) => {
+          if (mounted) return
+          mounted = true
+          try {
+            const summary = mount(child, warn)
+            info(`active (${summary})`)
+          } catch (error) {
+            warn(`mount failed, staying inert: ${String(error)}`)
           }
-        }, SERVICE_WAIT_TIMEOUT_MS)
-        return () => { clearTimeout(timer) }
-      }, 'dsh-session-top: service wait diagnostic')
+        })
+
+        // A silent plugin is the failure mode this whole revision exists to
+        // eliminate, so say so loudly if the controller never shows up. Bounded:
+        // one warning, not a poll loop.
+        ctx.effect(() => {
+          const timer = setTimeout(() => {
+            if (!mounted) {
+              warn('workspace controller still unpublished after 20s; the pinned region and right-click pin will not appear')
+            }
+          }, SERVICE_WAIT_TIMEOUT_MS)
+          return () => { clearTimeout(timer) }
+        }, 'dsh-session-top: service wait diagnostic')
+      } catch (error) {
+        warn(`init failed, staying inert: ${describeError(error)}`)
+      }
     }
 
     /** How long before an unpublished `workspaces` service is reported. */
@@ -647,29 +683,50 @@ window.__ModuleLoader__.load({
       }
 
       let regionEl = null
-      let regionRoot = null
       let anchorEl = null
-      let anchorRoot = null
 
       /** Create (once) the region and context-menu hosts, both plugin-owned. */
       const ensureHosts = () => {
         if (regionEl === null) {
           regionEl = document.createElement('div')
           regionEl.setAttribute('data-stp-region', '')
-          regionRoot = createRoot(regionEl)
         }
         if (anchorEl === null) {
           anchorEl = document.createElement('div')
           anchorEl.setAttribute('data-stp-anchor', '')
           anchorEl.setAttribute('aria-hidden', 'true')
-          anchorRoot = createRoot(anchorEl)
           document.body.appendChild(anchorEl)
         }
       }
 
-      /** Detach the region element from the sidebar, leaving its React root alive. */
+      /**
+       * Detach the region element from the sidebar, leaving its content intact
+       * so the next reconcile can re-attach it without rebuilding.
+       */
       const detachRegion = () => {
         if (regionEl !== null && regionEl.isConnected) regionEl.remove()
+      }
+
+      /**
+       * Empty a container the plugin owns.
+       *
+       * The plugin's own DOM only: nothing inside these hosts is rendered by
+       * React, so a wholesale rebuild can never disturb a host-owned node.
+       *
+       * Walks a SNAPSHOT of `children` (it is a live collection in a real
+       * document, and removing while iterating it skips nodes) and removes each
+       * child with the node's own `remove()`, which every DOM — including the
+       * minimal fakes these paths are exercised against — provides.
+       *
+       * @param {Element | null} el - the container to clear.
+       */
+      const clearChildren = (el) => {
+        if (el === null || el === undefined) return
+        try {
+          for (const child of [...el.children]) child.remove()
+        } catch (error) {
+          warn(`could not clear a plugin host: ${describeError(error)}`)
+        }
       }
 
       // ------------------------------------------------------------- render
@@ -686,22 +743,26 @@ window.__ModuleLoader__.load({
 
       const PINNED_LABEL = () => translate('region.pinned', '已置顶')
 
-/**
-       * Compact relative time, matching the official rows' format through the
-       * shared `relativeTime` primitive. Falls back to an empty string when the
-       * timestamp is unknown rather than printing an invalid date.
+/** Decorative pin glyphs, standing in for the ui-primitives icons. */
+      const PIN_GLYPH_FILLED = '\u{1F4CC}'
+      const PIN_GLYPH_OUTLINE = '\u{1F4CD}'
+
+      /**
+       * Compact relative time, in the same `{unit, n}` shape the official rows
+       * use, computed locally because the bundle requires no module. Falls back
+       * to an empty string when the timestamp is unknown rather than printing
+       * an invalid date.
        * @param {unknown} updatedAt - epoch ms.
        * @returns {string} the compact label, possibly empty.
        */
       const timeLabel = (updatedAt) => {
         if (typeof updatedAt !== 'number' || !Number.isFinite(updatedAt)) return ''
         try {
-          const relative = primitives.relativeTime(updatedAt, Date.now())
-          if (relative === null || relative === undefined) return ''
-          if (relative.unit === 'now') return translate('time.now', '刚刚')
-          const count = relative.n
-          if (typeof count !== 'number') return ''
-          return `${count}${unitSuffix(relative.unit)}`
+          const delta = Math.max(0, Date.now() - updatedAt)
+          if (delta < 60_000) return translate('time.now', '刚刚')
+          const unit = delta < 3_600_000 ? 'minute' : delta < 86_400_000 ? 'hour' : 'day'
+          const divisor = unit === 'minute' ? 60_000 : unit === 'hour' ? 3_600_000 : 86_400_000
+          return `${Math.floor(delta / divisor)}${unitSuffix(unit)}`
         } catch {
           return ''
         }
@@ -717,86 +778,107 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /**
+       * Build one plugin-owned row node.
+       *
+       * Deliberately carries NO flavor marker. A `data-row-key="session:…"` or
+       * `data-dcu-session` attribute here would make these rows detectable as a
+       * host sidebar, and `detectFlavor` would then pick the WRONG flavor
+       * whenever the host's own rows were not mounted (all groups folded,
+       * search view, mid-render) — sending right-clicks down the own-menu
+       * branch, where stopPropagation kills the host's menu. Own rows are
+       * matched by `data-stp-row`.
+       *
+       * @param {string} id - the session id.
+       * @param {object | undefined} summary - the session summary, if loaded.
+       * @param {boolean} selected - whether this is the retained session.
+       * @returns {Element} the row element.
+       */
       const makeRow = (id, summary, selected) => {
         const title = typeof summary?.displayTitle === 'string' && summary.displayTitle.length > 0
           ? summary.displayTitle
           : id
         const time = timeLabel(summary?.updatedAt)
-        return React.createElement(
-          'div',
-          {
-            key: id,
-            // Deliberately carries NO flavor marker. A `data-row-key="session:…"`
-            // or `data-dcu-session` attribute here would make these rows
-            // detectable as a host sidebar, and `detectFlavor` would then pick
-            // the WRONG flavor whenever the host's own rows were not mounted
-            // (all groups folded, search view, mid-render) — sending
-            // right-clicks down the own-menu branch, where stopPropagation
-            // kills the host's menu. Own rows are matched by `data-stp-row`.
-            'data-stp-row': '',
-            'data-stp-session': id,
-            role: 'treeitem',
-            tabIndex: 0,
-            'aria-selected': selected ? 'true' : undefined,
-            onClick: (event) => {
-              event.stopPropagation()
-              openSession(id)
-            },
-            onKeyDown: (event) => {
-              if (event.key !== 'Enter' && event.key !== ' ') return
-              event.preventDefault()
-              event.stopPropagation()
-              openSession(id)
-            },
-          },
-          React.createElement(
-            'span',
-            { 'data-stp-row-slot': '', 'aria-hidden': 'true' },
-            React.createElement(primitives.IconPinFillRegular, { size: 13 }),
-          ),
-          React.createElement('span', { 'data-stp-row-title': '', title }, title),
-          time.length > 0
-            ? React.createElement('span', { 'data-stp-row-time': '', 'aria-hidden': 'true' }, time)
-            : null,
-        )
+
+        const row = document.createElement('div')
+        row.setAttribute('data-stp-row', '')
+        row.setAttribute('data-stp-session', id)
+        row.setAttribute('role', 'treeitem')
+        row.setAttribute('tabindex', '0')
+        if (selected) row.setAttribute('aria-selected', 'true')
+        row.addEventListener('click', (event) => {
+          event.stopPropagation()
+          openSession(id)
+        })
+        row.addEventListener('keydown', (event) => {
+          if (event.key !== 'Enter' && event.key !== ' ') return
+          event.preventDefault()
+          event.stopPropagation()
+          openSession(id)
+        })
+
+        const slot = document.createElement('span')
+        slot.setAttribute('data-stp-row-slot', '')
+        slot.setAttribute('aria-hidden', 'true')
+        slot.textContent = PIN_GLYPH_FILLED
+        row.appendChild(slot)
+
+        const label = document.createElement('span')
+        label.setAttribute('data-stp-row-title', '')
+        label.setAttribute('title', title)
+        label.textContent = title
+        row.appendChild(label)
+
+        if (time.length > 0) {
+          const cell = document.createElement('span')
+          cell.setAttribute('data-stp-row-time', '')
+          cell.setAttribute('aria-hidden', 'true')
+          cell.textContent = time
+          row.appendChild(cell)
+        }
+        return row
       }
 
-      /** Render the pinned region for the current pin set. */
+      /**
+       * Render the pinned region for the current pin set.
+       *
+       * Wholesale rebuild rather than a diff: the region holds at most a handful
+       * of rows, it is entirely plugin-owned, and nothing else ever writes into
+       * it. A diff would only buy a micro-optimization at the cost of state the
+       * rows do not carry.
+       */
       const renderRegion = () => {
-        if (regionRoot === null) return
+        if (regionEl === null) return
         const pinned = [...pinSet()]
+        clearChildren(regionEl)
         if (pinned.length === 0) {
-          regionRoot.render(null)
           detachRegion()
           return
         }
         const byId = sessionById()
         const current = currentSessionId()
-        const rows = []
+
+        const header = document.createElement('div')
+        header.setAttribute('data-stp-region-header', '')
+        header.setAttribute('aria-hidden', 'true')
+        const headIcon = document.createElement('span')
+        headIcon.textContent = PIN_GLYPH_FILLED
+        const headLabel = document.createElement('span')
+        headLabel.textContent = PINNED_LABEL()
+        const headCount = document.createElement('span')
+        headCount.setAttribute('data-stp-region-count', '')
+        headCount.textContent = String(pinned.length)
+        header.appendChild(headIcon)
+        header.appendChild(headLabel)
+        header.appendChild(headCount)
+        regionEl.appendChild(header)
+
         for (const id of pinned) {
           const summary = byId[id]
           // A pinned id whose session has not loaded yet still gets a row so
           // the region does not flicker between renders.
-          rows.push(makeRow(id, summary, id === current))
+          regionEl.appendChild(makeRow(id, summary, id === current))
         }
-        regionRoot.render(
-          React.createElement(
-            React.Fragment,
-            null,
-            React.createElement(
-              'div',
-              { 'data-stp-region-header': '', 'aria-hidden': 'true' },
-              React.createElement(
-                'span',
-                null,
-                React.createElement(primitives.IconPinFillRegular, { size: 12 }),
-              ),
-              React.createElement('span', null, PINNED_LABEL()),
-              React.createElement('span', { 'data-stp-region-count': '' }, String(pinned.length)),
-            ),
-            ...rows,
-          ),
-        )
       }
 
       // ------------------------------------------------- group fold / unfold
@@ -912,7 +994,7 @@ window.__ModuleLoader__.load({
             // No recognized sidebar: collapse the plugin's contribution and
             // forget every cached header, so a sidebar swap starts clean.
             detachRegion()
-            if (regionRoot !== null) regionRoot.render(null)
+            clearChildren(regionEl)
             applyPinRules(dynamicSheet, null, [])
             headCache.clear()
             foldSignature.clear()
@@ -922,7 +1004,7 @@ window.__ModuleLoader__.load({
           ensureHosts()
           applyPinRules(dynamicSheet, flavor, pinned)
           renderRegion()
-          if (pinned.length > 0 && regionRoot !== null && regionEl.parentElement !== host) {
+          if (pinned.length > 0 && regionEl !== null && regionEl.parentElement !== host) {
             host.insertBefore(regionEl, host.firstChild)
           } else if (pinned.length === 0) {
             detachRegion()
@@ -981,55 +1063,74 @@ window.__ModuleLoader__.load({
       let augmentTimer = null
 
       const closeMenu = () => {
-        if (anchorRoot !== null) anchorRoot.render(null)
+        clearChildren(anchorEl)
         menuState = null
       }
 
       /**
        * Open the Pin/Unpin menu at the pointer.
+       *
+       * A plugin-owned fixed-position surface inside the anchor host, built the
+       * same way the region is: the ui-primitives `Menu` cannot be required (the
+       * bundle requires nothing), and a plain node keeps the menu entirely
+       * outside the host's React tree, so no host render can clobber it.
+       *
        * @param {string} sessionId - the right-clicked session.
        * @param {number} x - viewport x.
        * @param {number} y - viewport y.
        */
       const openMenu = (sessionId, x, y) => {
-        if (anchorRoot === null) return
+        if (anchorEl === null) return
         const pinned = pinSet().has(sessionId)
-        const rect = {
-          x, y, left: x, top: y, right: x, bottom: y,
-          width: 0, height: 0,
-          toJSON() { return this },
-        }
+        closeMenu()
         menuState = { sessionId, pinned }
-        anchorRoot.render(
-          React.createElement(
-            primitives.Menu,
-            {
-              open: true,
-              portal: true,
-              autoFocus: true,
-              onClose: closeMenu,
-              getAnchorRect: () => rect,
-              anchor: React.createElement('span', { 'data-stp-anchor': '' }),
-              items: [
-                {
-                  id: 'toggle-pin',
-                  label: pinned
-                    ? translate('menu.unpin', '取消置顶')
-                    : translate('menu.pin', '置顶该会话'),
-                  icon: React.createElement(
-                    pinned ? primitives.IconPinFillRegular : primitives.IconPinOutlineRegular,
-                    null,
-                  ),
-                },
-              ],
-              onSelect: (id) => {
-                if (id !== 'toggle-pin') return
-                closeMenu()
-                void togglePin(sessionId, !pinned)
-              },
-            },
-          ),
-        )
+
+        const surface = document.createElement('div')
+        surface.setAttribute('data-stp-menu', '')
+        surface.setAttribute('role', 'menu')
+
+        const item = document.createElement('button')
+        item.type = 'button'
+        item.setAttribute('role', 'menuitem')
+        item.setAttribute('data-stp-pin-item', '')
+        item.textContent = (pinned ? PIN_GLYPH_OUTLINE : PIN_GLYPH_FILLED)
+          + (pinned ? translate('menu.unpin', '取消置顶') : translate('menu.pin', '置顶该会话'))
+        item.addEventListener('click', (event) => {
+          event.preventDefault()
+          event.stopPropagation()
+          closeMenu()
+          void togglePin(sessionId, !pinned)
+        })
+
+        surface.appendChild(item)
+        anchorEl.appendChild(surface)
+        positionMenu(surface, x, y)
+        try {
+          item.focus?.()
+        } catch { /* focusing is a nicety, not a contract */ }
+      }
+
+      /**
+       * Place the menu at the pointer, nudged back inside the viewport so a
+       * right-click near an edge cannot open it off-screen.
+       *
+       * @param {Element} surface - the menu surface element.
+       * @param {number} x - viewport x.
+       * @param {number} y - viewport y.
+       */
+      const positionMenu = (surface, x, y) => {
+        try {
+          const style = surface.style
+          if (style === undefined || style === null) return
+          const width = surface.offsetWidth ?? 0
+          const height = surface.offsetHeight ?? 0
+          const maxX = Math.max(0, (globalThis.innerWidth ?? width) - width - 4)
+          const maxY = Math.max(0, (globalThis.innerHeight ?? height) - height - 4)
+          style.setProperty('left', `${Math.max(0, Math.min(x, maxX))}px`)
+          style.setProperty('top', `${Math.max(0, Math.min(y, maxY))}px`)
+        } catch (error) {
+          warn(`could not place the menu: ${describeError(error)}`)
+        }
       }
 
       /**
@@ -1277,15 +1378,13 @@ window.__ModuleLoader__.load({
             augmentTimer = null
           }
           try {
-            regionRoot?.render(null)
-            anchorRoot?.render(null)
-          } catch { /* the roots are already gone with the document */ }
+            clearChildren(regionEl)
+            clearChildren(anchorEl)
+          } catch { /* the hosts are already gone with the document */ }
           detachRegion()
           if (anchorEl?.isConnected === true) anchorEl.remove()
           regionEl = null
-          regionRoot = null
           anchorEl = null
-          anchorRoot = null
         }
       }, 'dsh-session-top: pinned region and row context menu')
 

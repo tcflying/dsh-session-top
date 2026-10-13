@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-top",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "ZCode-style session list for the DeepSeek Harness sidebar: sessions float to the top of their list on any activity, a right-click session row offers Pin/Unpin, pinned sessions leave their workspace group for a flat 'Pinned' region at the top of the sidebar, and the pin state survives restarts. Dual-face (host + client) dsh plugin, zero core changes.",
   "type": "module",
   "main": "./src/index.js",
@@ -30,7 +30,9 @@
     },
     "client": {
       "platform": "web",
-      "immediately": true
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ]
     }
   },
   "peerDependencies": {

@@ -6,24 +6,49 @@
  * factory, the loader materializes it, and the resulting fiber never leaves
  * FiberState.LOADING — reported as "web boot: 1 entry did not activate".
  *
- * This test runs our factory's real return value through the REAL cordis
- * (vendor/cordis, the same version the desktop profile resolves) and asserts
- * the fiber reaches ACTIVE. It is the closest thing to a boot rehearsal that
- * does not need a browser.
+ * This test runs our factory's real return value through the REAL cordis (the
+ * same build the desktop profile resolves) and asserts the fiber reaches
+ * ACTIVE. It is the closest thing to a boot rehearsal that does not need a
+ * browser.
  *
  * Run: node test/cordis-activation.mjs
  */
 import assert from 'node:assert/strict'
+import { existsSync, readFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const CORDIS = pathToFileURL(
-  join(here, '..', '..', '..', 'deepseek-harness', 'vendor', 'cordis', 'lib', 'index.js'),
-).href
 
-const { Context } = await import(CORDIS)
+/**
+ * Resolve the real cordis to activate against.
+ *
+ * Candidates are tried in order and the first one that exists wins. The test
+ * must run against the SAME cordis the desktop shell resolves, which is the
+ * published `@deepseek-ai/cordis` in the active profile — not a vendored
+ * checkout of the harness that happened to write this file first.
+ */
+const CORDIS_CANDIDATES = [
+  join(here, '..', 'vendor', 'cordis', 'lib', 'index.js'),
+  join(here, '..', '..', '..', 'deepseek-harness', 'vendor', 'cordis', 'lib', 'index.js'),
+  join(
+    process.env.DSH_HOME ?? join(homedir(), '.dsh'),
+    'profiles', 'desktop', 'node_modules', '@deepseek-ai', 'cordis', 'lib', 'index.js',
+  ),
+]
+
+const cordisPath = CORDIS_CANDIDATES.find(candidate => existsSync(candidate))
+if (cordisPath === undefined) {
+  throw new Error(
+    `cordis-activation: no cordis found. Looked in:\n  ${CORDIS_CANDIDATES.join('\n  ')}`,
+  )
+}
+
+const { Context } = await import(pathToFileURL(cordisPath).href)
+/** The cordis build this run actually activated against. */
+const CORDIS_VERSION = JSON.parse(readFileSync(join(dirname(cordisPath), '..', 'package.json'), 'utf8')).version
 
 // ------------------------------------------------------------------ DOM stub
 
@@ -94,32 +119,17 @@ globalThis.window = { addEventListener: () => {}, removeEventListener: () => {} 
 globalThis.MutationObserver = class { observe() {} disconnect() {} }
 globalThis.Element = FakeElement
 
-// ------------------------------------------------------------ react + modules
-
-const rendered = []
-const React = { createElement: (t, p, ...c) => ({ t, p, c }), Fragment: Symbol('Fragment') }
-const platformModules = {
-  react: React,
-  'react-dom/client': { createRoot: () => ({ render: (n) => rendered.push(n), unmount() {} }) },
-  '@deepseek-ai/dsh-client-ui-primitives': {
-    IconPinFillRegular: 'IconPinFillRegular',
-    IconPinOutlineRegular: 'IconPinOutlineRegular',
-    Menu: 'Menu',
-    relativeTime: () => ({ unit: 'now', n: 0 }),
-  },
-}
-
 let registration = null
 globalThis.window.__ModuleLoader__ = { load: (v) => { registration = v } }
 
 const source = await readFile(join(here, '..', 'src', 'client.js'), 'utf8')
-new Function('window', 'document', 'require', 'Element', 'MutationObserver', source)(
+// No `require` is bound: the bundle must materialize with nothing but the DOM
+// globals. A bundle that reached for a module would throw ReferenceError here —
+// and in the desktop shell, at the same point, which is what stranded the
+// fiber and hung startup.
+new Function('window', 'document', 'Element', 'MutationObserver', source)(
   globalThis.window,
   globalThis.document,
-  spec => {
-    if (!(spec in platformModules)) throw new Error(`unexpected require: ${spec}`)
-    return platformModules[spec]
-  },
   FakeElement,
   globalThis.MutationObserver,
 )
@@ -128,7 +138,7 @@ assert.ok(registration, 'bundle did not register')
 
 // The factory must produce a plugin object cordis accepts, and cordis must be
 // able to bring that fiber all the way to ACTIVE.
-const plugin = registration.factory(spec => platformModules[spec])
+const plugin = registration.factory()
 assert.equal(plugin.name, 'dsh-session-top', 'plugin name must equal the package name')
 assert.deepEqual(plugin.inject, [], 'no service may be required; a missing one stalls the fiber')
 assert.equal(typeof plugin.apply, 'function')
@@ -161,7 +171,7 @@ assert.equal(
   `fiber must reach ACTIVE (2), got state ${String(fiber.state)} — a non-ACTIVE state here is exactly the `
   + '"web boot: 1 entry did not activate" failure',
 )
-console.log('✔ factory output activates in real cordis 4.0.4 with workspaces+sessions present')
+console.log(`✔ factory output activates in real cordis ${CORDIS_VERSION} with workspaces+sessions present`)
 
 // The stronger case: NOTHING is provided. A bare `ctx.<service>` read throws
 // "cannot get property ... without inject" from the context Proxy, escapes
