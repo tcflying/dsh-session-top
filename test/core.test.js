@@ -374,26 +374,33 @@ test('package metadata targets the 0.2.x line and never an upper-bounded 0.2', a
   assert.equal(manifest.exports['.'], './src/index.js')
 })
 
-// Regression guard for a real boot failure: an earlier revision declared a
-// `dsh.client.inject` list naming @deepseek-ai/dsh-client-ui-sidebar and
-// friends. Those packages are NOT resolvable in a desktop profile (it has no
-// @deepseek-ai scope at all), so the row never materialized and the entry sat
-// in FiberState.LOADING forever: "web boot: 1 entry did not activate".
+// Regression guard for TWO real boot failures on the desktop shell:
 //
-// The manifest therefore names exactly ONE row — @deepseek-ai/dsh-client-runtime,
-// the client core every profile already loads — and nothing else. It also used
-// to carry a self-invented `immediately: true`; that field exists in the loader
-// but buys nothing here and pins the row into a prefetch tier the plugin does
-// not need, so it is gone.
-test('dsh.client names only the client-runtime row, and no prefetch tier', async () => {
+// 1. An earlier revision declared a `dsh.client.inject` list naming
+//    @deepseek-ai/dsh-client-ui-sidebar and friends — unresolvable in a desktop
+//    profile, so the row sat in FiberState.LOADING forever: "web boot: 1 entry
+//    did not activate".
+// 2. Measured on dsh-desktop-next 2.0.17-next (2026-10-13): ANY non-platform
+//    member in dsh.client — `inject: ['@deepseek-ai/dsh-client-runtime']` or a
+//    self-invented `immediately: true` — stalled the Electron shell's startup
+//    past its 60 s watchdog (recovery mode), while `{ platform: 'web' }` alone
+//    and no client block at all both reached "Host ready" in ~12 s. The host
+//    process itself was never blocked (an isolated fork of lib/host.js booted
+//    fine with the same tree); the stall lives in the shell's client-graph
+//    pipeline. The client half therefore declares ONLY the platform.
+//
+// A self-invented `immediately: true` also pins the row into a prefetch tier
+// the plugin does not need; it stays gone.
+test('dsh.client declares only the platform — no inject rows, no prefetch tier', async () => {
   const manifest = JSON.parse(await readFile(join(here, '..', 'package.json'), 'utf8'))
   const client = manifest.dsh?.client ?? {}
   assert.equal(client.platform, 'web', 'the browser half needs platform "web"')
-  assert.deepEqual(
-    client.inject ?? [],
-    ['@deepseek-ai/dsh-client-runtime'],
-    'every dsh.client.inject entry must resolve as a real package row in the profile; '
-    + 'an unresolvable name leaves the entry stuck in LOADING and fails the whole web boot',
+  assert.equal(
+    client.inject,
+    undefined,
+    'dsh.client.inject wedges the desktop shell boot past its 60 s watchdog '
+    + '(measured 2026-10-13, dsh-desktop-next 2.0.17-next); the client half is '
+    + 'self-contained and needs no module-graph rows',
   )
   assert.equal(
     client.immediately,
