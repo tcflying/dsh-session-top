@@ -1,0 +1,24 @@
+# dsh-session-top bundle patch: inserts the dual-face session pinning/sorting
+# plugin into the profile roster.
+#
+# `name` is the package name, resolved through the profile's node_modules.
+#
+# The host half (exports ".") runs in the host process: it watches committed
+# session events to rank sessions by activity and mirrors the pin set into the
+# official registry-global Workspace pin set (the same durable store the shipped
+# sidebar pin action writes), so the pin survives restarts without a second
+# source of truth. It also serves loopback-only diagnostics under
+# /api/dsh-session-top.
+#
+# The client half (exports "./client") is a browser bundle: it registers into the
+# shipped `sidebar.workspaces.session.menu.item` slot so a right-click on a
+# session row offers Pin/Unpin, renders the flat "Pinned" region above the
+# workspace groups, and hides pinned sessions from their own group. Every DOM
+# touch degrades silently when the official sidebar structure changes.
+#
+# Activate with `dsh plugin --profile desktop add link:<this package>` (which
+# also appends the package to the profile's dsh.profile.bundles list), then
+# restart the app.
+- insert:
+    - id: session-top
+      name: dsh-session-top
