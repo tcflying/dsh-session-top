@@ -17,7 +17,7 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 import {
-  ROW_KEY_ATTR, SESSION_ROW_PREFIX, UNGROUPED_KEY, WORKSPACE_ROW_PREFIX, planFloatToTop,
+  ROW_KEY_ATTR, SESSION_ROW_PREFIX, UNGROUPED_KEY, WORKSPACE_ROW_PREFIX, planFloatDirty, planFloatToTop,
 } from '../src/core.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -84,6 +84,187 @@ test('planFloatToTop picks the single most active member, not merely any', () =>
   const moves = planFloatToTop(['a', 'b', 'c'], id => ranks[id] ?? 0)
   assert.equal(moves.length, 1)
   assert.equal(moves[0].id, 'b', 'only the most active session moves')
+})
+
+// -------------------------------------------------- batch plan contract
+//
+// R18a: what the batch plan is allowed to compare, stated once so no later lane
+// redefines it. A pass consumes a batch of FACTS, `{id, eventTime}`, and two
+// fields that look interchangeable are not:
+//
+//   eventTime  the EVENT's own clock, in ms, as the host reported it. The only
+//              primary order. The receive time never overwrites it: a commit
+//              that arrives late carries its own clock and is placed by it.
+//   sequence   the plugin's monotonic arrival counter. Identity and freshness
+//              ONLY — telling two facts of one session apart, and stopping a
+//              refused fact from overwriting a newer one. It is deliberately
+//              NOT an input here and must never become one.
+//
+// The clause R18a had to settle: eventTime has millisecond resolution, so two
+// facts in the same millisecond are a genuine tie, and arrival order is NOT
+// consulted to break it — a tie keeps the order the ACCOUNT is in right now.
+// That is the rule `planFloatToTop` has always applied with its strict `>`,
+// and the two must not drift apart. Everything below pins one clause.
+
+test('planFloatDirty floats the newest eventTime, not the leading session', () => {
+  const current = ['a', 'b', 'c']
+  // b sits nearer the top of the account but acted earlier. The fact wins.
+  const moves = planFloatDirty(current, [{ id: 'b', time: 50 }, { id: 'c', time: 100 }])
+  const expected = [{ id: 'c', beforeId: 'a' }, { id: 'b', beforeId: 'a' }]
+  assert.deepEqual(moves, expected)
+  assert.deepEqual(replay(current, moves), ['c', 'b', 'a'])
+
+  // `seq` and `at` are ARRIVAL facts, and in both batches below they point at
+  // b: c acted last but arrived early. They exist to kill an ordering that lets
+  // an arrival fact OVERRIDE eventTime, as a primary key or as a tie-break. The
+  // two batches carry mirror assignments on purpose — with one assignment a
+  // descending key and an ascending key cannot be told apart, because one of
+  // them agrees with the account order and survives silently.
+  assert.deepEqual(planFloatDirty(current, [
+    { id: 'b', time: 50, seq: 9, at: 900 }, { id: 'c', time: 100, seq: 1, at: 100 },
+  ]), expected)
+  assert.deepEqual(planFloatDirty(current, [
+    { id: 'c', time: 100, seq: 9, at: 900 }, { id: 'b', time: 50, seq: 1, at: 100 },
+  ]), expected)
+})
+
+test('an exact same-millisecond tie keeps the order the account is in', () => {
+  const current = ['a', 'b', 'c']
+  const moves = planFloatDirty(current, [{ id: 'b', time: 100 }, { id: 'c', time: 100 }])
+  assert.deepEqual(moves, [{ id: 'b', beforeId: 'a' }, { id: 'c', beforeId: 'a' }])
+  assert.deepEqual(replay(current, moves), ['b', 'c', 'a'])
+})
+
+test('a same-millisecond tie ignores the batch order, the sequence and the arrival clock', () => {
+  // Two accounts that mirror each other: on ['a','b','c'] b leads c, on
+  // ['a','c','b'] c leads b. Each is fed BOTH assignments of the arrival facts.
+  //
+  // One account cannot do this job. Whichever way its two tied members sit, one
+  // direction of a `seq`/`at` tie-break agrees with the account order and
+  // survives silently, leaving an ASCENDING key indistinguishable from a
+  // DESCENDING one — the gap an independent review measured against this file.
+  // The PAIR of assignments is what makes both directions die.
+  for (const [current, lead, follow] of [
+    [['a', 'b', 'c'], 'b', 'c'],
+    [['a', 'c', 'b'], 'c', 'b'],
+  ]) {
+    const expected = [{ id: lead, beforeId: current[0] }, { id: follow, beforeId: current[0] }]
+    // Two facts, same millisecond, arrival facts set by the caller.
+    const tied = (leadSeq, followSeq, leadAt, followAt) => [
+      { id: lead, time: 100, seq: leadSeq, at: leadAt },
+      { id: follow, time: 100, seq: followSeq, at: followAt },
+    ]
+    const batches = [
+      // No arrival facts at all: the batch order must not decide either.
+      [{ id: lead, time: 100 }, { id: follow, time: 100 }],
+      [{ id: follow, time: 100 }, { id: lead, time: 100 }],
+      // The follower arrived LAST, then FIRST. Arrival order is not evidence of
+      // event order — a late-delivered commit arrives later carrying an older
+      // clock — so neither of them may promote it over the account order.
+      tied(1, 9, 100, 900),
+      tied(9, 1, 900, 100),
+    ]
+    for (const batch of batches) {
+      assert.deepEqual(
+        planFloatDirty(current, batch),
+        expected,
+        `${current.join('')} must keep its own order on ${JSON.stringify(batch)}`,
+      )
+    }
+    // A tie the account already satisfies must produce no host write at all.
+    assert.deepEqual(planFloatDirty(current, [
+      { id: follow, time: 100, seq: 9, at: 900 },
+      { id: current[0], time: 100, seq: 1, at: 100 },
+      { id: lead, time: 100 },
+    ]), [])
+  }
+})
+
+test('a same-millisecond tie resolves the way planFloatToTop resolves it', () => {
+  const current = ['a', 'b', 'c']
+  const times = { a: 0, b: 100, c: 100 }
+  const legacy = planFloatToTop(current, id => times[id] ?? 0)
+  const batch = planFloatDirty(current, [{ id: 'b', time: 100 }, { id: 'c', time: 100 }])
+  assert.deepEqual(legacy, [{ id: 'b', beforeId: 'a' }])
+  assert.equal(batch[0].id, legacy[0].id, 'both plans must pick the same session')
+})
+
+test('planFloatToTop keeps its own tie rule; R18a does not change it', () => {
+  // Strict `>`: a session already leading its account keeps a tie against a
+  // member that ties with it. This is the compat anchor — the batch plan above
+  // mirrors this rule, and the next lane must not "fix" this one.
+  assert.deepEqual(planFloatToTop(['a', 'b', 'c'], id => ({ a: 100, b: 100, c: 0 })[id] ?? 0), [])
+  // Among tied members, the one that comes first in the account wins.
+  assert.deepEqual(
+    planFloatToTop(['a', 'b', 'c'], id => ({ a: 0, b: 100, c: 100 })[id] ?? 0),
+    [{ id: 'b', beforeId: 'a' }],
+  )
+})
+
+test('an older fact cannot overtake a newer one in the same batch', () => {
+  // a acts last (100) and sits at the bottom; b leads the account but its fact
+  // is older (50). The newer fact owns the top; the older one is not chased.
+  const current = ['b', 'c', 'a']
+  const moves = planFloatDirty(current, [{ id: 'a', time: 100 }, { id: 'b', time: 50 }])
+  assert.deepEqual(moves, [{ id: 'a', beforeId: 'b' }])
+  assert.deepEqual(replay(current, moves), ['a', 'b', 'c'], 'c carries no fact and never moves')
+})
+
+test('an older fact produces no host write when a newer fact already leads', () => {
+  assert.deepEqual(planFloatDirty(['a', 'b', 'c'], [{ id: 'a', time: 100 }, { id: 'b', time: 50 }]), [])
+})
+
+test('the plan is a pure function of the batch; no rank survives a pass', () => {
+  const current = ['a', 'b', 'c']
+  const first = planFloatDirty(current, [{ id: 'b', time: 100 }])
+  // A later batch naming only `a` is planned from that fact alone. Keeping no
+  // rank between calls is what stops a stale fact from re-asserting an order an
+  // earlier batch already spent — the R01 defect, at the pure layer.
+  const second = planFloatDirty(current, [{ id: 'a', time: 5 }])
+  assert.deepEqual(first, [{ id: 'b', beforeId: 'a' }])
+  assert.deepEqual(second, [])
+})
+
+test('a fact for a session that is no longer a member is never written back', () => {
+  // A session that migrated to another workspace is in the batch but not in
+  // this account. It is planned where it is now; this plan must not chase it
+  // into the account it left, which the host would refuse mid-pass anyway.
+  assert.deepEqual(planFloatDirty(['a', 'b', 'c'], [{ id: 'zz', time: 999 }]), [])
+})
+
+test('two facts for one id resolve to the first; freshness is the caller\'s', () => {
+  const current = ['a', 'b', 'c']
+  // DEFENSIVE ONLY, and pinned because the answer is NOT "the newer one": the
+  // first in batch order. The host hands over a batch built as a Map keyed by
+  // id, so this cannot happen there; R18a adds no max() because a max() would
+  // be a freshness rule the host already owns (its sequence guard refuses to
+  // let an older fact overwrite a newer one).
+  const expected = [{ id: 'b', beforeId: 'a' }]
+  assert.deepEqual(planFloatDirty(current, [{ id: 'b', time: 100 }, { id: 'b', time: 1 }]), expected)
+  assert.deepEqual(planFloatDirty(current, [{ id: 'b', time: 1 }, { id: 'b', time: 100 }]), expected)
+})
+
+test('core does not validate eventTime; the host is the trust boundary', () => {
+  // What this module does NOT do, pinned so no later lane adds it quietly:
+  //   - a negative eventTime is not "no activity": it floats like any fact,
+  //     while `planFloatToTop` reads a negative rank as no rank. That
+  //     asymmetry is real and stays real here.
+  //   - a non-finite eventTime is not filtered. It leaves the comparison
+  //     unordered, so the account order stops deciding and the BATCH order
+  //     decides — the very leak the tie rule exists to prevent.
+  // The host is what keeps both unreachable: it substitutes `Date.now()` for
+  // any non-finite `event.time` before a fact is ever recorded.
+  assert.deepEqual(planFloatDirty(['a', 'b', 'c'], [{ id: 'b', time: -5 }]), [{ id: 'b', beforeId: 'a' }])
+  const nan = id => [{ id, time: Number.NaN }]
+  assert.deepEqual(
+    planFloatDirty(['a', 'b', 'c'], [...nan('b'), ...nan('c')]),
+    [{ id: 'b', beforeId: 'a' }, { id: 'c', beforeId: 'a' }],
+  )
+  assert.deepEqual(
+    planFloatDirty(['a', 'b', 'c'], [...nan('c'), ...nan('b')]),
+    [{ id: 'c', beforeId: 'a' }, { id: 'b', beforeId: 'a' }],
+    'a non-finite time hands the tie to the batch order — pinned as the known hazard',
+  )
 })
 
 // --------------------------------------------------------- drift guards
@@ -207,39 +388,46 @@ test('an unknown sidebar is observe-only in the contextmenu chain', async () => 
   const raw = await readFile(join(here, '..', 'src', 'client.js'), 'utf8')
   const source = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
   const start = source.indexOf('const onContextMenu = (event) => {')
-  const end = source.indexOf('const augmentNativeMenu', start)
+  const end = source.indexOf('const ownRowId', start)
   assert.ok(start > 0 && end > start, 'onContextMenu must exist')
   const handler = source.slice(start, end)
 
-  // Exactly two suppressions, in the documented order: our own rows (which no
-  // host menu competes for) and the positively-identified stock sidebar.
+  // Exactly two suppressions: our own rows (which no host menu competes for, and
+  // which must be preempted eagerly) and the deferred fallback for a host row
+  // nobody else handled.
   assert.equal(
     (handler.match(/preventDefault\(\)/g) ?? []).length,
     2,
-    'exactly two branches may suppress the native menu: own rows, and the stock sidebar',
+    'exactly two branches may suppress the native menu: own rows, and the deferred host-row fallback',
   )
-  assert.equal((handler.match(/stopPropagation\(\)/g) ?? []).length, 2)
+  assert.equal(
+    (handler.match(/stopPropagation\(\)/g) ?? []).length,
+    1,
+    'only the own-row branch may stop propagation',
+  )
 
-  // Order matters: own-row check → null-flavor bail → codex graft → official.
-  // The two suppressions are the own-row branch (position 1) and the stock
-  // branch (position 2); the null bail and the graft must sit between them.
+  // Order: already-handled bail → own-row match → own-row suppression → flavor
+  // bail → the deferred fallback, which must re-check what the dispatch did.
   const ownRow = handler.indexOf("[data-stp-row]")
+  const handledBail = handler.indexOf('if (event.defaultPrevented === true) return')
   const nullBail = handler.indexOf('if (flavor === null) return')
-  const graft = handler.indexOf('augmentNativeMenu(id)')
+  const deferred = handler.indexOf('afterDispatch(() => {')
   const suppressions = []
   for (const m of handler.matchAll(/preventDefault\(\)/g)) suppressions.push(m.index)
   assert.equal(suppressions.length, 2)
-  const [ownSuppress, officialSuppress] = suppressions
+  const [ownSuppress, fallbackSuppress] = suppressions
   assert.ok(ownRow > 0 && ownRow < ownSuppress, 'the own-row branch suppresses right after its match')
-  assert.ok(ownSuppress < nullBail, 'the null-flavor bail comes after the own-row branch')
-  assert.ok(nullBail < graft && graft < officialSuppress, 'the codex graft sits between the bails')
+  assert.ok(handledBail < ownSuppress, 'the already-handled bail runs before anything else')
+  assert.ok(ownSuppress < nullBail, 'the flavor bail comes after the own-row branch')
+  assert.ok(nullBail < deferred, 'the deferred fallback is the last branch')
+  assert.ok(deferred < fallbackSuppress, 'the fallback suppresses inside its deferred callback')
   assert.ok(
-    handler.slice(officialSuppress).includes('openMenu(id'),
-    'the final suppression belongs to the stock-sidebar own-menu branch',
+    handler.slice(deferred, fallbackSuppress).includes('if (event.defaultPrevented === true) return'),
+    'the deferred fallback must re-read defaultPrevented: ownership is decided by the dispatch, not by a probe',
   )
 
-  // Nothing between the null-flavor bail and the graft may touch the event.
-  const observeOnly = handler.slice(nullBail, graft)
+  // Nothing between the own-row branch and the fallback may touch the event.
+  const observeOnly = handler.slice(handler.indexOf('openOwnRowMenu(ownRow'), deferred)
   for (const forbidden of ['preventDefault', 'stopPropagation', 'stopImmediatePropagation']) {
     assert.ok(!observeOnly.includes(forbidden), `observe-only span must not call ${forbidden}`)
   }
@@ -288,46 +476,55 @@ test('theme tokens follow the detected sidebar', async () => {
   )
 })
 
-test('codex-ui keeps its own context menu and gains a pin row', async () => {
-  const source = await readFile(join(here, '..', 'src', 'client.js'), 'utf8')
-  // codex-ui opens a session menu on right-click with no pin in it; replacing
-  // that menu would delete rename/archive/fork, so the plugin grafts a row on.
-  assert.match(source, /nativeContextMenu: true/, 'codex flavor must declare its native menu')
-  assert.ok(
-    source.includes('[data-menu-material][role="menu"]'),
-    'the host menu surface is what the pin row must attach to',
-  )
-  assert.ok(source.includes('data-stp-pin-item'), 'the grafted pin row must be identifiable')
-  assert.ok(
-    /if \(flavor\.nativeContextMenu\) \{[\s\S]*?augmentNativeMenu\(id\)\s*\n\s*return/.test(source),
-    'codex path must augment, not replace: no preventDefault before augmentNativeMenu',
-  )
-})
-
-// The row menu died on the real machine: the plugin was supposed to pass the
-// contextmenu event through untouched, and anything that interrupts it during
-// document-capture stops React (which delegates at the root) from ever seeing
-// it. test/sidebar-dom.mjs proves it behaviourally; this pins the source.
-test('the codex right-click path never touches the event', async () => {
+// The right-click menu belongs to @baihejiangnan/dsh-session-context-menu,
+// whose client half renders `.dshcm-menu[role=menu]` from a shared extension
+// table. Grafting into `[data-menu-material]` matched ZERO of those menus, so
+// the pin affordance never appeared anywhere; the entries now go through the
+// owner's own registry instead. test/shared-menu.mjs proves that behaviourally
+// against a faithful mock of that owner; this pins the source contract.
+test('pin actions are published into the shared context-menu table', async () => {
   const raw = await readFile(join(here, '..', 'src', 'client.js'), 'utf8')
   const source = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
-  const start = source.indexOf('const onContextMenu = (event) => {')
-  const nullBail = source.indexOf('if (flavor === null) return', start)
-  const graft = source.indexOf('augmentNativeMenu(id)', start)
-  assert.ok(start > 0 && nullBail > start && graft > nullBail, 'the codex branch must be locatable')
-
-  // Everything from the flavor bail up to the graft covers BOTH the unknown
-  // sidebar and the codex sidebar. Neither may suppress the native menu: React
-  // delegates at the root container, so any capture-phase interruption stops a
-  // host menu from ever opening.
-  const observeOnly = source.slice(nullBail, graft)
-  for (const forbidden of ['preventDefault', 'stopPropagation', 'stopImmediatePropagation']) {
-    assert.ok(
-      !observeOnly.includes(forbidden),
-      `the codex/unknown path must not call ${forbidden} — it would kill the host menu`,
-    )
-  }
-  assert.ok(graft > nullBail, 'the codex path must still reach a graft')
+  assert.ok(
+    source.includes("Symbol.for('dsh.session-context-menu.extensions')"),
+    "the owner's registry key must be the well-known symbol",
+  )
+  assert.ok(
+    /api\.register\(pinEntry\(\)\)/.test(source) && /api\.register\(unpinEntry\(\)\)/.test(source),
+    'both pin and unpin must be registered through the owner\'s own register()',
+  )
+  assert.ok(
+    !/globalThis\[CTX_MENU_KEY\]\s*=/.test(source),
+    'the table belongs to the owner: this plugin must never create or replace one',
+  )
+  assert.ok(
+    !source.includes('[data-menu-material]'),
+    'the graft is gone: no foreign menu surface may be searched for or written into',
+  )
+  assert.ok(source.includes('data-stp-pin-item'), "the plugin's own fallback menu item must stay identifiable")
+  // Entries carry the owner's own call shape: visible({session,row}) gates them
+  // and run({session,row,sessions,workspaces,close}) performs them.
+  assert.ok(/visible:\s*\(\{ session \}/.test(source), 'entries must expose visible({session})')
+  assert.ok(/run:\s*\(\{ session, close \}/.test(source), 'entries must expose run({session,close})')
+  // Registration is bounded and cleaned up: a late owner is retried until it
+  // takes, and teardown hands the table back exactly as it was found.
+  assert.ok(source.includes('scheduleSharedMenu'), 'a late owner must be retried for')
+  assert.ok(
+    /if \(releaseSharedMenu !== null\) releaseSharedMenu\(\)/.test(source),
+    'teardown must unregister both entries',
+  )
+  // Ownership must NOT be read off the table: it outlives its owner (the table
+  // is only deleted when it is empty, and our entries keep it non-empty), so
+  // "our ids are in list()" says nothing about the owner still being loaded —
+  // believing it silenced every right-click after an owner reload.
+  assert.ok(
+    !source.includes('sharedMenuActive'),
+    'no liveness probe may branch on the table: only what the event does decides ownership',
+  )
+  assert.ok(
+    /const afterDispatch = \(fn\)/.test(source) && source.includes('queueMicrotask(fn)'),
+    'the fallback must be deferred past the whole dispatch so it can read the real outcome',
+  )
 })
 
 // A failed insertRule left the stylesheet EMPTY, because the old code deleted

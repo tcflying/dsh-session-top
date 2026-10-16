@@ -13,7 +13,7 @@ ZCode 风格的会话列表 for DeepSeek Harness 0.2.x：会话有新活动就�
 | # | 验收标准 | 实现位置 |
 |---|---|---|
 | 1 | **活跃上浮**：任何 session 有新活动就排到所在列表最上 | `src/index.js` 的 `onSessionEvent` 记录活动时间 → `reorderSessions()` 通过官方 `workspace.insertSessionBefore` 把该 session 上浮到所属工作区账户顶部。算法在 `src/core.js` 的 `planFloatToTop`。 |
-| 2 | **右键置顶**：右键会话行出「置顶该会话」/「取消置顶」 | `src/client.js` 的 `onContextMenu`（事件委托）+ `openMenu`（用官方 `Menu` primitive 在光标处弹出）。 |
+| 2 | **右键置顶**：右键会话行出「置顶该会话」/「取消置顶」 | `src/client.js` 的 `registerSharedMenu`（发布进共享扩展表，由 owner 渲染）+ `onContextMenu` / `openMenu`（owner 不在场时的自有兜底菜单，在光标处弹出）。 |
 | 3 | **置顶语义**：抽出工作区 → 侧栏顶部平铺「已置顶」区，原分组默认折叠，分组内不重复显示 | `src/client.js` 的 `renderRegion`（平铺渲染）+ `applyPinRules`（样式表规则隐藏分组内的原行）+ `reconcileGroups` / `setGroupExpanded`（折叠分组）。 |
 | 4 | **取消置顶**：回到原工作区分组内按活跃度的位置，「已置顶」区移除 | 同一套 `reconcile`：pin 规则为空 → 分组内的行由样式表自动恢复显示；`reconcileGroups` 把分组重新展开。 |
 | 5 | **持久化**：置顶状态跨重启保留 | 置顶集合直接用宿主已有的 registry 全局 pin 集（`workspaceRegistry.pinnedSessionIds`），经官方 `workspaces.pinSession` / `unpinSession` RPC 写入。宿主自己落盘，插件不存第二份。 |
@@ -107,20 +107,39 @@ ZCode 风格的会话列表 for DeepSeek Harness 0.2.x：会话有新活动就�
 | 会话列表容器 | `[role="tree"]` | `[role="tree"][aria-label]` |
 | 置顶隐藏规则 | `[role='tree'] [data-dcu-session="<id>"]` | `[role='tree'] [data-row-key='session:<id>']` |
 | 主题 token | `--dcu-sidebar-*` | `--dsh-*` |
-| 右键菜单 | **侧栏自己开**，本插件**追加**一行置顶 | 侧栏没有 context menu，本插件自己接管 |
+| 右键菜单 | 发布进**共享扩展表**，由 `@baihejiangnan/dsh-session-context-menu` 渲染 | 同左（两种侧栏共用同一条接缝） |
 
-### 为什么 codex-ui 是「追加」不是「替换」
+### 右键接缝：共享扩展表，不是 DOM 嫁接
 
-codex-ui 的会话行自带 `onContextMenu`，右键会打开它自己的菜单
-（重命名 / 标记未读 / 归档 / 分叉 / 打开路径 / 移动），里面**没有置顶**。
-直接 `preventDefault` 接管会把六个能用的操作全删掉。
+会话右键菜单属于 `@baihejiangnan/dsh-session-context-menu`（0.2.14）。它的
+client 侧在 `globalThis[Symbol.for('dsh.session-context-menu.extensions')]` 上建一张
+共享扩展表，**表由它自己创建和维护**，并在自己 apply 期间持有 lease；每个
+`visible({session, row})` 通过的条目都被渲染进它自己的 `.dshcm-menu`，点按时
+`run({session, row, sessions, workspaces, close})`。
 
-所以那里**不拦截**：让侧栏照常开菜单，本插件再把一行「置顶该会话 / 取消置顶」
-追加进去。它用的是官方 `Menu` primitive（`data-menu-material="translucent"`
-`role="menu"`），追加的节点落在同一套标记里，主题样式自动生效。找不到菜单面
-时轮询 12 次 × 40ms，仍失败就静默不动（不吞掉原有菜单）。
+本插件 `register()` 进那张表，**从不自建第二张**。上一版是去 DOM 里找
+`[data-menu-material]` 菜单面往里嫁接节点——owner 根本不用那套标记，于是在真机
+上每行右键都匹配到零个菜单面，什么也没发生。
 
-`test/sidebar-dom.mjs` 对两种侧栏各建一套骨架 DOM，跑真 bundle，逐条验证上表。
+事件归属**不看注册表**。表在 owner 卸载后仍然存在（lease 归零但还有条目时表不
+删），`api.list()` 里能看到我们自己的 id，这只能证明条目在，不能证明 owner 活着。
+所以归属按**事件实际发生了什么**判定：
+
+- owner 声称手势的方式是它在自己的 document 捕获监听里 `preventDefault()` +
+  `stopPropagation()`；
+- 我们在同一个节点同一个阶段，轮到本 handler 时无法知道它的监听是已经跑过还是
+  排在注册序前面。
+
+因此自己的兜底菜单**延后一个微任务**（在整轮 dispatch 之后）打开，且只在事件到
+那一刻仍 `defaultPrevented === false` 时才开。这同时覆盖 owner 先监听、owner 后
+监听、owner 卸载后我们的条目留在表里、owner 从未加载四种情形；owner 在场时它先
+`preventDefault`，我们的兜底什么都不做，两边不会同时开菜单，空白区域也永远不会被
+认领。
+
+`test/shared-menu.mjs` 直接照抄 0.2.14 的 `ownerRegistry()` 与它的
+`onContextMenu` 来驱动真 bundle，逐条验证上表（含 owner 卸载后接管、owner 晚加载、
+owner 先加载、owner 重载）；`test/sidebar-dom.mjs` 对两种侧栏各建一套骨架 DOM，
+验证上表其余各行。
 
 ### token 适配
 
@@ -233,19 +252,22 @@ ctx.inject(['workspaces'], (child) => mount(child, warn))
 
 | # | 条件 | 行为 | 是否碰 event |
 |---|---|---|---|
-| 1 | `closest('[data-stp-row]')` 命中 | 开自己的菜单 | **是**（自有行，没有宿主菜单竞争） |
-| 2 | `flavor === null` | **只观察** | 否 |
-| 3 | `flavor.nativeContextMenu`（codex） | 只观察 + 往宿主菜单追加一行 | 否 |
-| 4 | 明确是官方 flavor | 开自己的菜单 | **是**（官方侧栏没有 context menu） |
+| 1 | 事件到达时 `defaultPrevented` 已为 true | **只观察**（owner 或别人已经接手） | 否 |
+| 2 | `closest('[data-stp-row]')` 命中 | 立即开自己的菜单 | **是**（自有行，没有宿主菜单竞争） |
+| 3 | `flavor === null` | **只观察** | 否 |
+| 4 | 解析出宿主的 session 行，且 dispatch 结束时仍无人处理 | 延后一个微任务开自己的兜底菜单 | **是**（dispatch 之后） |
 
 React 把监听挂在 **root 容器**上，所以捕获阶段任何中断都会让宿主菜单永远
 打不开 —— codex-ui 的行菜单因此死过两次。现在「不认识 = 只观察」，不做任何
-事件修改、不开自己的菜单、不追加。
+事件修改、不开自己的菜单。owner 在场时它自己 `preventDefault`，第 4 条就永远
+不触发；owner 不在场（或卸载后条目还留在它的表里）时第 4 条接管。两种侧栏走的是
+同一条接缝，不存在「codex 追加 / 官方接管」的分支。
 
 `test/sidebar-dom.mjs` 用挂在 tree 上的哨兵监听器模拟 React root，断言事件
-仍然能到达；另有三条行为测试：flavor none 完全不干预、区域行不带宿主标记、
-以及**侧栏晚于插件渲染**时能被正确识别为 codex 并追加（这三条我都注入回归
-验证过会失败）。
+仍然能到达；另有行为测试：flavor none 完全不干预、区域行不带宿主标记、
+侧栏晚于插件渲染时仍被正确识别、以及 `MutationObserver` 静止一秒零突变且行节点
+身份不变（这些我都注入回归验证过会失败）。归属的四种时序在
+`test/shared-menu.mjs` 里对着 0.2.14 的真实 owner 代码逐条验证。
 
 ## 降级契约
 
@@ -257,9 +279,12 @@ React 把监听挂在 **root 容器**上，所以捕获阶段任何中断都会�
 | `[role="tree"]` | 找不到列表 → 同上，完全静默降级 |
 | `.dcu-wb-project-head[aria-expanded]` | 找不到表头 → 不折叠，分组保持侧栏原样 |
 | `data-row-key^="workspace:"`（官方） | 同上 |
-| `[data-menu-material][role="menu"]` | 找不到菜单面 → 右键时侧栏菜单照常开，只是没有置顶行 |
-| `workspaces.pinSession/unpinSession` | 缺 RPC → 不置顶，只警告一次 |
-| `uiWorkspace.openSession` | 缺失 → 回退到 `sessions.retain` |
+| 共享扩展表 `Symbol.for('dsh.session-context-menu.extensions')` | 表不存在 → 有限次重试后仍拿不到 → 自有兜底菜单接管（仍只在解析出的宿主 session 行上）；owner 在场则照旧交给 owner |
+| `workspaces.pinSession/unpinSession` | 缺 RPC → 不置顶，并在界面上给出 `role="alert"` 提示（不是只 `warn` 一次） |
+| `uiWorkspace.openSession` | 缺失 → 点击不导航，界面上 `role="alert"` 说明原因。**不回退**到 `sessions.retain` / `sessions.open`：前者是引用计数绑定 API 不是导航，后者在当前 ClientSessions 契约（`{ids, byId, phase, projectionsBySession}`）里不存在 |
+
+`pinSession`/`unpinSession` 被拒绝时同样 `role="alert"` 报出 `describeError`
+的 `name: message`，因为一次用户看不见的拒绝和一次坏掉的点击完全无法区分。
 
 `client.js` 里所有 DOM/React 调用都在 try/catch 内，失败只 `warn` 一次，
 **绝不把异常抛进侧栏的渲染链**。`inject` 是空数组：把任何服务写进 inject，
