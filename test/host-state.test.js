@@ -16,9 +16,11 @@
  * Run: node --test test/host-state.test.js
  */
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync, existsSync, readdirSync, statSync, renameSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { after, test } from 'node:test'
 
 // The plugin resolves its state directory from $DSH_HOME on every call, so the
@@ -119,20 +121,33 @@ function makeGate(blockCall = 0) {
  * effect lifecycle that behaves the way cordis does — the cleanup returned by an
  * effect runs when the plugin is disposed.
  */
-function harness({ workspaces, config = {}, webServer = false, persistence, getThrows, loggerThrows } = {}) {
+function harness({ workspaces, config = {}, webServer = false, persistence, getThrows, loggerThrows, registryAbsent = false } = {}) {
   const logged = []
   const listeners = new Set()
   const effects = []
   const routes = []
   const capturedRoutes = []
   const counters = { listCalls: 0, persistenceListCalls: 0 }
+  // Whether the host has published its registry YET, and whether it is willing
+  // to enumerate it right now. Both are host facts, so both are knobs here
+  // rather than seams in the plugin: a host that activates its workspace
+  // registry after this plugin did, and a host whose `list()` refuses for a
+  // while, are startup orders and transient failures that really happen.
+  let registryPublished = !registryAbsent
+  let listRefused = false
+  const registryService = {
+    pinnedSessionIds: [],
+    list() {
+      counters.listCalls += 1
+      if (listRefused) throw new Error('host registry refused to enumerate')
+      return workspaces
+    },
+  }
   const services = {
-    workspaceRegistry: {
-      pinnedSessionIds: [],
-      list() {
-        counters.listCalls += 1
-        return workspaces
-      },
+    // A getter, so `ctx.get` sees exactly what a host that has not published
+    // yet would hand back — `undefined`, not an empty stand-in.
+    get workspaceRegistry() {
+      return registryPublished ? registryService : undefined
     },
     // Present and empty, so the plugin's seeding path finishes on its first
     // attempt instead of arming the 15s grace timer every test would then have
@@ -179,7 +194,14 @@ function harness({ workspaces, config = {}, webServer = false, persistence, getT
       return services[name]
     },
     logger: {
-      info: m => logged.push(['info', m]),
+      // Same shape as `warn` below, and for the same reason: `info` is the
+      // startup greeting, which the plugin used to deliver inside a promise
+      // nobody held, so a host whose logger refuses it produced an unhandled
+      // rejection — the host process going down, not a lost log line.
+      info: m => {
+        logged.push(['info', m])
+        if (loggerThrows?.info === true) throw new Error('host logger refused this message')
+      },
       // A host whose logger REFUSES a message, as opposed to one whose registry
       // refuses a write. The message is still recorded — so the case can see
       // that the plugin tried — and then the call throws, which is the shape
@@ -248,6 +270,10 @@ function harness({ workspaces, config = {}, webServer = false, persistence, getT
 
   return {
     ctx, emit, logged, counters, status, detachedStatus, resync, detachedResync,
+    /** The host activates its workspace registry, if it had not already. */
+    publishRegistry: () => { registryPublished = true },
+    /** The host's `list()` starts refusing, or starts answering again. */
+    refuseList: (on = true) => { listRefused = on },
     /** Run the plugin's own teardown, exactly as cordis would on dispose. */
     dispose() {
       for (const { cleanup } of effects.splice(0).reverse()) {
@@ -1534,12 +1560,26 @@ test('R11-fix: a pass that throws is counted, reported, and never escapes', asyn
 
   getThrows.on = false
   const status = await h.status()
-  assert.equal(status.passesStarted, 1, 'one pass ran')
-  assert.equal(status.passesFailed, 1, 'and it failed at pass level')
+  // The count is no longer 1, and that is the contract this ticket changed: the
+  // pass no longer SPENDS the facts it could not place. It hands them back
+  // through the same bounded retry every other host refusal uses, so a lookup
+  // that stays broken costs exactly the refusal budget and then defers — not an
+  // unbounded poll, and not one silent loss.
+  assert.ok(status.passesStarted >= 1, 'the pass ran')
+  assert.ok(status.passesFailed >= 1, 'and it failed at pass level')
+  assert.ok(
+    status.passesStarted <= 4,
+    `the retries must stop at the refusal budget, got ${String(status.passesStarted)} passes`,
+  )
   assert.equal(status.passesCompleted, 0, 'a failed pass is not a completed one')
   assert.ok(
     String(status.lastError).includes('lookup refused by the host'),
     `the reason must be reported, got ${String(status.lastError)}`,
+  )
+  assert.equal(status.deferredSessions, 1, `a lookup that never recovers ends in a deferral, not a loop: ${JSON.stringify(status.deferredActivity)}`)
+  assert.deepEqual(
+    status.deferredActivity.map(one => one.id), ['a2'],
+    'and the deferred fact is the one that could not be placed',
   )
 })
 
@@ -2001,7 +2041,17 @@ test('R12: a record above the per-record ceiling is dropped, counted, and never 
       clock += 1
       h.emit(session(id), activity(clock))
     }
-    const ran = await waitForStatus(h, now => now.passesStarted >= 1)
+    // `passesStarted` is satisfied the moment the pass BEGINS, but `written`
+    // below is the log WORKER's number, and that worker is a deliberately
+    // independent async writer — the start line may not have reached the disk
+    // yet, which is a timing accident of the machine and not of the plugin.
+    // Waiting on the pass alone therefore read 0 writes and failed for a reason
+    // this case is not about. So the wait names both: the pass really ran, and
+    // the one record the assertions below expect has landed. `droppedRecords`
+    // and `queued` need no such wait — they are counted synchronously when the
+    // record is offered, which happened before the pass started. No sleep, and
+    // every assertion below is unchanged.
+    const ran = await waitForStatus(h, now => now.passesStarted >= 1 && now.log.written >= 1)
     assert.equal(ran.passesStarted, 1, 'precondition: one burst, one coalescing window, one pass')
     const status = await h.status()
 
@@ -2611,7 +2661,19 @@ test('R12-fix1: a log from a previous run can be appended to, and is still not m
     for (let index = 1; index <= 60; index += 1) {
       clock += 1
       h.emit(session(ids[index % ids.length]), activity(clock))
-      const seen = await waitForStatus(h, now => now.passesStarted >= index)
+      // `passesStarted` is satisfied the moment the pass BEGINS, but the two
+      // reads below are about the log WORKER, which is a deliberately
+      // independent async writer and may not have finished when the pass is
+      // already counted. Waiting on `passesStarted` alone therefore read
+      // `log.written` before the startup record and the first append had
+      // landed, and the precondition failed on a schedule of the machine's
+      // choosing rather than the plugin's. So the wait names BOTH conditions
+      // for the one iteration that asserts on them: no sleep, and the
+      // assertion below is unchanged.
+      const seen = await waitForStatus(
+        h,
+        now => now.passesStarted >= index && (index !== 1 || now.log.written >= 2),
+      )
       assert.equal(seen.passesStarted, index, `one window must be one pass, got ${String(seen.passesStarted)} at ${String(index)}`)
       if (index === 1) {
         assert.equal(seen.log.written >= 2, true, 'precondition: the first append lands on the previous run\'s log')
@@ -2644,6 +2706,191 @@ test('R12-fix1: a log from a previous run can be appended to, and is still not m
     h.dispose()
     sandbox.release()
   }
+})
+
+// ------------------------------------------------------- startup-courtesy P1
+
+/**
+ * The child the P1 case drives: a real host whose logger refuses EVERY message
+ * it is offered, at both levels, plus a host with no workspace registry at all.
+ *
+ * It is a separate process because the defect is an unhandled rejection, and an
+ * unhandled rejection is the thing that kills the runner trying to observe it —
+ * in-process this case would take the whole file down instead of failing. The
+ * script answers on stdout as one JSON line; nothing else is trusted.
+ */
+const childHostSource = `
+const { pathToFileURL } = await import('node:url')
+const pluginPath = process.argv[2]
+const logPath = process.argv[3]
+const rejections = []
+process.on('unhandledRejection', (reason) => { rejections.push(String(reason)) })
+
+const { apply } = await import(pathToFileURL(pluginPath).href)
+
+const listeners = new Set()
+const cleanups = []
+let infoCalls = 0
+let warnCalls = 0
+const ctx = {
+  get: () => undefined,
+  logger: {
+    info: () => { infoCalls += 1; throw new Error('host logger refused the startup greeting') },
+    warn: () => { warnCalls += 1; throw new Error('host logger refused this message') },
+  },
+  on: (event, handler) => {
+    const entry = { event, handler }
+    listeners.add(entry)
+    return () => listeners.delete(entry)
+  },
+  effect: (fn) => {
+    const cleanup = fn()
+    cleanups.push(cleanup)
+    return () => { cleanup?.() }
+  },
+}
+
+apply(ctx, { enabled: true, debounceMs: 5, logFile: logPath })
+
+// A session acts, so the listener the greeting announces is demonstrably live
+// AFTER the refusal, and not merely present.
+for (const { event, handler } of [...listeners]) {
+  if (event !== 'session/event') continue
+  handler({ id: 's1', header: { origin: 'main' } }, { type: 'agent/message', time: 1000, data: { source: { kind: 'agent' } } })
+}
+
+// Long enough for the debounce window, a pass, and any promise that was going
+// to escape to actually escape.
+await new Promise((resolve) => { setTimeout(resolve, 400) })
+// Read BEFORE teardown: the point is that the listener was attached and live,
+// and disposal is exactly what takes it away again.
+const attached = listeners.size
+for (const cleanup of cleanups.reverse()) {
+  try { cleanup?.() } catch { /* a failing cleanup must not hide the rest */ }
+}
+await new Promise((resolve) => { setTimeout(resolve, 100) })
+process.stdout.write(JSON.stringify({ rejections, infoCalls, warnCalls, listeners: attached }))
+`
+
+test('P1: a logger that throws on info costs the host process nothing', async (t) => {
+  // `logger.warn` was guarded and asserted; `logger.info` was not. The startup
+  // greeting called it inside `void (async () => { ... })()` — a promise
+  // nobody held — so a host whose logger refuses a message produced an
+  // unhandled rejection on the startup path, which is the host process going
+  // down over a courtesy line rather than a lost log line.
+  const sandbox = tempHome('dsh-session-top-p1-logger-info-')
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-session-top-p1-child-'))
+  const script = join(dir, 'host.mjs')
+  writeFileSync(script, childHostSource, 'utf8')
+  const logPath = sandbox.logPath('activity.log')
+  t.after(() => { rmSync(dir, { recursive: true, force: true }); sandbox.release() })
+
+  const run = spawnSync(
+    process.execPath,
+    [script, fileURLToPath(new URL('../src/index.js', import.meta.url)), logPath],
+    { encoding: 'utf8', timeout: 60000 },
+  )
+  const detail = `status=${String(run.status)} signal=${String(run.signal)} stderr=${String(run.stderr).slice(0, 800)}`
+  assert.equal(run.status, 0, `the host process must survive a logger that refuses the greeting: ${detail}`)
+  assert.equal(run.signal, null, `and must not be killed by a signal: ${detail}`)
+
+  const answer = JSON.parse(run.stdout)
+  assert.deepEqual(
+    answer.rejections, [],
+    `a throwing info logger must not produce an unhandled rejection, got ${JSON.stringify(answer.rejections)}`,
+  )
+  assert.equal(answer.infoCalls, 1, `precondition: the greeting really was attempted and refused, got ${String(answer.infoCalls)}`)
+  assert.ok(answer.warnCalls >= 1, `precondition: the guarded warn path was exercised too, got ${String(answer.warnCalls)}`)
+  assert.ok(answer.listeners >= 1, 'and the session listener the greeting announces is still attached')
+
+  // The refusal must not be the end of the block either: the start record is
+  // offered AFTER the greeting, so an unguarded `logger.info` also cost the log
+  // its only proof that this apply came up.
+  assert.ok(existsSync(logPath), `the startup record must still be written, ${detail}`)
+  assert.ok(
+    readLogBytes(logPath).includes('"kind":"start"'),
+    `and it must still be the startup record, got ${JSON.stringify(readLogBytes(logPath).slice(0, 400))}`,
+  )
+})
+
+// ------------------------------------------------------- refused-batch P2
+
+test('P2: a registry that is not published yet does not spend the batch it could not apply', async (t) => {
+  // `takeActivityBatch` empties the pending map at the moment a pass takes it,
+  // so a pass that stops because the host has not published its registry used
+  // to return 0 with the facts already gone. That is a silent loss: the
+  // session acted, and nothing in status ever says why it was never floated.
+  const log = []
+  const workspaces = [account('A', ['a1', 'a2'], log)]
+  const h = harness({ workspaces, webServer: true, registryAbsent: true })
+  t.after(() => h.dispose())
+  // A window wide enough that publishing between two passes is deterministic
+  // rather than a race against the retry budget.
+  await applyPlugin({ ctx: h.ctx, config: { debounceMs: 60 } })
+  assertApplied(h)
+
+  h.emit(session('a2'), activity(1000))
+  const starved = await waitForStatus(h, now => now.passesStarted >= 1)
+  assert.equal(starved.registryMissing, true, 'precondition: the pass really could not read a registry')
+  assert.equal(applied(log).length, 0, 'precondition: and really wrote nothing')
+  assert.equal(
+    starved.pendingActivity.length, 1,
+    `the fact the starved pass consumed must still be pending, got ${JSON.stringify(starved.pendingActivity)}`,
+  )
+
+  // The host finishes activating. The one batch that pass consumed must still
+  // be there to apply.
+  h.publishRegistry()
+  // Not `passesCompleted`: a pass that could not ask the host anything counts
+  // as completed too, so that number is already satisfied by the starved pass.
+  // What has to be waited for is the durable write itself.
+  assert.ok(
+    await waitFor(() => applied(log).length > 0),
+    `the starved pass's fact must still be applied once the registry appears, got ${JSON.stringify(attempted(log))}`,
+  )
+  assert.equal(
+    applied(log).some(one => one.id === 'a1'),
+    false,
+    `and nothing the batch never named may be written, got ${JSON.stringify(applied(log))}`,
+  )
+  assert.deepEqual(workspaces[0].sessionIds, ['a2', 'a1'], 'the durable order is the one the batch chose')
+  const landed = await h.status()
+  assert.equal(
+    landed.deferredSessions, 0,
+    `one short refusal is not a deferral, got ${JSON.stringify(landed.deferredActivity)}`,
+  )
+})
+
+test('P2: a registry that refuses to enumerate once does not spend the batch', async (t) => {
+  // The sibling shape: the registry IS there and `list()` throws, which is a
+  // refusal like any other — nothing was written, so every fact in the batch is
+  // still owed to the host.
+  const log = []
+  const workspaces = [account('A', ['a1', 'a2'], log)]
+  const h = harness({ workspaces, webServer: true })
+  t.after(() => h.dispose())
+  await applyPlugin({ ctx: h.ctx, config: { debounceMs: 60 } })
+  assertApplied(h)
+
+  h.refuseList(true)
+  h.emit(session('a2'), activity(1000))
+  const refused = await waitForStatus(h, now => now.passesStarted >= 1)
+  assert.ok(
+    String(refused.lastError ?? '').includes('refused to enumerate') || refused.passesFailed > 0,
+    `precondition: the refusal was really recorded, got ${String(refused.lastError)}`,
+  )
+  assert.equal(applied(log).length, 0, 'precondition: and really wrote nothing')
+
+  h.refuseList(false)
+  assert.ok(
+    await waitFor(() => applied(log).length > 0),
+    `the refused pass's fact must still be applied once the registry answers, got ${JSON.stringify(attempted(log))}`,
+  )
+  assert.equal(
+    applied(log).some(one => one.id === 'a1'), false,
+    `and nothing the batch never named may be written, got ${JSON.stringify(applied(log))}`,
+  )
+  assert.deepEqual(workspaces[0].sessionIds, ['a2', 'a1'], 'the durable order is the one the batch chose')
 })
 
 after(() => {

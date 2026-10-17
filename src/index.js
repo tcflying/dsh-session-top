@@ -551,6 +551,24 @@ function applyImpl(ctx, config = {}) {
   }
 
   /**
+   * `warn`, at info level, under the same rule and for the same reason.
+   *
+   * The startup greeting used to call `logger.info` directly inside a promise
+   * nobody held, so a host whose logger refuses a message turned a greeting
+   * into an unhandled rejection — which is not a lost log line, it is the host
+   * process going down. Two helpers rather than a general logger wrapper: the
+   * contract is one rule, applied at the places that report.
+   * @param {string} message - what to report.
+   */
+  const info = (message) => {
+    try {
+      logger.info?.(message)
+    } catch {
+      // Deliberately empty, for the reason `warn` gives.
+    }
+  }
+
+  /**
    * Record one dropped record, with the reason and the bytes it would have
    * occupied. Every drop goes through here, so the total is always the sum of
    * the reasons and cannot drift from them.
@@ -1337,6 +1355,35 @@ function applyImpl(ctx, config = {}) {
   }
 
   /**
+   * Hand a WHOLE consumed batch back to the pending set.
+   *
+   * `takeActivityBatch` empties `pendingActivity` at the moment a pass takes
+   * it, so a pass that stops because the HOST refused to be asked — no
+   * registry, a lookup that raises, a `list()` that throws — must put the facts
+   * back itself or they are gone. They are gone silently, which is the worst
+   * way: a session that acted is simply never floated again, and nothing in the
+   * status says why.
+   *
+   * The budget is `requeueActivity`'s, not a new one: every fact carries its
+   * own attempt count, a fact a newer activity has already superseded is
+   * dropped by that path, and one past `REFUSAL_RETRY_LIMIT` is deferred with
+   * its `time`, `seq` and reason instead of retried forever. So this cannot
+   * spin against a host that never publishes a registry.
+   *
+   * Only the host's own refusals come through here. A bug inside this plugin is
+   * still a pass-level failure, reported by `runPass` rather than retried.
+   * @param {ReadonlyMap<string, {time: number, seq: number, at?: number}>} batch - the consumed facts.
+   * @returns {boolean} true when anything went back (so the pass should re-arm).
+   */
+  const requeueActivityBatch = (batch) => {
+    let queued = false
+    for (const [id, fact] of batch) {
+      if (requeueActivity(id, fact)) queued = true
+    }
+    return queued
+  }
+
+  /**
    * Behavior 1's durable half: float the sessions that acted to the top of
    * their own account.
    *
@@ -1385,9 +1432,28 @@ function applyImpl(ctx, config = {}) {
   const reorderSessions = async (batch) => {
     if (!alive()) return 0
     if (batch.size === 0) return 0
-    const registry = ctx.get('workspaceRegistry')
+    let registry
+    try {
+      registry = ctx.get('workspaceRegistry')
+    } catch (error) {
+      // A host whose service LOOKUP raises has, as far as this pass is
+      // concerned, not published a registry: it cannot be asked to place
+      // anything. So the facts go back on the pending set through the same
+      // bounded path an absent registry uses, and the reason is still raised
+      // rather than swallowed — `runPass` counts this pass as failed, which is
+      // what keeps it visible instead of looking like an ordinary idle window.
+      stats.lastError = String(error)
+      stats.registryMissing = true
+      requeueActivityBatch(batch)
+      throw error
+    }
     if (registry === undefined) {
       stats.registryMissing = true
+      // Facts this pass already consumed, and a registry that has not appeared
+      // yet, are the same situation: the host cannot be asked. Requeueing here
+      // is what lets the facts land once it publishes, instead of being spent
+      // on a pass that could not write them anywhere.
+      requeueActivityBatch(batch)
       return 0
     }
     stats.registryMissing = false
@@ -1397,6 +1463,9 @@ function applyImpl(ctx, config = {}) {
       workspaces = registry.list()
     } catch (error) {
       stats.lastError = String(error)
+      // A `list()` that throws is a refusal like any other: nothing was
+      // written, so every fact in this batch is still owed to the host.
+      requeueActivityBatch(batch)
       return 0
     }
     for (const workspace of workspaces) {
@@ -1571,18 +1640,25 @@ function applyImpl(ctx, config = {}) {
       const takenAt = new Date().toISOString()
       // Recorded only now. Before this line `batch.size` described a pass that
       // had not started, which is what let the log claim a batch the host was
-      // never actually asked to reorder. Still before the first `await`.
+      // never actually asked to reorder. Still before the first `await`, so the
+      // log line lands while this pass may still be blocked on the host below —
+      // the log worker is deliberately independent of the reorder, and moving
+      // this after the `await` would trade one defect for a worse one.
       //
-      // No error guard is wrapped around this, and deliberately so. The only
-      // thing here that can throw is the `ctx.get` in `rankedSessions` — the
-      // registry read and the sort below it are already guarded internally —
-      // and `reorderSessions` opens with the very same lookup. A host that
-      // refuses it therefore fails the pass either way, so a guard here would
-      // promise a batch survives that in fact cannot be reached. Wrapping it
-      // would only relocate `lastError`, and the path it does guard (a passing
-      // pass whose diagnostics failed) is not one this code can produce.
+      // The diagnostics are isolated from the pass. They read the host's own
+      // services for a ranking that is explicitly NOT the order the sidebar
+      // shows, so a host that refuses those reads must not stop the reorder
+      // below, and must not leave the facts this pass has already consumed with
+      // nobody to requeue them. `rankedSessions` records its own `lastError`;
+      // the guard adds the report, not the swallowing.
       if (alive()) {
-        const ranked = rankedSessions()
+        let ranked = []
+        try {
+          ranked = rankedSessions()
+        } catch (error) {
+          stats.lastError = String(error)
+          warn(`dsh-session-top: ranking diagnostics failed: ${String(error)}`)
+        }
         void logLine({ at: takenAt, tracked: lastActivity.size, batch: batch.size, top: ranked.slice(0, 5) })
       }
       await reorderSessions(batch)
@@ -1737,9 +1813,18 @@ function applyImpl(ctx, config = {}) {
     // persisted header before the process had served a single event, filling a
     // map that never took part in ordering. The fallback cache is now filled on
     // demand, through resync, and it stays empty until someone asks.
-    void (async () => {
-      // Every remaining step is a host interaction; none of them may start
-      // once this apply has been torn down.
+    // Every remaining step is a host interaction; none of them may start once
+    // this apply has been torn down. All of it is a courtesy, so the whole block
+    // is guarded rather than only its logger calls.
+    //
+    // This used to be `void (async () => { ... })()`: no `await` anywhere in
+    // the body, no `catch`, and a `logger.info` that throws synchronously
+    // therefore rejected a promise nobody was holding. That is an unhandled
+    // rejection, which does not merely lose a greeting — it takes the host
+    // process down, on the startup path, before the listener this block is
+    // announcing has done anything. The `async` bought nothing, so it is gone
+    // along with the floating promise.
+    try {
       if (!alive()) return
       const registry = ctx.get('workspaceRegistry')
       if (registry === undefined && !warnedRegistryMissing) {
@@ -1754,9 +1839,13 @@ function applyImpl(ctx, config = {}) {
       // activity", which it has never been.
       const summary = `dsh-session-top: active (activity ${activity}, debounce ${debounceMs}ms, ${pinned} pinned, `
         + `fallback times load on resync, state in ${pluginHome()})`
-      logger.info?.(summary)
+      info(summary)
       void logLine({ at: new Date().toISOString(), kind: 'start', summary })
-    })()
+    } catch {
+      // Deliberately empty, exactly as in `info` and `warn`. A host that
+      // refuses this greeting, or a registry read that refuses, must not cost
+      // the listener above its one announcement.
+    }
   }
 
   // Diagnostics are strictly optional: a host with no web server (headless,

@@ -12,21 +12,36 @@
  *                                            naming "会话操作"/"session action"
  *   titleFrom       lib/client.js:194-197
  *   resolveSession  lib/client.js:199-214  unique title match over state.ids
- *   menu build      lib/client.js:606-629  rename/archive/delete/explorer/
+ *   menu build      OWNER_CONTRACTS below  rename/archive[/delete]/explorer/
  *                                            copycwd/copyid/fork + extensions
  *                                            + refresh
  *
- * The host fixture is transcribed from `@michengai/dsh-codex-ui` lib/client.js:
+ * The host fixture is transcribed from `@michengai/dsh-codex-ui` lib/client.js
+ * (the version installed under the desktop profile, 1.1.35):
  *   :4560-4562  div.dcu-wb-session[data-dcu-session][role=treeitem][aria-selected]
+ *   :4617       the session row's OWN `onContextMenu` — preventDefault(),
+ *               stopPropagation(), setMenu({type:"session"}) — which is
+ *               codex-ui's native claim of a right-click on a session row, and
+ *               is what the plugin must observe instead of assume
  *   :4704       button.dcu-wb-context-anchor[aria-label=t("sessions.actions")]
  *   :9175       zh "sessions.actions" = "{name} 的会话操作"
  *   :4540,:3592 <DisclosureBody open> — folding sets data-open + `inert`; the
  *               session rows STAY MOUNTED, so a pinned session's real host row
  *               is reachable even inside a collapsed workspace group.
  *
+ * The owner is VERSION-PINNED by the sha256 of its own `lib/client.js`, and the
+ * menu each version must produce is a hand-written literal per version. The
+ * owner's published menu is not one menu: the v0.2.14 tagged artifact
+ * never had a delete entry, and unreleased main added one. Asserting either one
+ * against the other is a false failure; deriving the expectation from whatever
+ * the owner happened to render is a test that cannot fail, so neither is done.
+ * An artifact that is neither pin FAILS, rather than being accommodated.
+ *
  * Run: node test/owner-menu-real.mjs
+ *      DSH_CTX_MENU_CLIENT=<path to a pinned owner's lib/client.js> node test/owner-menu-real.mjs
  */
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -72,6 +87,86 @@ function resolveOwnerClient() {
 }
 
 const ownerClientPath = resolveOwnerClient()
+
+// ------------------------------------------------- the owner's version pin
+
+/**
+ * What one OWNED REVISION of the owner's `lib/client.js` must render.
+ *
+ * Hand-written from the owner's own menu-build source, per revision:
+ *   - `sessionMenu`    the owner's own items for a RESOLVED session, in the
+ *                      order `add()` is called, before extensions and 刷新.
+ *   - `unresolvedMenu` the same with an ambiguous title, where the owner drops
+ *                      the session-scoped items it cannot attribute.
+ *   - `tail`           what follows the plugin's own extension entry.
+ *
+ * The plugin's entry is appended between `unresolvedMenu`/`sessionMenu` and
+ * `tail` by the builders below, because the owner renders registered extensions
+ * after `创建会话分支` and before `刷新`.
+ *
+ * These are literals on purpose. Anything computed from the menu the owner
+ * actually rendered would make every assertion below tautological.
+ */
+/** This plugin's row-colour entry label, in the owner's rendered menu. */
+const COLOR_LABEL = '自定义行背景颜色…'
+const COLOR_ID = 'dsh-session-top.row-color'
+
+const OWNER_CONTRACTS = {
+  // github.com/baihejiangnan/dsh-session-context-menu tag v0.2.14
+  // (commit fc9ab4692fc9d1d9825b671c56abf21aeabca938), the v0.2.14 tagged
+  // artifact. Its menu build has no `deleteSession` call at all
+  // (lib/client.js:437-459: 重命名会话, 归档会话, then the cwd block), so this
+  // revision's menu must NOT contain 删除会话.
+  '6960b05c2199c529e5daaba738287ba59bbfa1394862d2ae734c3c6475d229c9': {
+    revision: 'v0.2.14 tagged artifact (tag fc9ab469)',
+    sessionMenu: ['重命名会话', '归档会话', '在资源管理器中打开', '复制工作目录', '复制会话 ID', '创建会话分支'],
+    unresolvedMenu: ['重命名会话', '归档会话', '创建会话分支'],
+    tail: ['刷新'],
+  },
+  // Unreleased main, commit ab40ccedd79f36961fddfe5adf0a99cbe489ab6f
+  // (2026-09-29). Its menu build DOES call
+  // `add(root, t("deleteSession"), ...)` (lib/client.js:637), so this
+  // revision's menu MUST contain 删除会话.
+  '9ccc3ab8dbefb1d8e100b232c7e612315d81aa084ddced55e789ec48cc6243b9': {
+    revision: 'main@ab40cced (unreleased; introduces 删除会话)',
+    sessionMenu: ['重命名会话', '归档会话', '删除会话', '在资源管理器中打开', '复制工作目录', '复制会话 ID', '创建会话分支'],
+    unresolvedMenu: ['重命名会话', '归档会话', '删除会话', '创建会话分支'],
+    tail: ['刷新'],
+  },
+}
+
+/** The owner's file, hashed, and the contract that hash is pinned to. */
+const ownerSource = readFileSync(ownerClientPath, 'utf8')
+const ownerSha256 = createHash('sha256').update(ownerSource, 'utf8').digest('hex')
+const ownerContract = OWNER_CONTRACTS[ownerSha256]
+if (ownerContract === undefined) {
+  throw new Error(
+    `the owner at ${ownerClientPath} is not a revision this file has a menu contract for.\n`
+    + `  sha256 ${ownerSha256}\n`
+    + `read that revision's menu build (the \`if (row) {\` block of its lib/client.js)\n`
+    + `and add its sha256 to OWNER_CONTRACTS above with the labels it calls add() with.\n`
+    + `Guessing is not an option: this file must not silently accept an owner whose\n`
+    + `menu has drifted, and it must not filter the actual menu down to what it expects.\n`
+    + `known revisions:\n`
+    + Object.entries(OWNER_CONTRACTS).map(([sha, c]) => `  ${sha}  ${c.revision}`).join('\n'),
+  )
+}
+
+/**
+ * The owner's full menu for a resolved session, plus this plugin's entries.
+ *
+ * TWO of them now, in the order they are registered: the pin/unpin toggle
+ * (order 50/51) and the row-colour item (order 52). The owner's own items and
+ * its 刷新 tail are untouched, which is the whole point of registering into its
+ * table rather than replacing the menu.
+ */
+const ownRowMenu = (pinLabel) => [...ownerContract.sessionMenu, pinLabel, COLOR_LABEL, ...ownerContract.tail]
+/** The same, on an ordinary host row. */
+const hostRowMenu = (pinLabel) => [...ownerContract.sessionMenu, pinLabel, COLOR_LABEL, ...ownerContract.tail]
+/** The owner's menu when the title is ambiguous and no session can be attributed. */
+const unresolvedMenu = () => [...ownerContract.unresolvedMenu, ...ownerContract.tail]
+
+console.log(`owner revision: ${ownerContract.revision} (sha256 ${ownerSha256.slice(0, 12)})`)
 
 // --------------------------------------------------------------- fake DOM
 
@@ -296,8 +391,16 @@ class CustomEvent {
  * `projectBody` is left COLLAPSED on purpose: that is the state a group holding
  * a pinned session is left in, and the whole point is that the real row is
  * still mounted inside it.
+ *
+ * `native` attaches codex-ui's OWN session-row `onContextMenu`, transcribed from
+ * lib/client.js:4617-4626: it claims the gesture with a synchronous
+ * `preventDefault()` + `stopPropagation()` and opens the host's own session menu
+ * at the pointer. It is opt-in so a case can turn codex's own menu on or off —
+ * but a case that asserts codex serves the gesture must have it ON, and must
+ * assert the sentinel it records, so "the host handles it" is an observation and
+ * not an assumption about which row happens to exist.
  */
-function buildHost() {
+function buildHost({ native = false } = {}) {
   const body = new El('body')
   const head = new El('head')
   const html = new El('html')
@@ -326,6 +429,7 @@ function buildHost() {
   projectBody.setAttribute('aria-hidden', 'true')
 
   const hostClicks = []
+  const nativeClaims = []
   const rows = {}
 
   const makeRow = (id, title, selected) => {
@@ -364,6 +468,19 @@ function buildHost() {
       openHostMenu(document, id, title)
     })
     actions.appendChild(anchor)
+
+    // codex-ui's own session-row right-click handler (lib/client.js:4617).
+    // React serves it at the row, so a right-click on the row reaches it — the
+    // claim it makes is a synchronous preventDefault, which is the only thing a
+    // re-delivered gesture can be judged by.
+    if (native === true) {
+      row.addEventListener('contextmenu', (event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        nativeClaims.push({ id, x: event.clientX, y: event.clientY })
+        openHostMenu(document, id, title)
+      })
+    }
 
     row.appendChild(copy)
     row.appendChild(time)
@@ -410,7 +527,7 @@ function buildHost() {
       return !event.defaultPrevented
     },
   }
-  return { body, head, html, document, docListeners, tree, treeBody, projectBody, rows, hostClicks }
+  return { body, head, html, document, docListeners, tree, treeBody, projectBody, rows, hostClicks, nativeClaims }
 }
 
 /** codex-ui's own session menu, as `Menu` renders it into a portal. */
@@ -437,9 +554,9 @@ function openHostMenu(document, id, title) {
 
 // ------------------------------------------------------- run plugin + owner
 
-async function run({ pinned = [S1], withOwner = true, order = 'owner-first', titles = null } = {}) {
+async function run({ pinned = [S1], withOwner = true, order = 'owner-first', titles = null, native = false } = {}) {
   delete globalThis[KEY]
-  const host = buildHost()
+  const host = buildHost({ native })
   ACTIVE_DOCUMENT = host
   const pinCalls = []
   const opened = []
@@ -526,7 +643,6 @@ async function run({ pinned = [S1], withOwner = true, order = 'owner-first', tit
 
   let ownerRegistration = null
   globalThis.window.__ModuleLoader__ = { load: (value) => { ownerRegistration = value } }
-  const ownerSource = readFileSync(ownerClientPath, 'utf8')
   new Function('window', ownerSource)(globalThis.window)
   const ownerExports = ownerRegistration.factory()
 
@@ -588,10 +704,16 @@ async function run({ pinned = [S1], withOwner = true, order = 'owner-first', tit
 }
 
 /** Deliver a contextmenu the way a document-capture listener sees it. */
-async function rightClick(docListeners, target, clientX = 120, clientY = 240) {
+function deliverContextMenu(docListeners, target, clientX = 120, clientY = 240) {
   const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX, clientY, button: 2, buttons: 2 })
   event.target = target
   for (const fn of [...(docListeners.get('contextmenu') ?? [])]) fn(event)
+  return event
+}
+
+/** As `deliverContextMenu`, then wait out the microtask the plugin defers to. */
+async function rightClick(docListeners, target, clientX = 120, clientY = 240) {
+  const event = deliverContextMenu(docListeners, target, clientX, clientY)
   await new Promise(r => { queueMicrotask(() => { setTimeout(r, 0) }) })
   return event
 }
@@ -638,8 +760,8 @@ function menuItem(document, label) {
   assert.ok(labels !== null, 'the REAL owner must have built .dshcm-menu for the pinned row')
   assert.deepEqual(
     labels,
-    ['重命名会话', '归档会话', '删除会话', '在资源管理器中打开', '复制工作目录', '复制会话 ID', '创建会话分支', '取消置顶', '刷新'],
-    `a pinned row must offer the owner's full menu plus Unpin; got ${JSON.stringify(labels)}`,
+    ownRowMenu('取消置顶'),
+    `a pinned row must offer this owner revision's full menu plus Unpin; got ${JSON.stringify(labels)}`,
   )
   console.log('✔ own pinned row: the REAL owner builds its full menu on it')
 
@@ -698,7 +820,7 @@ function menuItem(document, label) {
   await rightClick(t.docListeners, t.rows[S2].title)
   assert.deepEqual(
     menuLabels(t.document),
-    ['重命名会话', '归档会话', '删除会话', '在资源管理器中打开', '复制工作目录', '复制会话 ID', '创建会话分支', '置顶该会话', '刷新'],
+    hostRowMenu('置顶该会话'),
     'an ordinary, unpinned host row still offers Pin in the full owner menu',
   )
   assert.equal(t.ownerEvents[0].row, t.rows[S2].row)
@@ -713,15 +835,15 @@ function menuItem(document, label) {
   const t = await run({ pinned: [S1], order: 'plugin-first' })
   assert.deepEqual(
     t.ownerEntries().map(entry => entry.id).sort(),
-    ['dsh-session-top.pin', UNPIN_ID].sort(),
-    'the bounded retry must publish both entries into a table the owner created late',
+    ['dsh-session-top.pin', UNPIN_ID, COLOR_ID].sort(),
+    'the bounded retry must publish every entry into a table the owner created late',
   )
   const ownRow = t.document.body.querySelector('[data-stp-row]')
   await rightClick(t.docListeners, ownRow.querySelector('[data-stp-row-title]'))
   assert.equal(t.document.body.querySelector('[data-stp-menu]'), null, 'no plugin menu either way round')
   assert.deepEqual(
     menuLabels(t.document),
-    ['重命名会话', '归档会话', '删除会话', '在资源管理器中打开', '复制工作目录', '复制会话 ID', '创建会话分支', '取消置顶', '刷新'],
+    ownRowMenu('取消置顶'),
     'plugin-first must reach exactly the same owner menu',
   )
   assert.equal(t.ownerEvents.length, 1, 'exactly one menu per gesture — the re-delivery must not recurse')
@@ -739,7 +861,7 @@ function menuItem(document, label) {
   await rightClick(t.docListeners, ownRow.querySelector('[data-stp-row-title]'))
   assert.deepEqual(
     menuLabels(t.document),
-    ['重命名会话', '归档会话', '删除会话', '在资源管理器中打开', '复制工作目录', '复制会话 ID', '创建会话分支', '取消置顶', '刷新'],
+    ownRowMenu('取消置顶'),
   )
   assert.equal(t.ownerEvents[0].row, t.rows[S2].row)
   assert.equal(t.ownerEvents[0].session?.id, S2, 'the CURRENT pinned session, not the other one')
@@ -760,7 +882,7 @@ function menuItem(document, label) {
   const labels = menuLabels(t.document)
   assert.deepEqual(
     labels,
-    ['重命名会话', '归档会话', '删除会话', '创建会话分支', '刷新'],
+    unresolvedMenu(),
     'with an ambiguous title the owner drops the session-scoped items; the plugin adds none of its own',
   )
   assert.ok(!labels.includes('取消置顶'), 'an unresolved session must not offer an Unpin that could hit the wrong one')
@@ -776,16 +898,75 @@ function menuItem(document, label) {
   t.dispose(); t.disposeOwner()
 }
 
-// --- NO owner on screen: the plugin still serves its own row, and only then.
+// --- NO owner, but codex-ui's OWN session menu is there and claims the
+//     re-delivered gesture (lib/client.js:4617: preventDefault +
+//     stopPropagation + its own session menu). The plugin must observe the
+//     claim and stand down. "A host row exists" is NOT that claim — the only
+//     evidence of it is the re-delivered event coming back defaultPrevented.
+{
+  const t = await run({ pinned: [S1], withOwner: false, native: true })
+  const ownRow = t.document.body.querySelector('[data-stp-row]')
+  await rightClick(t.docListeners, ownRow.querySelector('[data-stp-row-title]'))
+  assert.deepEqual(
+    t.nativeClaims.map(claim => claim.id), [S1],
+    'codex-ui\'s own handler must really have received the forwarded gesture, exactly once',
+  )
+  assert.deepEqual(
+    [t.nativeClaims[0].x, t.nativeClaims[0].y], [120, 240],
+    'and at the pointer the user actually used',
+  )
+  const native = t.document.body.querySelector('.dcu-host-menu')
+  assert.ok(native !== null, 'codex-ui\'s own session menu must be the one that is open')
+  assert.deepEqual(
+    [...native.children].map(item => item.textContent), HOST_MENU,
+    'codex-ui\'s own menu, with its own actions, nothing added and nothing removed',
+  )
+  assert.equal(t.document.body.querySelector('.dshcm-menu'), null, 'no owner means no owner menu')
+  assert.equal(
+    t.document.body.querySelector('[data-stp-menu]'), null,
+    'a gesture codex-ui claimed must never be covered by the plugin\'s one-item fallback',
+  )
+  t.dispose()
+  console.log('✔ no owner but codex-ui\'s own handler claims it: its menu stands, no fallback')
+}
+
+// --- NO owner and NO native claimer, with the host row still mounted. Nothing
+//     serves the gesture, so the plugin must: delivering the re-delivered event
+//     is not the same as somebody having claimed it, and treating delivery as a
+//     claim is what turned this right-click into silence.
 {
   const t = await run({ pinned: [S1], withOwner: false })
   const ownRow = t.document.body.querySelector('[data-stp-row]')
   await rightClick(t.docListeners, ownRow.querySelector('[data-stp-row-title]'))
+  assert.deepEqual(t.nativeClaims, [], 'precondition: nothing in the host claims a right-click')
   assert.equal(t.document.body.querySelector('.dshcm-menu'), null, 'no owner means no owner menu')
+  assert.equal(t.document.body.querySelector('.dcu-host-menu'), null, 'and no host menu either')
   const own = t.document.body.querySelector('[data-stp-menu]')
   assert.ok(own !== null, 'the plugin-owned fallback menu must still open on its own row')
   assert.match(own.textContent, /取消置顶/)
+  assert.equal(
+    t.document.body.querySelectorAll('[data-stp-menu]').length, 1,
+    'one unclaimed gesture, one fallback menu — the forward must not recurse into a second',
+  )
   t.dispose()
+  console.log('✔ no owner and no native claimer: the forwarded gesture falls back to Pin/Unpin')
+}
+
+// --- TORN DOWN before the deferred claim check runs. The queued callback
+//     belongs to a generation that no longer exists and must not claim the
+//     gesture or open anything on the page.
+{
+  const t = await run({ pinned: [S1], withOwner: false })
+  const ownRow = t.document.body.querySelector('[data-stp-row]')
+  deliverContextMenu(t.docListeners, ownRow.querySelector('[data-stp-row-title]'))
+  t.dispose()
+  await new Promise(r => { queueMicrotask(() => { setTimeout(r, 0) }) })
+  assert.equal(
+    t.document.body.querySelector('[data-stp-menu]'), null,
+    'a generation unmounted before its deferred check must not open a menu afterwards',
+  )
+  assert.equal(t.document.body.querySelector('[data-stp-anchor]'), null, 'and must not resurrect its host either')
+  console.log('✔ torn down before the deferred check: the dead generation claims nothing')
 }
 
 // --- A pinned session whose real host row is gone: degrade to the own menu,

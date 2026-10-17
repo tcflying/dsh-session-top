@@ -178,8 +178,23 @@ class CountingObserver {
 /**
  * A codex-flavored page: the workspace tree the plugin anchors on, plus one
  * host session row so the flavor is positively identified.
+ *
+ * `official` keys the rows the way the STOCK sidebar keys them and gives them
+ * no "…" row control. That is the rendering where a right-click still reaches
+ * the plugin's own menu — on codex the host serves its own session menu — so
+ * the cases that need a pin RPC genuinely in flight are built on it.
+ *
+ * The stock list element also carries `aria-label`, because that is the pair
+ * the host's own AnimatedRows writes and half of the plugin's tree selector
+ * (`[role="tree"][aria-label]`). A bare `role="tree"` is a different contract:
+ * `findTree` returns null, the region is never attached, and a check written
+ * against it fails as "the region is missing" rather than as the thing it is
+ * actually about.
+ *
+ * @param {object} [options] - which rendering to build.
+ * @param {boolean} [options.official] - the stock sidebar, not codex-ui.
  */
-function page() {
+function page({ official = false } = {}) {
   const body = new El('body')
   const head = new El('head')
   const workspace = new El('div')
@@ -189,16 +204,20 @@ function page() {
   const listBody = new El('div')
   listBody.className = 'dcu-wb-project-body'
   const tree = new El('div')
-  tree.className = 'dcu-wb-tree'
   tree.setAttribute('role', 'tree')
+  if (official === true) tree.setAttribute('aria-label', 'Sessions')
   const row = new El('div')
-  row.className = 'dcu-wb-session'
-  row.setAttribute('role', 'treeitem')
-  row.setAttribute('data-dcu-session', S1)
   const row2 = new El('div')
-  row2.className = 'dcu-wb-session'
-  row2.setAttribute('role', 'treeitem')
-  row2.setAttribute('data-dcu-session', S2)
+  for (const [node, id] of [[row, S1], [row2, S2]]) {
+    node.setAttribute('role', 'treeitem')
+    if (official === true) {
+      node.setAttribute('data-row-key', `session:${id}`)
+    } else {
+      node.className = 'dcu-wb-session'
+      node.setAttribute('data-dcu-session', id)
+    }
+  }
+  if (official !== true) tree.className = 'dcu-wb-tree'
   tree.appendChild(row)
   tree.appendChild(row2)
   listBody.appendChild(tree)
@@ -669,7 +688,7 @@ async function testFailureInsideEffectBody() {
 // ----------------------------------------------------------------------- R04
 
 async function testAsyncCompletionAfterDispose() {
-  const scaffold = page()
+  const scaffold = page({ official: true })
   const probe = installGlobals(scaffold)
   const registration = await loadBundle()
   const gate = makeGate()
@@ -680,6 +699,12 @@ async function testAsyncCompletionAfterDispose() {
   ctx.flush()
   await settle()
 
+  // This check reads the module-level observer set that every other check in
+  // this file also reads. Bailing out before the release below would leave one
+  // observer and one document listener behind, and the NEXT check would report
+  // them as its own duplicates — a cascade that reads like two defects where
+  // there is one.
+  try {
   assert.equal(probe.regions(), 1, 'precondition: the region is mounted')
   const rulesAtDispose = probe.sheet('dynamic')
   assert.ok((rulesAtDispose ?? '').length > 0, 'precondition: the pin rule is written')
@@ -708,6 +733,9 @@ async function testAsyncCompletionAfterDispose() {
   assert.equal(probe.anchors(), 0, 'no anchor host may be recreated')
   assert.equal(probe.listeners(), 0, 'no document listener may come back')
   assert.equal(store.live.pinned.includes(S1), false, 'the host pin set did change, and is not rolled back here')
+  } finally {
+    ctx.dispose()
+  }
 }
 
 /**

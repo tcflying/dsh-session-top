@@ -2,13 +2,21 @@
  * Shared session context-menu behavior test.
  *
  * The right-click session menu on the real desktop belongs to
- * `@baihejiangnan/dsh-session-context-menu`. Its client half
- * (lib/client.js, 0.2.14) creates a shared extension table on `globalThis`
- * under `Symbol.for('dsh.session-context-menu.extensions')`, takes a lease on it,
- * renders `.dshcm-menu[role=menu]` on every session right-click, and appends
- * every registered entry whose `visible({session,row})` is not false — calling
- * `run({session,row,sessions,workspaces,close})` after it has closed its own
- * menu.
+ * `@baihejiangnan/dsh-session-context-menu`. Its client half (lib/client.js; the
+ * 0.2.14 tagged artifact here) creates a shared extension table on
+ * `globalThis` under `Symbol.for('dsh.session-context-menu.extensions')`, takes a
+ * lease on it, renders `.dshcm-menu[role=menu]` on every session right-click, and
+ * appends every registered entry whose `visible({session,row})` is not false —
+ * calling `run({session,row,sessions,workspaces,close})` after it has closed its
+ * own menu.
+ *
+ * SCOPE. This file pins the SHARED-TABLE contract — registration, the lease, the
+ * claim-by-`preventDefault`, extension filtering and ordering — which is the same
+ * across the owner's revisions. It does NOT pin the owner's own item list, which
+ * differs per revision (unreleased main adds 删除会话; the 0.2.14 tagged artifact
+ * has no delete entry at all). Per-version menus are pinned by the client's
+ * sha256 against hand-written literals in `test/owner-menu-real.mjs`, against the
+ * real artifact.
  *
  * This plugin's previous revision instead hunted for `[data-menu-material]`
  * surfaces to graft a pin row into. That owner renders no such attribute, so the
@@ -32,6 +40,8 @@ const S1 = 'session-aaaaaaaa-1111-4111-8111-111111111111'
 const S2 = 'session-bbbbbbbb-2222-4222-8222-222222222222'
 const PIN_ID = 'dsh-session-top.pin'
 const UNPIN_ID = 'dsh-session-top.unpin'
+const COLOR_ID = 'dsh-session-top.row-color'
+const COLOR_LABEL = '自定义行背景颜色…'
 
 // --------------------------------------------------------------- fake DOM
 
@@ -161,7 +171,8 @@ function matchSimple(el, selector) {
 
 /**
  * Transcribed from @baihejiangnan/dsh-session-context-menu@0.2.14
- * lib/client.js:70-92 — the registry is created lazily by the OWNER and frozen;
+ * lib/client.js:70-92 — the registry is created lazily by the OWNER and frozen,
+ * and unchanged by later revisions;
  * register() throws on a duplicate id; the returned disposer also drops the
  * global when nothing holds it any more.
  */
@@ -198,6 +209,8 @@ function ownerRegistry() {
  * bails on an already-handled event, it renders `.dshcm-menu[role=menu]` (never
  * a `[data-menu-material]` surface), and it filters extensions through
  * `visible?.({session, row}) !== false` (0.2.14 lib/client.js:617-627).
+ * The owner's own ITEM LIST below is this file's own stand-in, not a
+ * revision-exact copy — see the header.
  */
 function applyOwner({ document, sessions, workspaces, ownCalls }) {
   const api = ownerRegistry()
@@ -273,34 +286,59 @@ function applyOwner({ document, sessions, workspaces, ownCalls }) {
 
 // ---------------------------------------------------------- the host page
 
-function page() {
+/**
+ * The host page.
+ *
+ * `official` builds the STOCK sidebar instead of codex-ui's: the same rows,
+ * keyed the way the stock sidebar keys them and deliberately WITHOUT the "…"
+ * row control. That combination is what still reaches the plugin's own menu —
+ * on codex the host serves its own session menu, and on a stock row carrying
+ * the host control the hand-off borrows that instead.
+ *
+ * @param {object} [options] - which rendering to build.
+ * @param {boolean} [options.official] - the stock sidebar, not codex-ui.
+ */
+function page({ official = false } = {}) {
   const body = new El('body')
   const head = new El('head')
   const listArea = new El('div')
   const treeBody = new El('div')
   const tree = new El('div')
-  tree.className = 'dcu-wb-tree'
-  tree.setAttribute('role', 'tree')
   const project = new El('div')
-  project.className = 'dcu-wb-project'
   const head2 = new El('div')
-  head2.className = 'dcu-wb-project-head'
-  head2.setAttribute('aria-expanded', 'true')
-  project.appendChild(head2)
+  tree.setAttribute('role', 'tree')
+  if (official === true) {
+    tree.setAttribute('aria-label', 'sessions')
+    head2.setAttribute('data-row-key', 'workspace:w1')
+    head2.setAttribute('aria-expanded', 'true')
+    tree.appendChild(head2)
+  } else {
+    tree.className = 'dcu-wb-tree'
+    project.className = 'dcu-wb-project'
+    head2.className = 'dcu-wb-project-head'
+    head2.setAttribute('aria-expanded', 'true')
+    project.appendChild(head2)
+  }
   const rows = {}
   for (const id of [S1, S2]) {
     const row = new El('div')
-    row.className = 'dcu-wb-session'
-    row.setAttribute('role', 'treeitem')
-    row.setAttribute('data-dcu-session', id)
     const title = new El('span')
-    title.className = 'dcu-wb-session-title'
     title.textContent = id === S1 ? 'first' : 'second'
     row.appendChild(title)
-    project.appendChild(row)
+    if (official === true) {
+      row.setAttribute('role', 'treeitem')
+      row.setAttribute('data-row-key', `session:${id}`)
+      tree.appendChild(row)
+    } else {
+      row.className = 'dcu-wb-session'
+      row.setAttribute('role', 'treeitem')
+      row.setAttribute('data-dcu-session', id)
+      title.className = 'dcu-wb-session-title'
+      project.appendChild(row)
+    }
     rows[id] = { row, title }
   }
-  tree.appendChild(project)
+  if (official !== true) tree.appendChild(project)
   treeBody.appendChild(tree)
   listArea.appendChild(treeBody)
   body.appendChild(listArea)
@@ -384,13 +422,13 @@ function labelOf(node) {
 
 async function run({
   pinned = [], withOwner = 'before', withUiWorkspace = true, refuseUnpin = false,
-  throwOnOpen = false, deferUnpinReject = false,
+  throwOnOpen = false, deferUnpinReject = false, official = false,
 } = {}) {
   // Set when `deferUnpinReject` asked for an RPC that settles on OUR schedule,
   // so a rejection can be delivered after the plugin has been disposed.
   let rejectPending = null
   delete globalThis[KEY]
-  const scaffold = page()
+  const scaffold = page({ official })
   const ownCalls = []
   const pinCalls = []
   const opened = []
@@ -537,10 +575,12 @@ async function run({
 {
   const run1 = await run({ withOwner: 'before', pinned: [] })
   const entries = run1.owner.api.list()
-  assert.deepEqual(entries.map(entry => entry.id), [PIN_ID, UNPIN_ID], 'both entries must be registered in order')
+  assert.deepEqual(entries.map(entry => entry.id), [PIN_ID, UNPIN_ID, COLOR_ID], 'every entry must be registered in order')
   assert.equal(entries[0].label, '置顶该会话')
   assert.equal(entries[1].label, '取消置顶')
-  console.log('✔ owner first: the pin/unpin entries are in the shared table at mount')
+  assert.equal(entries[2].label, COLOR_LABEL)
+  assert.deepEqual(entries.map(entry => entry.order), [50, 51, 52], 'the pin/unpin orders must be unchanged')
+  console.log('✔ owner first: pin/unpin/row-colour are in the shared table at mount, in order')
 
   // The right-click must reach the owner untouched by the plugin.
   const ev = await rightClickAndSettle(run1.docListeners, run1.rows[S1].title)
@@ -553,7 +593,7 @@ async function run({
   const labels = menuLabels(run1.document)
   assert.deepEqual(
     labels,
-    ['重命名会话', '归档会话', '永久删除会话', '置顶该会话', '刷新'],
+    ['重命名会话', '归档会话', '永久删除会话', '置顶该会话', COLOR_LABEL, '刷新'],
     `the owner's own items must survive next to ours; got ${JSON.stringify(labels)}`,
   )
   console.log('✔ owner live: the gesture is untouched and the host items are preserved')
@@ -580,7 +620,7 @@ async function run({
   // S1 is pinned, S2 is not — and S1 is an ordinary host row, not one of ours.
   await rightClickAndSettle(run1.docListeners, run1.rows[S1].title)
   const labels = menuLabels(run1.document)
-  assert.deepEqual(labels, ['重命名会话', '归档会话', '永久删除会话', '取消置顶', '刷新'])
+  assert.deepEqual(labels, ['重命名会话', '归档会话', '永久删除会话', '取消置顶', COLOR_LABEL, '刷新'])
   assert.ok(!labels.includes('置顶该会话'), 'pin and unpin must be mutually exclusive')
   menuItem(run1.document, '取消置顶').click()
   await new Promise(r => { setTimeout(r, 20) })
@@ -593,7 +633,7 @@ async function run({
   const run1 = await run({ withOwner: 'after', pinned: [] })
   assert.deepEqual(
     run1.owner.api.list().map(entry => entry.id),
-    [PIN_ID, UNPIN_ID],
+    [PIN_ID, UNPIN_ID, COLOR_ID],
     'a late owner must still receive the entries, however the two apply orders fall out',
   )
   await rightClickAndSettle(run1.docListeners, run1.rows[S2].title)
@@ -604,16 +644,17 @@ async function run({
   run1.disposeOwner()
 }
 
-// --- NO owner at all: the plugin's own menu, and it never invents a table
+// --- NO owner at all, on codex. codex serves its own session menu on
+// right-click, so the gesture is not this plugin's to claim: with nobody
+// building a menu it still must not cover the host's. And it must never invent
+// the owner's table, claim blank space, or write into a foreign surface.
 {
   const run1 = await run({ withOwner: 'none', pinned: [] })
   assert.equal(globalThis[KEY], undefined, 'the plugin must never create the owner\'s table itself')
 
   const ev = await rightClickAndSettle(run1.docListeners, run1.rows[S1].title)
-  assert.equal(ev.defaultPrevented, true, 'with nobody else building a menu, the plugin owns the row it resolved')
-  const own = run1.document.body.querySelector('[data-stp-menu]')
-  assert.ok(own !== null, "the plugin's own menu must open")
-  assert.match(labelOf(own), /置顶该会话/)
+  assert.equal(ev.defaultPrevented, false, "codex's own session menu must not be prevented")
+  assert.ok(run1.document.body.querySelector('[data-stp-menu]') === null, 'and not covered by a plugin menu')
 
   // Blank space inside the sidebar is not a row: never claimed.
   const blank = await rightClickAndSettle(run1.docListeners, run1.tree)
@@ -626,7 +667,21 @@ async function run({
   run1.body.appendChild(foreign)
   await new Promise(r => { setTimeout(r, 120) })
   assert.equal(foreign.querySelector('[data-stp-pin-item]'), null, 'no graft into a surface we do not own')
-  console.log('✔ owner disabled: own menu on a real row, nothing claimed on blank space, no graft')
+  console.log('✔ owner disabled on codex: nothing claimed, nothing grafted')
+  run1.dispose()
+}
+
+// --- The plugin's own menu, where it is still the right answer: a STOCK row
+// with no host "…" control to borrow. Everything else about the shared table is
+// identical — it simply is not there, and the gesture has a real owner.
+{
+  const run1 = await run({ withOwner: 'none', pinned: [], official: true })
+  const ev = await rightClickAndSettle(run1.docListeners, run1.rows[S1].title)
+  assert.equal(ev.defaultPrevented, true, 'with nothing else to open a menu, the plugin owns the row it resolved')
+  const own = run1.document.body.querySelector('[data-stp-menu]')
+  assert.ok(own !== null, "the plugin's own menu must open")
+  assert.match(labelOf(own), /置顶该会话/)
+  console.log('✔ stock row with no host menu control: the plugin\'s own pin menu')
   run1.dispose()
 }
 
@@ -638,23 +693,27 @@ async function run({
 // hands the gesture to nobody: every right-click falls through silently.
 {
   const run1 = await run({ withOwner: 'before', pinned: [] })
-  assert.equal(run1.owner.api.list().length, 2, 'entries start registered')
+  assert.equal(run1.owner.api.list().length, 3, 'entries start registered')
   run1.disposeOwner()
 
   // The entries are still there. That fact must NOT disable our own menu.
   assert.equal(globalThis[KEY] !== undefined, true, "our entries keep the owner's table alive")
   assert.deepEqual(
     run1.owner.api.list().map(entry => entry.id),
-    [PIN_ID, UNPIN_ID],
+    [PIN_ID, UNPIN_ID, COLOR_ID],
     'the table survives its owner',
   )
 
   const ev = await rightClickAndSettle(run1.docListeners, run1.rows[S1].title)
-  assert.equal(ev.defaultPrevented, true, 'with no owner left, the plugin must claim the row itself')
-  const own = run1.document.body.querySelector('[data-stp-menu]')
-  assert.ok(own !== null, "the plugin's own menu must open after the owner unloaded")
-  assert.match(labelOf(own), /置顶该会话/)
-  console.log('✔ owner unloaded with our entries still in its table: the plugin serves the row itself')
+  assert.equal(
+    ev.defaultPrevented, false,
+    "entries left in a table must not tempt the plugin into claiming codex's own menu",
+  )
+  assert.ok(
+    run1.document.body.querySelector('[data-stp-menu]') === null,
+    "and it must not open its own menu once the owner is gone",
+  )
+  console.log('✔ owner unloaded with our entries still in its table: the gesture still belongs to codex')
   run1.dispose()
 }
 
@@ -745,7 +804,7 @@ async function run({
 
 // --- UNPIN REFUSAL: the pin RPC rejected, and the user must be able to see it.
 {
-  const run1 = await run({ withOwner: 'none', pinned: [S1] })
+  const run1 = await run({ withOwner: 'none', pinned: [S1], official: true })
   const own = run1.document.body.querySelector('[data-stp-menu]')
   assert.ok(own === null, 'no menu until the gesture')
   await rightClickAndSettle(run1.docListeners, run1.rows[S1].title)
@@ -764,7 +823,7 @@ async function run({
   // Make the official RPC refuse, exactly as a host-side validation would.
   const failing = run1.document
   void failing
-  const run2 = await run({ withOwner: 'none', pinned: [S1], refuseUnpin: true })
+  const run2 = await run({ withOwner: 'none', pinned: [S1], refuseUnpin: true, official: true })
   await rightClickAndSettle(run2.docListeners, run2.rows[S1].title)
   run2.document.body.querySelector('[data-stp-pin-item]').click()
   await new Promise(r => { setTimeout(r, 20) })
@@ -869,7 +928,7 @@ function cssRuleFor(document, selector) {
   )
   missing.dispose()
 
-  const refusing = await run({ withOwner: 'none', pinned: [S1], refuseUnpin: true })
+  const refusing = await run({ withOwner: 'none', pinned: [S1], refuseUnpin: true, official: true })
   await rightClickAndSettle(refusing.docListeners, refusing.rows[S1].title)
   refusing.document.body.querySelector('[data-stp-pin-item]').click()
   await new Promise(r => { setTimeout(r, 20) })
@@ -901,7 +960,7 @@ function cssRuleFor(document, selector) {
 // reading — including the dismissal the plugin performs itself immediately
 // before showing the next one.
 {
-  const run1 = await run({ withOwner: 'none', pinned: [S1], withUiWorkspace: false })
+  const run1 = await run({ withOwner: 'none', pinned: [S1], withUiWorkspace: false, official: true })
   run1.document.body.querySelector('[data-stp-row]').click()
   await new Promise(r => { setTimeout(r, 20) })
   assert.ok(run1.document.body.querySelector('[data-stp-alert]') !== null, 'a refusal is on screen')
@@ -928,7 +987,7 @@ function cssRuleFor(document, selector) {
 // happen is this generation answering it by creating a fresh host and a fresh
 // timer on a page it no longer serves.
 {
-  const run1 = await run({ withOwner: 'none', pinned: [S1], deferUnpinReject: true })
+  const run1 = await run({ withOwner: 'none', pinned: [S1], deferUnpinReject: true, official: true })
   await rightClickAndSettle(run1.docListeners, run1.rows[S1].title)
   run1.document.body.querySelector('[data-stp-pin-item]').click()
   await new Promise(r => { setTimeout(r, 20) })

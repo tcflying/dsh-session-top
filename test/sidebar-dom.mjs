@@ -62,8 +62,40 @@ let mutationLog = { records: 0, deliveries: 0 }
 const reportedListenerErrorLog = []
 const reportedListenerErrors = () => [...reportedListenerErrorLog]
 
-/** Report one childList change the way the DOM does: target plus added/removed. */
-function emitMutation(target, added = [], removed = []) {
+/**
+ * The document listeners of the run in progress, so `dispatchEvent` on an
+ * element can reach the document's CAPTURE listeners the way it does in a page.
+ * Set by `runBundle`, which owns the map it points at.
+ */
+let activeDocumentListeners = null
+
+/**
+ * `MouseEvent`, for the plugin's own re-delivery of a contextmenu.
+ *
+ * `cancelable` is the load-bearing part: a claim is only observable if
+ * `preventDefault()` sets something, and an event that cannot be cancelled
+ * cannot be claimed. The pointer travels with it, because the hand-off has to
+ * re-open whatever menu the host serves at the pointer the user actually used.
+ */
+class MouseEvent {
+  constructor(type, init = {}) {
+    this.type = type
+    this.bubbles = init.bubbles === true
+    this.cancelable = init.cancelable === true
+    this.defaultPrevented = false
+    this.clientX = init.clientX ?? 0
+    this.clientY = init.clientY ?? 0
+    this.button = init.button ?? 0
+    this.buttons = init.buttons ?? 0
+    this.target = null
+    this.currentTarget = null
+    this.propagationStopped = false
+  }
+  preventDefault() { if (this.cancelable) this.defaultPrevented = true }
+  stopPropagation() { this.propagationStopped = true }
+}
+
+/** Report one childList change the way the DOM does: target plus added/removed. */function emitMutation(target, added = [], removed = []) {
   const record = { type: 'childList', target, addedNodes: added, removedNodes: removed }
   mutationLog.records += 1
   for (const observer of [...observers]) {
@@ -101,6 +133,78 @@ class FakeClassList {
   add(...n) { this.el.classList.add(...n) }
 }
 
+/**
+ * Sum the `translate()` offsets on an element's ancestor chain, including its
+ * own inline style — the browser composes them for every descendant's box.
+ * @param {object} el - the fake element.
+ * @returns {[number, number]} the accumulated [dx, dy].
+ */
+function translateChain(el) {
+  let dx = 0
+  let dy = 0
+  for (let node = el; node != null; node = node.parentElement) {
+    const raw = node.style?.props?.get?.('transform')
+    if (typeof raw !== 'string') continue
+    const m = raw.match(/translate\(\s*(-?[\d.]+)px\s*,\s*(-?[\d.]+)px\s*\)/)
+    if (m === null) continue
+    dx += Number(m[1])
+    dy += Number(m[2])
+  }
+  return [dx, dy]
+}
+
+const translateOf = (el) => translateChain(el)[0]
+const translateYOf = (el) => translateChain(el)[1]
+
+/** The box a real browser reports for an element it is not rendering. */
+const EMPTY_BOX = { left: 0, top: 0, width: 0, height: 0, right: 0, bottom: 0 }
+
+/**
+ * Is `display: none` in force on this element?
+ *
+ * Two sources, and only the two the anchor hand-off can actually meet:
+ *
+ *  - an INLINE `display`, which is what the anchor writes on the row and on
+ *    `.rowActions` to put the "…" button on screen before it measures it. The
+ *    plugin's own pin hide rule lands in a stylesheet this fake does not
+ *    evaluate, so the inline half is the one that has to be modelled exactly.
+ *  - the host's own `.rowActions { display: none }`, which
+ *    `.sessionRow.menuOpen .rowActions` reveals (Rows.module.css:256-269).
+ *
+ * Without the second one the fake reports a laid-out box for a container the
+ * browser has not rendered: `getBoundingClientRect` hands back `ELLIPSIS_BOX`
+ * where the page would hand back zeros, so an anchor that never put the button
+ * on screen still "measures" a real rect and the offset this whole path exists
+ * to prevent goes untested.
+ *
+ * Ancestors count, because a child of an unrendered box has no box either.
+ * @param {object} el - the fake element.
+ * @returns {boolean} true when the element renders nothing.
+ */
+function isDisplayNone(el) {
+  for (let node = el; node != null; node = node.parentElement) {
+    const inline = node.style?.getPropertyValue?.('display') ?? ''
+    if (inline === 'none') return true
+    // An inline declaration outranks the stylesheet rule for the same
+    // property, `!important` and all. The anchor relies on exactly that: it
+    // writes `display: inline-flex !important` on `.rowActions` to put the "…"
+    // button on screen BEFORE the host's click has put `menuOpen` on the row.
+    if (inline !== '') continue
+    const name = typeof node.className === 'string' ? node.className : ''
+    if (!name.split(/\s+/).includes('Rows_rowActions__x1y2z')) continue
+    // `.sessionRow.menuOpen .rowActions` — the host reveals the strip itself
+    // once its menu is open, and that is what keeps it up after the anchor is
+    // handed back.
+    let revealed = false
+    for (let up = node.parentElement; up != null; up = up.parentElement) {
+      const upName = typeof up.className === 'string' ? up.className : ''
+      if (upName.split(/\s+/).some(one => one.includes('menuOpen'))) { revealed = true; break }
+    }
+    if (!revealed) return true
+  }
+  return false
+}
+
 class El {
   constructor(tag = 'div') {
     this.tagName = tag.toUpperCase()
@@ -112,16 +216,68 @@ class El {
     this.isConnected = true
     this.style = {
       props: new Map(),
-      setProperty: (k, v) => { this.style.props.set(k, v) },
-      removeProperty: (k) => { this.style.props.delete(k) },
+      // The priority argument is RECORDED, because the plugin's temporary
+      // anchor styles depend on it: an inline `display:block !important` is the
+      // only declaration that beats the plugin's own `display:none !important`
+      // hide rule in a real browser. A fake that dropped it would make the
+      // un-hide look effective in tests and inert on the page.
+      priorities: new Map(),
+      setProperty: (k, v, priority) => {
+        this.style.props.set(k, v)
+        if (priority === undefined || priority === '') this.style.priorities.delete(k)
+        else this.style.priorities.set(k, priority)
+      },
+      removeProperty: (k) => { this.style.props.delete(k); this.style.priorities.delete(k) },
+      // Read-back is part of the contract the anchor undo depends on: it only
+      // restores a property that still carries the value IT wrote.
+      getPropertyValue: (k) => this.style.props.get(k) ?? '',
+      getPropertyPriority: (k) => this.style.priorities.get(k) ?? '',
     }
     this.sheet = { cssRules: [], deleteRule(i) { this.cssRules.splice(i, 1) }, insertRule(c) { this.cssRules.push(c); return 0 } }
+    /**
+     * Layout box, for the anchor-positioning cases.
+     *
+     * A real browser reports the box INCLUDING any `transform` in the inline
+     * style, which is exactly what the official menu measures. `transformRect`
+     * replays the one transform syntax the plugin uses (`translate(dx, dy)`)
+     * so a test can assert the anchor landed on the user's pointer instead of
+     * on the hidden group it came from.
+     */
+    this._rect = { left: 0, top: 0, width: 120, height: 32, right: 120, bottom: 32 }
   }
+
+  /** The transform currently in force, parsed back out of the inline style. */
+  transformRect() {
+    // Not rendered is not "at 0,0 with a width": a browser reports all zeros,
+    // and every measurement the menu anchors on would be taken from that.
+    if (isDisplayNone(this)) return { ...EMPTY_BOX }
+    // Ancestors count: a real browser reports a descendant's box AFTER every
+    // transform on its ancestor chain, which is precisely what the temporary
+    // anchor styling relies on (the transform goes on the ROW, the measured
+    // anchor is the "…" button inside it).
+    const dx = translateOf(this)
+    const dy = translateYOf(this)
+    const base = this._rect
+    if (dx === 0 && dy === 0) return base
+    return {
+      left: base.left + dx, top: base.top + dy,
+      width: base.width, height: base.height,
+      right: base.right + dx, bottom: base.bottom + dy,
+    }
+  }
+
+  getBoundingClientRect() { return this.transformRect() }
 
   get classList() { return new Set() }
   /** Real DOM nodes expose this; the plugin inserts relative to it. */
   get firstChild() { return this.children[0] ?? null }
   get lastChild() { return this.children[this.children.length - 1] ?? null }
+  /** Real DOM: used to place a control directly above the nav it controls. */
+  get nextElementSibling() {
+    if (this.parentElement === null) return null
+    const at = this.parentElement.children.indexOf(this)
+    return this.parentElement.children[at + 1] ?? null
+  }
 
   set textContent(value) { this._text = String(value); emitMutation(this, [], []) }
   get textContent() { return this._text ?? '' }
@@ -148,7 +304,19 @@ class El {
   get className() { return this.attributes.get('class') ?? '' }
   set className(v) { this.setAttribute('class', v) }
 
-  appendChild(c) { c.parentElement = this; this.children.push(c); emitMutation(this, [c], []); return c }
+  /**
+   * DOM `appendChild`, which is `insertBefore(node, null)` and therefore
+   * carries the SPEC's pre-insert MOVE step, like every other insertion: a node
+   * that already has a parent is REMOVED from it first.
+   *
+   * It did not, and `officialUiScaffold` puts `listArea` through it right after
+   * `body.insertBefore(root, listArea)`. So `listArea` stayed a child of `body`
+   * AND of `root`, `descendants()` walked it twice, and every node inside it was
+   * reported twice by `querySelectorAll`. That was invisible while every control
+   * lived outside `listArea`; a control placed directly above the directory body
+   * does not, and "exactly one control" counted one control as two.
+   */
+  appendChild(c) { return this.insertBefore(c, null) }
 
   /**
    * DOM `insertBefore`, with the SPEC's pre-insert move semantics: a node that
@@ -217,20 +385,95 @@ class El {
    * The exception is still recorded — see `reportedListenerErrors()` — because
    * "the host's own handler blew up" is worth asserting on. It is just not a
    * return value the caller can branch on, which is the whole point.
+   *
+   * Two additions, both faithful to the platform rather than convenient for the
+   * plugin:
+   *
+   *  - `target` is the node the event was delivered to. A browser always sets
+   *    it, and the plugin's own key handling reads it to tell "the row was
+   *    activated" from "a control INSIDE the row was".
+   *  - `{ bubble: true }` walks the ancestor chain and honours
+   *    `stopPropagation()`. It is OPT-IN: every pre-existing case dispatches on
+   *    one node and relies on that, so turning it on by default would silently
+   *    change what they exercise. Only the cases that need to prove a gesture
+   *    on a child never reaches its row ask for it.
+   *
+   * @returns {object} the event object the listeners saw.
    */
-  dispatch(type, event = {}) {
-    const e = { preventDefault() {}, stopPropagation() {}, ...event }
-    for (const fn of [...(this.listeners.get(type) ?? [])]) {
-      try {
-        fn(e)
-      } catch (error) {
-        // "Report exception", then continue with the next listener.
-        reportedListenerErrorLog.push({ type, tag: this.tagName, error: String(error) })
-      }
+  dispatch(type, event = {}, options = {}) {
+    const e = {
+      type,
+      defaultPrevented: false,
+      propagationStopped: false,
+      preventDefault() { this.defaultPrevented = true },
+      stopPropagation() { this.propagationStopped = true },
+      stopImmediatePropagation() { this.propagationStopped = true },
+      ...event,
     }
+    if (e.target === undefined || e.target === null) e.target = this
+    let node = this
+    for (;;) {
+      for (const fn of [...(node.listeners.get(type) ?? [])]) {
+        try {
+          fn(e)
+        } catch (error) {
+          // "Report exception", then continue with the next listener.
+          reportedListenerErrorLog.push({ type, tag: node.tagName, error: String(error) })
+        }
+      }
+      if (options.bubble !== true || e.propagationStopped === true) break
+      node = node.parentElement
+      if (node === null || node === undefined) break
+    }
+    return e
   }
 
   click() { this.dispatch('click') }
+
+  /**
+   * `focus()`, counted.
+   *
+   * The colour dialog claims focus for its own field and hands focus back to
+   * whatever opened it; without a focus() to call, both halves of that contract
+   * would be unobservable here.
+   */
+  focus() { this.focusCalls = (this.focusCalls ?? 0) + 1 }
+
+  /**
+   * `element.dispatchEvent`, with the order the platform gives it.
+   *
+   * The DOCUMENT's capture listeners run first, in registration order, and only
+   * then this node's own listeners. `stopPropagation()` sets a flag that stops
+   * the event moving on to the NEXT node in the path — it does not unregister a
+   * listener from the node it fired on (that is `stopImmediatePropagation()`), so
+   * a capture loop keeps running after one of its own listeners called it, and
+   * what it stops is this node: a target listener is then never invoked.
+   *
+   * This exists because the plugin's own hand-off (`redispatchContextMenu`) is a
+   * real `dispatchEvent` on a real host row. Without it that hand-off could not
+   * run at all — `typeof MouseEvent !== 'function'` — so every case that
+   * "proved the host serves this gesture" proved only that the hand-off bailed
+   * out early and never got the chance to be wrong.
+   *
+   * @param {object} event - a cancelable event object.
+   * @returns {boolean} false when the event was cancelled, as the platform says.
+   */
+  dispatchEvent(event) {
+    if (event.target === undefined || event.target === null) event.target = this
+    event.currentTarget = this
+    const invoke = (list) => {
+      for (const fn of [...list]) {
+        try {
+          fn(event)
+        } catch (error) {
+          reportedListenerErrorLog.push({ type: event.type, tag: this.tagName, error: String(error) })
+        }
+      }
+    }
+    invoke(activeDocumentListeners?.get(event.type) ?? [])
+    if (event.propagationStopped !== true) invoke(this.listeners.get(event.type) ?? [])
+    return event.defaultPrevented !== true
+  }
 
   matches(sel) { return matchSimple(this, sel) }
 
@@ -258,6 +501,11 @@ class El {
  * / `[attr^=v]`. Descendant combinators are handled by matches() below.
  */
 function matchCompound(el, part) {
+  // The universal selector. `deepestTextMatch` sweeps `querySelectorAll('*')`
+  // and the plugin's own identification depends on it, so a fake that quietly
+  // matched NOTHING for `*` made the pinned footer entry look absent in tests
+  // while a real browser finds it.
+  if (part === '*') return true
   const m = part.match(/^([a-zA-Z][\w-]*)?((?:\.[\w-]+)*)((?:\[[^\]]+\])*)$/)
   if (!m) return false
   const [, tag, classes, attrs] = m
@@ -283,6 +531,11 @@ function matchCompound(el, part) {
         const expected = dq ?? sq
         if (op === '=' && actual !== expected) return false
         if (op === '^=' && !actual.startsWith(expected)) return false
+        // `[class*="panelList"]`. The host's CSS-module class names are hashed
+        // but KEEP the readable segment (`IQEYQa_panelList`), so a substring
+        // attribute selector is how the panel region and the collapsed rail are
+        // identified without inventing a selector the host does not emit.
+        if (op === '*=' && !actual.includes(expected)) return false
       }
     }
     if (groups === 0) return false
@@ -320,6 +573,12 @@ function makeTree() {
   // listArea > treeBody > tree  (region is inserted above treeBody)
   const listArea = new El('div')
   const treeBody = new El('div')
+  // The hashed-but-readable class the host really puts on the seat that holds
+  // the workspace directories AND their sessions (`WorkspaceBrowser.tsx:669`,
+  // `HoverCardGroup className={clsx(css.treeBody, css.wide)}`). It is recorded
+  // because it is what the host emits, not because anything selects on it: the
+  // directory body is reached from the PROVEN tree, never searched for by name.
+  treeBody.className = '_8WIE4q_treeBody _8WIE4q_wide'
   const tree = new El('div')
   tree.setAttribute('role', 'tree')
   treeBody.appendChild(tree)
@@ -353,6 +612,301 @@ function officialScaffold() {
   return { ...s, head, row, inner }
 }
 
+/**
+ * The stock sidebar with the two surfaces the new work actually reads: the
+ * panels nav above the session list, and a session row carrying the HOST's own
+ * "…" button menu.
+ *
+ * Shapes are taken from the shipped host, not invented:
+ *
+ *   - `SidebarRoot.tsx:280` — `<nav class="panelList" aria-label="全局面板">`
+ *     holding one `panelRow` button per panel, inside the sidebar ROOT, above
+ *     `regionArea`. Class names carry the hashed-but-readable segment the real
+ *     build emits (`IQEYQa_panelList`), because that is what
+ *     `[class*="panelList"]` has to match.
+ *   - `Rows.tsx:667-690` / `ui-workspace/lib/client.js:2328-2350` — the row's
+ *     `rowActions` span wrapping `button[aria-label="会话“<title>”的操作"]`
+ *     whose click toggles `menuOpen`, and the portalled `[role="menu"]` it
+ *     opens.
+ *   - `WorkspaceBrowser.tsx:484` — `childRows = group.expanded ? … : []`: a
+ *     FOLDED group renders NO session rows. `folded` reproduces that by
+ *     unmounting the row when the header is clicked shut, which is the case
+ *     the pinned hand-off has to survive.
+ *
+ * @param {object} [options] - which parts to render.
+ * @param {boolean} [options.rail] - the whole sidebar collapsed to its 56px rail.
+ * @param {boolean} [options.folded] - start with the group folded (rows unmounted),
+ *   and keep unmounting them on every further fold, as the real host does.
+ * @param {boolean} [options.hostRowMenu] - give the host row a real "…" button.
+ * @param {boolean} [options.panels] - render the panels nav at all.
+ * @returns {object} the scaffold, with the interesting nodes hung off it.
+ */
+/**
+ * Where the host row and its "…" button sit before any temporary styling.
+ * Deep in the sidebar on purpose: a menu that anchored there instead of on the
+ * user's pointer would be several hundred pixels from where the click happened,
+ * which is the failure the hand-off has to rule out.
+ */
+const ROW_BOX = { left: 24, top: 420, width: 232, height: 32, right: 256, bottom: 452 }
+const ELLIPSIS_BOX = { left: 232, top: 428, width: 20, height: 16, right: 252, bottom: 444 }
+
+function officialUiScaffold({ rail = false, folded = false, hostRowMenu = true, panels = true, footer = false } = {}) {
+  const s = makeTree()
+  s.tree.setAttribute('aria-label', 'sessions')
+  const root = new El('div')
+  root.className = rail ? 'IQEYQa_root IQEYQa_collapsed' : 'IQEYQa_root'
+  s.body.insertBefore(root, s.listArea)
+
+  let panelNav = null
+  if (panels) {
+    panelNav = new El('nav')
+    panelNav.className = 'IQEYQa_panelList'
+    panelNav.setAttribute('aria-label', '全局面板')
+    for (const label of ['插件', '自动化任务', '待办', 'MCP连接器']) {
+      const panelRow = new El('button')
+      panelRow.type = 'button'
+      panelRow.className = 'IQEYQa_panelRow'
+      panelRow.textContent = label
+      panelNav.appendChild(panelRow)
+    }
+    root.appendChild(panelNav)
+  }
+  root.appendChild(s.listArea)
+
+  const footerParts = footer ? attachSidebarFooter(root) : null
+
+  const head = new El('div')
+  head.setAttribute('role', 'treeitem')
+  head.setAttribute('data-row-key', 'workspace:w1')
+  head.setAttribute('aria-expanded', 'true')
+  head.onclickCount = 0
+
+  const makeRow = () => {
+    const row = new El('div')
+    row.className = 'Rows_sessionRow__x1y2z'
+    row.setAttribute('role', 'treeitem')
+    row.setAttribute('data-row-key', `session:${S1}`)
+    row._rect = { ...ROW_BOX }
+    const inner = new El('span')
+    inner.className = 'Rows_title__x1y2z'
+    inner.textContent = 'one'
+    row.appendChild(inner)
+    if (hostRowMenu) attachHostRowMenu(row, s)
+    return row
+  }
+
+  // The host commits the fold by re-rendering: expanded renders the children,
+  // folded renders none of them. That is the whole reason a pinned row's
+  // official row can be MISSING while its group exists.
+  head.addEventListener('click', () => {
+    head.onclickCount += 1
+    const next = head.getAttribute('aria-expanded') === 'true' ? 'false' : 'true'
+    head.setAttribute('aria-expanded', next)
+    for (const row of [...s.tree.querySelectorAll('[data-row-key^="session:"]')]) {
+      if (next === 'true') s.tree.appendChild(row)
+      else row.remove()
+    }
+    if (next === 'true' && s.tree.querySelector(`[data-row-key="session:${S1}"]`) === null) {
+      s.tree.appendChild(makeRow())
+    }
+  })
+
+  s.tree.appendChild(head)
+  const row = makeRow()
+  s.tree.appendChild(row)
+  if (folded) {
+    head.setAttribute('aria-expanded', 'false')
+    row.remove()
+  }
+  return {
+    ...s,
+    root,
+    panelNav,
+    head,
+    row,
+    makeRow,
+    footerParts,
+    /**
+     * The session row as it is MOUNTED right now.
+     *
+     * Not `row`: pinning folds the group, which unmounts it, and re-expanding
+     * renders a NEW element with a NEW "…" button — exactly what the real host
+     * does, and exactly why a test that kept a handle on the old node would be
+     * asserting about a detached one.
+     */
+    liveRow: () => s.tree.querySelector(`[data-row-key="session:${S1}"]`),
+  }
+}
+
+/**
+ * The user's own opening of the directory, after the plugin's one-time
+ * first-sight fold.
+ *
+ * Every case about a surface that lives INSIDE a workspace group is written
+ * past that fold: the plugin closes a directory the first time it sees it, the
+ * host unmounts its rows, and the user opens it again — three real steps, in
+ * that order. Calling this after `runBundle` performs the third; the first two
+ * have already happened for real. A case that skips it is asserting about a row
+ * the host no longer renders, which is a different thing entirely.
+ *
+ * @param {object} sc - an `officialUiScaffold` result.
+ */
+function openWorkspace(sc) {
+  assert.equal(
+    sc.head.getAttribute('aria-expanded'), 'false',
+    'precondition: the plugin folded this directory on first sight',
+  )
+  assert.equal(sc.tree.querySelector('[data-row-key^="session:"]'), null, 'precondition: the host unmounted its rows')
+  sc.head.click()
+  assert.equal(sc.head.getAttribute('aria-expanded'), 'true', 'the user opened it, and the host remounted its rows')
+  return sc
+}
+
+/**
+ * The sidebar's own footer, at the shape the running app renders it (measured
+ * on http://127.0.0.1:3082/ and read back off the live DOM):
+ *
+ *   footerActions
+ *     └ (display:contents wrappers) balance region + the import control
+ *   accountRoot
+ *     └ span > button[aria-label=账号菜单]
+ *
+ * The identification the plugin uses is what this scaffolds on purpose: two
+ * stable `aria-label`s, their nearest common ancestor, and the deepest element
+ * whose own text starts with 已置顶. Nothing here is a hashed class.
+ *
+ * @param {Element} root - the sidebar root to hang it under.
+ * @returns {object} the nodes a case asserts on.
+ */
+function attachSidebarFooter(root) {
+  const actions = new El('div')
+  actions.className = 'IQEYQa_footerActions'
+
+  // `display:contents` on the wrappers, because that is what the live page
+  // emits: the footer control's own box IS its box, and a wrapper that
+  // generated one would let a marker land on a box that is not on screen.
+  const balanceWrap = new El('div')
+  balanceWrap.className = 'cm-wrap'
+  balanceWrap.style.setProperty('display', 'contents')
+  const balance = new El('section')
+  balance.setAttribute('role', 'region')
+  balance.setAttribute('aria-label', '简化侧栏显示')
+  balance.className = 'cm-footer-stack simple'
+  for (const cls of ['cm-simple-summary', 'cm-foot clickable', 'cm-peak-strip weekend']) {
+    const cell = new El('div')
+    cell.className = cls
+    balance.appendChild(cell)
+  }
+  balanceWrap.appendChild(balance)
+
+  // The pinned-count entry, carrying the live page's own `aria-label` and the
+  // `display:contents` parent it renders inside. The label is what the plugin
+  // identifies it by FIRST: on the live page the visible text alone matched
+  // nothing, because the text sits on a CHILD of this button.
+  const pinnedWrap = new El('div')
+  pinnedWrap.style.setProperty('display', 'contents')
+  const pinnedEntry = new El('button')
+  pinnedEntry.className = '__dsh-session-pin-footer__'
+  pinnedEntry.setAttribute('role', 'button')
+  pinnedEntry.setAttribute('aria-label', '已置顶的会话')
+  pinnedEntry.setAttribute('title', '已置顶的会话')
+  const pinnedLabel = new El('span')
+  pinnedLabel.textContent = '已置顶 5'
+  pinnedEntry.appendChild(pinnedLabel)
+
+  const importWrap = new El('div')
+  importWrap.className = 'cm-wrap'
+  importWrap.style.setProperty('display', 'contents')
+  const importer = new El('button')
+  importer.setAttribute('aria-label', '导入会话')
+  importer.textContent = '导入会话'
+  importWrap.appendChild(importer)
+
+  actions.appendChild(balanceWrap)
+  actions.appendChild(pinnedWrap)
+  pinnedWrap.appendChild(pinnedEntry)
+  actions.appendChild(importWrap)
+  root.appendChild(actions)
+
+  const accountRoot = new El('div')
+  accountRoot.className = 'hR2WGG_root'
+  const accountSpan = new El('span')
+  const account = new El('button')
+  account.setAttribute('aria-label', '账号菜单')
+  account.className = 'hR2WGG_trigger'
+  account.textContent = '账号'
+  accountSpan.appendChild(account)
+  accountRoot.appendChild(accountSpan)
+  root.appendChild(accountRoot)
+
+  return {
+    actions, balance, balanceWrap, importer, importWrap, pinnedEntry, account, accountRoot,
+  }
+}
+
+/**
+ * The host's own row menu: `rowActions` > `button[aria-label="会话“<title>”的操作"]`,
+ * whose click toggles the row's `menuOpen` class and opens a portalled menu
+ * carrying the host's own items (置顶/取消置顶、重命名、分叉会话、归档会话、复制
+ * Session ID — `sidebar.workspaces.session.menu.item`). Nothing the plugin does
+ * may replace, reorder or graft into that surface.
+ */
+function attachHostRowMenu(row, scaffold) {
+  const actions = new El('span')
+  actions.className = 'Rows_rowActions__x1y2z'
+  // The host measures the anchor WRAPPER, which spans the row's trailing
+  // cells. Positioned inside the row's box like the real one.
+  actions._rect = { left: 190, top: 424, width: 66, height: 24, right: 256, bottom: 448 }
+  const ellipsis = new El('button')
+  ellipsis.type = 'button'
+  ellipsis.className = 'Rows_iconButton__x1y2z'
+  ellipsis.setAttribute('aria-label', '会话“one”的的操作')
+  ellipsis._rect = { ...ELLIPSIS_BOX }
+  ellipsis.clicks = 0
+  let menu = null
+  ellipsis.addEventListener('click', () => {
+    ellipsis.clicks += 1
+    const open = row.className.includes('menuOpen')
+    row.className = open
+      ? row.className.replace(/\s*\S*menuOpen\S*/g, '').trim()
+      : `${row.className} Rows_menuOpen__x1y2z`
+    if (open) {
+      menu?.remove()
+      menu = null
+      return
+    }
+    // The portal list, positioned by the host from the anchor rect. Its
+    // geometry is recorded so a test can prove the anchor it measured was the
+    // one under the pointer.
+    menu = new El('div')
+    menu.setAttribute('role', 'menu')
+    menu.anchorRect = actions.getBoundingClientRect()
+    for (const label of ['置顶', '重命名', '分叉会话', '归档会话', '复制 Session ID']) {
+      const item = new El('button')
+      item.setAttribute('role', 'menuitem')
+      item.textContent = label
+      menu.appendChild(item)
+    }
+    scaffold.body.appendChild(menu)
+  })
+  actions.appendChild(ellipsis)
+  row.appendChild(actions)
+  row.hostMenu = () => menu
+  row.ellipsis = ellipsis
+}
+
+/**
+ * codex-ui's own session menu, as `Menu` renders it into a portal — the zh
+ * labels behind its `sessions.*` keys (installed codex-ui 1.1.35,
+ * lib/client.js:9182-9212). Transcribed because it is what the row's own
+ * handler opens, and a case has to be able to tell codex's menu apart from a
+ * plugin one rather than only counting nodes.
+ */
+const CODEX_SESSION_MENU = [
+  '重命名会话', '归档会话', '删除会话', '在新会话中继续',
+  '在资源管理器中打开', '复制工作目录', '复制会话标题', '复制会话 ID',
+]
+
 function codexScaffold() {
   const s = makeTree()
   // The host container codex-ui keeps mounted whatever the groups inside it are
@@ -372,6 +926,37 @@ function codexScaffold() {
   row.className = 'dcu-wb-session dcu-wb-session-time'
   row.setAttribute('role', 'treeitem')
   row.setAttribute('data-dcu-session', S1)
+
+  /**
+   * codex-ui's OWN session-row right-click handler (lib/client.js:4617-4626),
+   * transcribed: React serves it at the row, so a right-click on the row is
+   * claimed synchronously with `preventDefault()` + `stopPropagation()` and the
+   * host opens its own session menu at the pointer.
+   *
+   * It is the thing that makes "codex serves this gesture" an OBSERVATION
+   * rather than an assumption about which rows are mounted: `nativeClaims`
+   * records that this handler really received the gesture, so a case may prove
+   * the plugin stood down for a claim it can also see was made.
+   */
+  const nativeClaims = []
+  row.addEventListener('contextmenu', (event) => {
+    event.preventDefault()
+    event.stopPropagation()
+    nativeClaims.push({ id: S1, x: event.clientX, y: event.clientY })
+    s.body.querySelector('.dcu-host-menu')?.remove()
+    const menu = new El('div')
+    menu.className = 'dcu-host-menu'
+    menu.setAttribute('role', 'menu')
+    for (const label of CODEX_SESSION_MENU) {
+      const item = new El('button')
+      item.type = 'button'
+      item.setAttribute('role', 'menuitem')
+      item.textContent = label
+      menu.appendChild(item)
+    }
+    s.body.appendChild(menu)
+  })
+
   const title = new El('span')
   title.className = 'dcu-wb-session-title'
   row.appendChild(title)
@@ -379,7 +964,7 @@ function codexScaffold() {
   project.appendChild(head)
   project.appendChild(body2)
   s.tree.appendChild(project)
-  return { ...s, project, head, row, title }
+  return { ...s, project, head, row, title, nativeClaims }
 }
 
 // -------------------------------------------------------------------- drive
@@ -418,11 +1003,79 @@ let previousRunDispose = null
  * linger. The harness's own waits never enter the set at all: they use
  * `harnessSetTimeout`, captured before any wrapping.
  */
-async function runBundle(scaffold, { pinned, mutable = false, locale = undefined, items = undefined }) {
+/**
+ * One origin's Storage, as the browser models it: a single map of key/value,
+ * one call log, one refusal mode.
+ *
+ * Two windows on the same origin share ONE Storage object — that is not a
+ * convenience, it is the whole reason a local preference can conflict at all.
+ * `newStorageFixture()` twice gives two INDEPENDENT origins (the previous
+ * behaviour, where every mount got its own private store); passing ONE fixture
+ * to two `runBundle` calls gives two windows on the same origin.
+ *
+ * `foreignWrites` is kept separate from `writes` on purpose. `writes` is what
+ * THIS harness observed a mounted bundle do through `setItem`, and several cases
+ * assert on its length to prove a bundle wrote nothing. A write made on behalf
+ * of another window (`writeFromOtherWindow`) lands in `foreignWrites` so it
+ * cannot be counted as the bundle's own — otherwise "this window wrote nothing
+ * in response to a foreign write" could not be asserted at all.
+ *
+ * @param {object} [options] - the fixture's shape.
+ * @param {string} [options.mode] - 'ok' or 'throw' (a browser refusing storage).
+ * @param {object} [options.seed] - the keys already present.
+ * @returns {{map: Map<string, string>, calls: {reads: string[], writes: [string, string][]}, foreignWrites: [string, string][], mode: string}}
+ */
+function newStorageFixture({ mode = 'ok', seed = {} } = {}) {
+  return {
+    map: new Map(Object.entries(seed)),
+    calls: { reads: [], writes: [] },
+    foreignWrites: [],
+    mode,
+  }
+}
+
+async function runBundle(scaffold, {
+  pinned, mutable = false, locale = undefined, items = undefined,
+  // 'ok' (default) is a working localStorage; 'throw' is a browser that
+  // refuses storage entirely (private mode, disabled site data, quota). The
+  // plugin must degrade to its default state and keep working either way.
+  storage = 'ok',
+  storageSeed = {},
+  // Hand this mount an EXISTING origin instead of a private one, so two mounts
+  // are two windows on the same origin reading and writing one Storage.
+  storageFixture = null,
+  // Keep the previous generation mounted rather than retiring it, so a test can
+  // hold two live windows at the same time. The test owns both disposes.
+  alongside = false,
+  // The official slot registry, when this mount is to take part in a slot. It is
+  // `undefined` for every other case, which is exactly what `ctx.get('slots')`
+  // answers on a host that publishes none.
+  slots = undefined,
+} = {}) {
   // The previous generation goes first, so its bundle can no longer arm
   // anything into the set this run is about to start counting.
-  if (previousRunDispose !== null) previousRunDispose()
+  if (!alongside && previousRunDispose !== null) previousRunDispose()
   const listeners = new Map()
+
+  const fixture = storageFixture ?? newStorageFixture({ mode: storage, seed: storageSeed })
+  const store = fixture.map
+  const storageCalls = fixture.calls
+  const fakeStorage = {
+    getItem(key) {
+      storageCalls.reads.push(key)
+      if (fixture.mode === 'throw') throw new Error('storage denied')
+      return store.has(key) ? store.get(key) : null
+    },
+    setItem(key, value) {
+      storageCalls.writes.push([key, value])
+      if (fixture.mode === 'throw') throw new Error('storage denied')
+      store.set(key, String(value))
+    },
+    removeItem(key) {
+      if (fixture.mode === 'throw') throw new Error('storage denied')
+      store.delete(key)
+    },
+  }
 
   /**
    * The bundle is evaluated with `new Function`, so it resolves `setTimeout`
@@ -455,6 +1108,31 @@ async function runBundle(scaffold, { pinned, mutable = false, locale = undefined
    * the plugin failed to release is still visible here afterwards.
    */
   const liveTimers = () => [...liveTimerHandles]
+
+  /**
+   * `window` listeners, RECORDED FOR REAL.
+   *
+   * This used to be `addEventListener: () => {}`, which made every claim about
+   * window-level listeners unfalsifiable: a bundle that registered a `storage`
+   * handler and never removed it, or one that ignored the event, produced the
+   * same observable nothing. Recording them, and removing them on the real
+   * `removeEventListener`, is what lets a case assert both that a delivery
+   * happened and that dispose left none behind. `dispatchWindowEvent` below is
+   * the delivery half.
+   */
+  const windowListeners = new Map()
+  const addWindowListener = (t, fn) => {
+    if (!windowListeners.has(t)) windowListeners.set(t, [])
+    windowListeners.get(t).push(fn)
+  }
+  const removeWindowListener = (t, fn) => {
+    const handlers = windowListeners.get(t)
+    if (handlers === undefined) return
+    const index = handlers.indexOf(fn)
+    if (index >= 0) handlers.splice(index, 1)
+    if (handlers.length === 0) windowListeners.delete(t)
+  }
+
   globalThis.document = {
     body: scaffold.body,
     head: scaffold.head,
@@ -466,10 +1144,19 @@ async function runBundle(scaffold, { pinned, mutable = false, locale = undefined
     removeEventListener: () => {},
     dispatchEvent: () => {},
   }
-  globalThis.window = { addEventListener: () => {}, removeEventListener: () => {} }
+  globalThis.window = {
+    addEventListener: addWindowListener,
+    removeEventListener: removeWindowListener,
+    dispatchEvent: () => false,
+  }
+  globalThis.localStorage = fakeStorage
   globalThis.MutationObserver = FakeMutationObserver
   globalThis.Element = El
   globalThis.KeyboardEvent = class { constructor(type, init) { this.type = type; Object.assign(this, init) } }
+  // The plugin's hand-off needs a real constructor to build its re-delivery with
+  // and a real document to deliver it into.
+  globalThis.MouseEvent = MouseEvent
+  activeDocumentListeners = listeners
 
   let registration = null
   globalThis.window.__ModuleLoader__ = { load: (v) => { registration = v } }
@@ -545,6 +1232,7 @@ async function runBundle(scaffold, { pinned, mutable = false, locale = undefined
     },
     layout: { selectPanel: (id) => { panels.push(id) } },
     locale,
+    slots,
   })) services[name] = value
 
   // Model cordis faithfully: the fiber activates NOW with nothing provided, and
@@ -602,8 +1290,61 @@ async function runBundle(scaffold, { pinned, mutable = false, locale = undefined
   }
   /** Reproduce a host re-render: the plugin reconciles off its list subscriptions. */
   const nudge = () => { for (const fn of [...nudges]) fn() }
-  previousRunDispose = dispose
-  return { listeners, registration, logs, afterApply, dispose, services, pinCalls, nudge, live, opened, panels, liveTimers }
+  if (!alongside) previousRunDispose = dispose
+  return {
+    listeners, registration, logs, afterApply, dispose, services, pinCalls, nudge, live,
+    opened, panels, liveTimers, store, storageCalls, storageFixture: fixture, windowListeners,
+  }
+}
+
+/**
+ * Deliver one event to the listeners this mount actually registered on `window`.
+ *
+ * This is the browser half of the cross-window contract: it calls the very
+ * functions the bundle passed to `addEventListener`, with the event object it
+ * would have been handed. Nothing about the bundle is stubbed, re-implemented
+ * or bypassed.
+ *
+ * @param {object} run - a `runBundle` result.
+ * @param {string} type - the event type.
+ * @param {object} event - the event to deliver.
+ * @returns {number} how many listeners were delivered to.
+ */
+function dispatchWindowEvent(run, type, event) {
+  const handlers = [...(run.windowListeners.get(type) ?? [])]
+  for (const fn of handlers) fn(event)
+  return handlers.length
+}
+
+/**
+ * What a write in ANOTHER window on the same origin does to this one: the
+ * shared Storage changes, and THIS window alone is told about it.
+ *
+ * Two properties are modelled rather than assumed, because both are what the
+ * browser guarantees and neither is a property of the bundle:
+ *
+ *   - the writing window is NOT told (no event at the writer), so this cannot
+ *     be folded into `setItem` without also faking the plugin's own read-back;
+ *   - the event carries the NEW value, and the store already holds it, in that
+ *     order — a listener that reads Storage and a listener that trusts
+ *     `newValue` must agree.
+ *
+ * @param {object} run - the window being told.
+ * @param {string} key - the storage key the other window wrote.
+ * @param {unknown} value - the raw value it wrote.
+ * @returns {number} how many listeners were delivered to.
+ */
+function writeFromOtherWindow(run, key, value) {
+  const fixture = run.storageFixture
+  const raw = String(value)
+  fixture.foreignWrites.push([key, raw])
+  fixture.map.set(key, raw)
+  return dispatchWindowEvent(run, 'storage', {
+    key,
+    newValue: raw,
+    oldValue: null,
+    storageArea: null,
+  })
 }
 
 /**
@@ -648,6 +1389,18 @@ function staticCss(scaffold) {
   assert.ok(
     rules.some(r => r.includes("role='tree'")),
     'the hide rule must be scoped to the tree so plugin-owned rows survive',
+  )
+  // The dynamic sheet is three optional halves joined with '\n', and the last
+  // owner must blank it to EXACTLY the empty string — a teardown that leaves a
+  // stray newline behind would show up as a live-looking sheet, and the string
+  // comparison in the disposal cases would still call it equal to `''` only by
+  // accident. `filter(Boolean)` on the source side is what keeps the join free
+  // of empty halves, and this reads the RAW text: `sheetRules` filters empty
+  // lines out before the test ever sees them, so it cannot see this at all.
+  const rawCss = sc.head.querySelector('style[data-stp-sheet="dynamic"]')?.textContent ?? ''
+  assert.equal(
+    /\n\s*\n|^\n|\n$/.test(rawCss), false,
+    `the dynamic sheet must carry no blank line; got ${JSON.stringify(rawCss)}`,
   )
   console.log('✔ official flavor: pin hide rule targets data-row-key="session:<id>"')
 
@@ -702,11 +1455,16 @@ function staticCss(scaffold) {
   console.log('✔ codex flavor: group folded through .dcu-wb-project-head toggle')
 }
 
-// --- right-click on a codex row while NO shared context-menu owner exists.
-// The owner (@baihejiangnan/dsh-session-context-menu) is what renders the menu on
-// the real desktop; with it absent the plugin offers its own — but only on a
-// positively identified host row, and it must never go looking for someone
-// else's menu surface to graft into.
+// --- right-click on a codex row. codex-ui SERVES ITS OWN session menu on
+// right-click, with its own actions in it, so the gesture is not this plugin's
+// to claim: preventing it, or opening a plugin menu over it, would cost the user
+// the host's menu and gain them exactly one entry. Pin on this rendering comes
+// from the shared menu owner (@baihejiangnan/dsh-session-context-menu), which
+// renders into the menu codex already opens.
+//
+// What must still hold: the plugin never goes looking for someone else's menu
+// surface to graft into, and it never stops a listener downstream from seeing
+// the event.
 {
   const sc = codexScaffold()
   const { listeners, pinCalls } = await runBundle(sc, { pinned: [] })
@@ -728,15 +1486,16 @@ function staticCss(scaffold) {
   }
   handlers[0](ev)
   await afterDispatch()
-  assert.equal(ev.defaultPrevented, true, 'with no owner, the plugin must claim the row it resolved')
-  assert.equal(rootSentinel.length, 0, 'and the event must not also reach a host listener')
-
-  const own = sc.body.querySelector('[data-stp-menu]')
-  assert.ok(own !== null, "the plugin's own menu must open on a real host session row")
-  const item = own.querySelector('[data-stp-pin-item]')
-  assert.ok(item !== null, 'the own menu must offer the pin action')
-  assert.match(item.textContent, /置顶该会话/, 'an unpinned session offers Pin')
-  console.log('✔ codex flavor with no menu owner: own menu on a real session row')
+  assert.equal(
+    ev.defaultPrevented, false,
+    "codex's own session menu must be neither prevented nor covered",
+  )
+  assert.equal(
+    sc.body.querySelector('[data-stp-menu]'), null,
+    'and no plugin menu may open on top of it',
+  )
+  assert.equal(rootSentinel.length, 0, 'the event must not also reach a host listener')
+  console.log('✔ codex flavor: the native session menu and its actions are left alone')
 
   // A foreign surface appearing afterwards must stay untouched.
   const foreign = new El('div')
@@ -754,11 +1513,32 @@ function staticCss(scaffold) {
   )
   assert.ok(foreignRow.isConnected, 'the host must keep its own menu rows')
   console.log('✔ no DOM graft: a foreign menu surface is never touched')
+}
 
-  // Clicking the item must write through the official pin RPC.
+// --- The plugin's own menu, where it is still the right answer: an OFFICIAL
+// row that carries no host "…" control to borrow. Its single action must write
+// through the official pin RPC, not through anything of its own.
+{
+  const sc = officialUiScaffold({ hostRowMenu: false })
+  const { listeners, pinCalls } = await runBundle(sc, { pinned: [] })
+  const handlers = listeners.get('contextmenu') ?? []
+  handlers[0]({
+    target: sc.row,
+    clientX: 100,
+    clientY: 200,
+    defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true },
+    stopPropagation() {},
+  })
+  await afterDispatch()
+  const own = sc.body.querySelector('[data-stp-menu]')
+  assert.ok(own !== null, 'a row with no host menu control still gets the pin fallback')
+  const item = own.querySelector('[data-stp-pin-item]')
+  assert.ok(item !== null, 'the fallback must offer the pin action')
+  assert.match(item.textContent, /置顶该会话/, 'an unpinned session offers Pin')
   item.click()
   await new Promise(r => { harnessSetTimeout(r, 20) })
-  assert.deepEqual(pinCalls, [['pin', S1]], 'the own menu must pin through workspaces.pinSession')
+  assert.deepEqual(pinCalls, [['pin', S1]], 'the pin must go through workspaces.pinSession')
   console.log('✔ own menu item pins through the official workspace RPC')
 }
 
@@ -981,9 +1761,9 @@ function staticCss(scaffold) {
   // Wait out the memoization window so the next probe really re-reads the DOM.
   await new Promise(r => { harnessSetTimeout(r, 320) })
 
-  // Right-click the now-rendered codex row. No shared context-menu owner exists
-  // in this harness, so the plugin owns the row it positively resolved — and
-  // still nothing of anyone else's may be touched.
+  // Right-click the now-rendered codex row. Its menu is codex's own, so the
+  // gesture stays the host's — and still nothing of anyone else's menu surface
+  // may be touched.
   const late = {
     target: row, defaultPrevented: false, propagationStopped: false,
     preventDefault() { this.defaultPrevented = true },
@@ -992,10 +1772,13 @@ function staticCss(scaffold) {
   }
   handlers[0](late)
   await afterDispatch()
-  assert.equal(late.defaultPrevented, true, 'with no owner, a resolved codex row is the plugin\'s to serve')
-  assert.ok(
-    bare.body.querySelector('[data-stp-menu]') !== null,
-    'the late-rendered sidebar must be detected and served by the plugin\'s own menu',
+  assert.equal(
+    late.defaultPrevented, false,
+    "a late-rendered codex row's native menu is the host's, not the plugin's to replace",
+  )
+  assert.equal(
+    bare.body.querySelector('[data-stp-menu]'), null,
+    'and no plugin menu may appear on top of it',
   )
 
   const surface = new El('div')
@@ -1484,6 +2267,28 @@ function rawContextMenu(target) {
 /** Wait past the reconcile debounce (60ms) for a 1000-row region. */
 function settle(ms = 250) {
   return new Promise(resolve => { harnessSetTimeout(resolve, ms) })
+}
+
+/**
+ * Wait until `ready()` holds, or fail loudly when it does not.
+ *
+ * A fixed `setTimeout(40)` after an async action is a GUESS at how long the
+ * round-trip takes, and a guess is a flake: it passes on a quiet machine and
+ * fails on a busy one with an unrelated-looking error. Polling for the actual
+ * state keeps the assertion identical and removes the timing assumption; the
+ * deadline is generous and its failure message says what was still missing.
+ *
+ * @param {() => boolean} ready - the condition to wait for.
+ * @param {string} what - named in the failure message.
+ * @param {number} deadlineMs - how long to keep trying.
+ */
+async function waitUntil(ready, what, deadlineMs = 1000) {
+  const step = 10
+  for (let waited = 0; waited <= deadlineMs; waited += step) {
+    if (ready() === true) return
+    await settle(step)
+  }
+  assert.ok(ready() === true, `timed out after ${deadlineMs}ms waiting for ${what}`)
 }
 
 /** Total listener registrations across a set of fake rows. */
@@ -1993,9 +2798,17 @@ function storeFoldScaffold() {
   }
 }
 
-// --- S3: a group seen for the first time with NO pin is left exactly as the
-// user has it, on first mount and again after the plugin is torn down and
-// re-applied (the "service reload" shape).
+// --- S3: a group that is ALREADY closed costs nothing — on first sight, on
+// later notifications, and again after the plugin is torn down and re-applied
+// (the "service reload" shape).
+//
+// This used to read "a group seen for the first time with NO pin is left
+// exactly as the user has it". The one-time default fold has since claimed the
+// first sighting of every foldable directory (S3b), so what survives it is the
+// narrower invariant that still carries the weight, and it is the same defect
+// the old case was written for: a group already in the state the plugin wants
+// must cost ZERO clicks, and no notification may change that. A group the USER
+// opened after that initialization is S3b's second half.
 {
   const sc = foldScaffold()
   sc.makeGroup('wA', false)
@@ -2008,7 +2821,7 @@ function storeFoldScaffold() {
       'false',
       `${key} was folded before the plugin ever touched it, and must stay folded`,
     )
-    assert.equal(sc.heads.get(key).clicks, 0, `${key} must not be clicked on first sight`)
+    assert.equal(sc.heads.get(key).clicks, 0, `${key} must not be clicked when it is already closed`)
   }
   // Later notifications change nothing either.
   run.nudge()
@@ -2028,8 +2841,127 @@ function storeFoldScaffold() {
   )
   assert.equal(sc.heads.get('wA').clicks + sc.heads.get('wB').clicks, 0, 'and must not click it')
   again.dispose()
-  console.log('✔ R07/S3: a first sighting with no pin leaves the user\'s fold exactly as it was')
+  console.log('✔ R07/S3: an already-closed group is never clicked — not on first sight, not on churn, not after a reload')
 }
+
+// --- S3b: THE FIRST-SIGHT DEFAULT FOLD. A foldable directory the plugin has
+// never seen is closed ONCE — pin or no pin — and from then on that group's
+// expansion is the user's alone.
+//
+// Two rules make it survivable, and both are about which question the pass is
+// asking:
+//
+//  1. UNTIL THE GROUP HAS BEEN READ CLOSED, THE TARGET IS "CLOSED" — whatever
+//     the pin set says. The pin rule ("no pin means expand") only takes over
+//     once that has happened. A state that flipped to "expand" the moment the
+//     default click was issued would wait for the fold to land and then
+//     immediately open the group again, one reconcile later.
+//  2. AFTERWARDS, A GROUP THE USER OPENS IS BOOKED AS REACHED. Otherwise every
+//     idle pass, title change, reorder and unrelated pin is a reason to close
+//     the group again — the `GROUP_ZERO_PINS_INITIAL` defect, still fatal under
+//     the new default.
+{
+  const sc = foldScaffold()
+  const a = sc.makeGroup('wA', true)
+  const b = sc.makeGroup('wB', true)
+  // Disjoint members, so a pin on one group cannot be mistaken for a pin on
+  // the other.
+  const run = await runBundle(sc, {
+    pinned: [],
+    items: [
+      { workspaceId: 'wA', title: 'A', sessionIds: [S1] },
+      { workspaceId: 'wB', title: 'B', sessionIds: [S2] },
+    ],
+  })
+  await settle()
+  for (const [key, head] of [['wA', a], ['wB', b]]) {
+    assert.equal(
+      head.getAttribute('aria-expanded'),
+      'false',
+      `${key} holds no pin and must still be closed the first time it is seen`,
+    )
+    assert.equal(head.clicks, 1, `${key} takes exactly one click to get there`)
+  }
+  run.nudge()
+  run.nudge()
+  await settle()
+  assert.equal(a.clicks + b.clicks, 2, 'a closed group is never clicked again')
+
+  // The user opens one by hand. From here nothing may close it again.
+  a.setAttribute('aria-expanded', 'true')
+  const clicksAfterOpen = a.clicks
+  run.live.byId = { ...run.live.byId, [S2]: { id: S2, displayTitle: 'two (renamed)', updatedAt: 9 } }
+  run.live.items = [
+    { workspaceId: 'wA', title: 'A', sessionIds: [S1] },
+    { workspaceId: 'wB', title: 'B', sessionIds: [S2] },
+  ]
+  // A pin that belongs to the OTHER group entirely, and its removal.
+  run.live.pinned = [S2]
+  for (let i = 0; i < 3; i += 1) { run.nudge(); await settle() }
+  run.live.pinned = []
+  for (let i = 0; i < 3; i += 1) { run.nudge(); await settle() }
+  assert.equal(a.clicks, clicksAfterOpen, 'no idle pass, title, reorder or foreign pin may re-close it')
+  assert.equal(a.getAttribute('aria-expanded'), 'true', 'and it must stay exactly as the user left it')
+  // The group that DOES hold a pin still answers to it.
+  assert.equal(b.getAttribute('aria-expanded'), 'true', 'losing its last pin re-opens that group')
+  run.dispose()
+  console.log("✔ R07/S3b: a directory is closed once on first sight, and the user's own opening survives every later change")
+}
+
+// --- S3c: a DIRECTORY THAT RENDERS LATE is a first sighting like any other.
+// Nothing is booked while its header is missing, so it is still closed when the
+// header finally appears.
+{
+  const sc = foldScaffold()
+  sc.makeGroup('wA', false) // present: this is what proves the sidebar
+  const run = await runBundle(sc, { pinned: [], items: TWO_GROUPS })
+  await settle()
+  assert.equal(
+    sc.tree.querySelectorAll('[data-row-key="workspace:wB"]').length,
+    0,
+    'the second directory has not rendered its header yet',
+  )
+  const late = sc.makeGroup('wB', true)
+  run.nudge()
+  await settle()
+  assert.equal(
+    late.getAttribute('aria-expanded'),
+    'false',
+    'a directory that arrives late is closed on first sight too',
+  )
+  assert.equal(late.clicks, 1, 'and it takes exactly one click')
+  run.dispose()
+  console.log('✔ R07/S3c: a directory that renders late is still closed on first sight')
+}
+
+// --- S3d: the default fold on a host that commits on ITS OWN schedule.
+//
+// Rule 1 above is only observable against a host that takes time: the default
+// fold is issued, and every later pass must still be asking for "closed". A
+// target that flipped to "expand" while the click was in flight would land the
+// fold and open the group right behind it — the reading moved, the request was
+// spent, and a second click would follow.
+const defaultFoldTags = []
+for (const [delayMs, notifications] of [[250, 0], [250, 1], [1000, 2]]) {
+  const sc = foldScaffold()
+  const a = sc.makeGroup('wA', true, `late:${delayMs}`)
+  const run = await runBundle(sc, { pinned: [], items: TWO_GROUPS })
+  const tag = `first-sight fold, host applies after ${delayMs}ms / ${notifications} notification(s)`
+  await settle(120)
+  assert.equal(a.clicks, 1, `${tag}: one click is issued`)
+  for (let i = 0; i < notifications; i += 1) {
+    run.nudge()
+    await settle(Math.max(90, Math.floor(delayMs / 5)))
+  }
+  await settle(delayMs + 400)
+  assert.equal(a.getAttribute('aria-expanded'), 'false', `${tag}: and it must not be opened again behind it`)
+  assert.equal(a.transitions, 1, `${tag}: toggled exactly once`)
+  assert.equal(a.clicks, 1, `${tag}: the intent stays the same one while the click is in flight`)
+  defaultFoldTags.push(`${delayMs}ms/${notifications}`)
+  run.dispose()
+}
+console.log(`✔ R07/S3d: the first-sight fold is never followed by the pin rule opening the group back (${defaultFoldTags.join(', ')})`)
+
 
 // --- S4: the signature is the SET of pinned members. Re-ordering, or adding a
 // session that is not pinned, is not a pin change and must not re-touch a group
@@ -2426,6 +3358,2696 @@ console.log('✔ R07/S5e: the host re-rendering its header does not re-issue a c
   assert.equal(a.transitions, 2)
   run.dispose()
   console.log('✔ R07: a real pin/unpin pair folds and unfolds once each, and never clicks a satisfied group')
+}
+
+// =====================================================================
+// REQUIREMENT 1 — the global-panels region ("插件 / 自动化任务 / 待卡 / MCP连接器")
+// starts folded, with a compact keyboard-reachable control, a remembered user
+// choice, and no residue.
+//
+// The host has no preference of its own for this region (SidebarRoot.tsx:279-293
+// renders `<nav class="panelList">` unconditionally), so "default folded" and
+// "remember the user's choice" are this plugin's to implement — and to give back.
+// =====================================================================
+
+/** The control the plugin mounts above the panels nav. */
+const panelsToggle = (sc) => sc.root.querySelector('[data-stp-panels-toggle]')
+
+// --- 1a: default folded, keyboard reachable, correctly wired to the nav.
+{
+  const sc = officialUiScaffold()
+  const run = await runBundle(sc, { pinned: [] })
+  const nav = sc.panelNav
+  const toggle = panelsToggle(sc)
+  assert.ok(toggle !== null, 'a compact control for the panels region must be mounted')
+  assert.equal(toggle.tagName, 'BUTTON', 'it must be a real button, so the keyboard reaches it')
+  assert.equal(toggle.getAttribute('type'), 'button')
+  assert.ok((toggle.getAttribute('aria-label') ?? '').length > 0, 'the control must name itself')
+  assert.equal(nav.getAttribute('data-stp-panels'), 'collapsed', 'no stored choice means folded')
+  assert.equal(toggle.getAttribute('aria-expanded'), 'false')
+  const controls = toggle.getAttribute('aria-controls')
+  assert.ok(controls, 'aria-controls must point at the region it controls')
+  assert.equal(nav.getAttribute('id'), controls, 'aria-controls must name the nav itself')
+  assert.ok(
+    sheetRules(sc).some(rule => rule.includes('data-stp-panels') && rule.includes('display:none')),
+    `the fold must be a stylesheet rule from this plugin; got ${JSON.stringify(sheetRules(sc))}`,
+  )
+  assert.ok(staticCss(sc).includes('stp-panels-toggle'), 'the control must be styled, not bare')
+  run.dispose()
+  console.log('✔ panels: default folded, with a keyboard-reachable aria-wired control')
+}
+
+// --- 1b: the user's explicit choice wins, survives a reconcile, and is stored.
+{
+  const sc = officialUiScaffold()
+  const run = await runBundle(sc, { pinned: [] })
+  const toggle = panelsToggle(sc)
+  toggle.click()
+  assert.equal(toggle.getAttribute('aria-expanded'), 'true', 'the click must expand the region')
+  assert.equal(sc.panelNav.getAttribute('data-stp-panels'), 'expanded')
+  assert.ok(
+    !sheetRules(sc).some(rule => rule.includes('data-stp-panels') && rule.includes('display:none')),
+    'expanded means no hide rule',
+  )
+  assert.ok(run.storageCalls.writes.length > 0, 'the explicit choice must be written to storage')
+  const [key] = run.storageCalls.writes[0]
+  assert.ok(
+    key.startsWith('dsh-session-top'),
+    `the storage key must be namespaced to this plugin; got ${key}`,
+  )
+
+  // The failure this guards: a reconcile that re-applies its own default would
+  // slam the region shut again on the next host notification.
+  for (let i = 0; i < 3; i += 1) {
+    run.nudge()
+    await settle()
+  }
+  assert.equal(
+    toggle.getAttribute('aria-expanded'), 'true',
+    'a reconcile must never re-close what the user explicitly opened',
+  )
+  assert.equal(panelsToggle(sc), toggle, 'and must not mount a second control')
+  run.dispose()
+  console.log('✔ panels: an explicit expand survives every reconcile')
+}
+
+// --- 1c: the remembered choice is read back on the NEXT mount.
+{
+  const sc = officialUiScaffold()
+  const run = await runBundle(sc, { pinned: [], storageSeed: { 'dsh-session-top:panels-collapsed': '0' } })
+  const toggle = panelsToggle(sc)
+  assert.equal(toggle.getAttribute('aria-expanded'), 'true', 'a remembered expand must be honoured')
+  assert.notEqual(sc.panelNav.getAttribute('data-stp-panels'), 'collapsed')
+  run.dispose()
+  console.log('✔ panels: the remembered expand is honoured on the next mount')
+}
+
+// --- 1d: a browser that refuses storage still gets a working, folded region.
+{
+  const sc = officialUiScaffold()
+  const run = await runBundle(sc, { pinned: [], storage: 'throw' })
+  const toggle = panelsToggle(sc)
+  assert.ok(toggle !== null, 'a refused storage must not take the control with it')
+  assert.equal(toggle.getAttribute('aria-expanded'), 'false', 'and the default still applies')
+  toggle.click()
+  assert.equal(toggle.getAttribute('aria-expanded'), 'true', 'expanding still works without storage')
+  assert.equal(
+    run.logs.filter(([, line]) => /panel/i.test(line) && /error|fail/i.test(line)).length, 0,
+    'a refused storage is not a failure to report',
+  )
+  run.dispose()
+  console.log('✔ panels: storage refusal degrades to the default and keeps working')
+}
+
+// --- 1e: the whole-sidebar rail is the host's business, not ours.
+{
+  const sc = officialUiScaffold({ rail: true })
+  const run = await runBundle(sc, { pinned: [] })
+  assert.equal(panelsToggle(sc), null, 'the collapsed rail must not gain a panels control')
+  assert.equal(
+    sc.panelNav.getAttribute('data-stp-panels'), null,
+    'and the host keeps rendering its rail exactly as it does without the plugin',
+  )
+  run.dispose()
+  console.log('✔ panels: the narrow rail is left entirely to the host')
+}
+
+// --- 1f: an unrecognized sidebar keeps its nav untouched.
+{
+  const sc = makeTree()
+  const nav = new El('nav')
+  nav.className = 'IQEYQa_panelList'
+  nav.setAttribute('aria-label', '全局面板')
+  sc.body.appendChild(nav)
+  const run = await runBundle(sc, { pinned: [] })
+  assert.equal(nav.getAttribute('data-stp-panels'), null, 'an unknown sidebar must be left alone')
+  assert.equal(sc.body.querySelector('[data-stp-panels-toggle]'), null)
+  run.dispose()
+  console.log('✔ panels: an unknown sidebar is observe-only')
+}
+
+// --- 1g: a sidebar that mounts LATE still gets the control.
+{
+  const sc = officialUiScaffold({ panels: false })
+  const run = await runBundle(sc, { pinned: [] })
+  assert.equal(sc.body.querySelector('[data-stp-panels-toggle]'), null, 'nothing to fold yet')
+
+  const nav = new El('nav')
+  nav.className = 'IQEYQa_panelList'
+  nav.setAttribute('aria-label', '全局面板')
+  sc.root.appendChild(nav)
+  run.nudge()
+  await settle()
+  const toggle = panelsToggle(sc)
+  assert.ok(toggle !== null, 'a panels nav that appears later must still be collapsed')
+  assert.equal(nav.getAttribute('data-stp-panels'), 'collapsed')
+  assert.equal(nav.getAttribute('id'), toggle.getAttribute('aria-controls'))
+  run.dispose()
+  console.log('✔ panels: a late sidebar gets the control on the next pass')
+}
+
+// --- 1h: dispose takes every trace of it back, and a remount does not stack.
+{
+  const sc = officialUiScaffold()
+  const first = await runBundle(sc, { pinned: [] })
+  const toggle = panelsToggle(sc)
+  const navId = sc.panelNav.getAttribute('id')
+  assert.ok(navId, 'the control wired an id while it was mounted')
+
+  first.dispose()
+  assert.equal(sc.body.querySelector('[data-stp-panels-toggle]'), null, 'dispose removes the control')
+  assert.equal(sc.panelNav.getAttribute('data-stp-panels'), null, 'and the fold attribute')
+  assert.equal(sc.panelNav.getAttribute('id'), null, 'and the id it added')
+
+  // A second mount on the same document must not leave the first one's control.
+  const second = await runBundle(sc, { pinned: [] })
+  assert.equal(sc.body.querySelectorAll('[data-stp-panels-toggle]').length, 1, 'exactly one control')
+  second.dispose()
+  console.log('✔ panels: dispose is complete and a remount does not stack controls')
+}
+
+// =====================================================================
+// REQUIREMENT 3 — the "工作区目录" master switch, between the pinned region and
+// the host's own workspace directories.
+//
+// Two levels of fold, and only two. R07/S3b closes each directory once; this
+// one control folds the whole directory region on top of that. The region is
+// the body the host renders the directory headers AND their sessions into
+// (`WorkspaceBrowser.tsx:669`), reached from the PROVEN tree rather than
+// searched for by name — and it is folded with a stylesheet rule, never by
+// removing or re-parenting a single host node, so every group's own expansion
+// is still exactly where the user left it when the region comes back.
+// =====================================================================
+
+/** The control the plugin mounts above the directory body. */
+const dirsToggle = (sc) => sc.body.querySelector('[data-stp-groups-toggle]')
+
+/** The workspace title bar and its search button, as the host renders them. */
+function sectionHeader(scaffold) {
+  const header = new El('div')
+  header.className = 'Rows_sectionHeader__x1y2z'
+  const search = new El('button')
+  search.setAttribute('aria-label', '搜索会话')
+  header.appendChild(search)
+  scaffold.root.insertBefore(header, scaffold.root.children[0])
+  return { header, search }
+}
+
+/** Everything below the directory region that is none of the plugin's business. */
+function sidebarFooter(scaffold) {
+  const footer = new El('div')
+  footer.className = 'Rows_footer__x1y2z'
+  const balance = new El('button')
+  balance.textContent = '余额'
+  footer.appendChild(balance)
+  scaffold.body.appendChild(footer)
+  return { footer, balance }
+}
+
+// --- 3a: expanded by default, keyboard reachable, wired to the body it folds.
+{
+  const sc = officialUiScaffold()
+  const run = await runBundle(sc, { pinned: [] })
+  const body = sc.treeBody
+  const toggle = dirsToggle(sc)
+  assert.ok(toggle !== null, 'a control for the workspace directories must be mounted')
+  assert.equal(toggle.tagName, 'BUTTON', 'a real button, so Enter/Space reach it natively')
+  assert.equal(toggle.getAttribute('type'), 'button')
+  assert.ok((toggle.getAttribute('aria-label') ?? '').length > 0, 'the control must name itself')
+  assert.equal(
+    toggle.getAttribute('aria-expanded'), 'true',
+    'the region starts EXPANDED — only the directories inside it are folded',
+  )
+  assert.equal(body.getAttribute('data-stp-groups'), 'expanded')
+  const controls = toggle.getAttribute('aria-controls')
+  assert.ok(controls, 'aria-controls must point at the region it controls')
+  assert.equal(body.getAttribute('id'), controls, 'aria-controls must name the directory body itself')
+  assert.equal(toggle.nextElementSibling, body, 'the control sits directly above the directories')
+  assert.equal(
+    toggle.closest('._8WIE4q_treeBody'), null,
+    'and never inside the body it hides — that fold would take the control with it',
+  )
+  assert.equal(
+    sheetRules(sc).some(rule => rule.includes('data-stp-groups') && rule.includes('display:none')),
+    false,
+    'an expanded region emits no hide rule',
+  )
+  assert.ok(staticCss(sc).includes('stp-groups-toggle'), 'the control must be styled, not bare')
+  run.dispose()
+  console.log('✔ directories: the region starts expanded, with a keyboard-reachable aria-wired control above it')
+}
+
+// --- 3b: folding takes the DIRECTORIES and their sessions, and nothing else.
+{
+  const sc = officialUiScaffold()
+  const { header, search } = sectionHeader(sc)
+  const { footer, balance } = sidebarFooter(sc)
+  const run = await runBundle(sc, { pinned: [S1] })
+  const toggle = dirsToggle(sc)
+  const region = sc.body.querySelector('[data-stp-region]')
+  assert.ok(region !== null, 'precondition: a pinned region above the directories')
+  assert.equal(region.nextElementSibling, toggle, 'the control sits BETWEEN the pinned region and the directories')
+  assert.ok(sc.treeBody.querySelector('[data-row-key^="workspace:"]') !== null, 'precondition: a directory to hide')
+
+  toggle.click()
+  assert.equal(toggle.getAttribute('aria-expanded'), 'false', 'the click folds the region')
+  assert.equal(sc.treeBody.getAttribute('data-stp-groups'), 'collapsed')
+  assert.ok(
+    sheetRules(sc).some(rule => rule.includes('data-stp-groups') && rule.includes('display:none')),
+    `the fold must be a stylesheet rule from this plugin; got ${JSON.stringify(sheetRules(sc))}`,
+  )
+  // The whole body goes, which is what "the directories AND their sessions"
+  // means; a rule scoped to session rows alone would leave the directory names
+  // on screen with nothing under them.
+  assert.equal(
+    sheetRules(sc).some(rule => rule.includes('data-stp-groups') && rule.includes('session:')), false,
+    'the fold is not a per-session hide rule',
+  )
+  // Siblings, not children: none of these is reachable by the fold.
+  assert.equal(region.parentElement, sc.listArea, 'the pinned region is a sibling of the body, not inside it')
+  assert.ok(header.isConnected !== false && search.isConnected !== false, 'the workspace title bar and its search button survive')
+  assert.ok(footer.isConnected !== false && balance.isConnected !== false, 'and so does the footer below')
+  assert.equal(footer.getAttribute('data-stp-groups'), null, 'the fold marker is only ever on the one proven body')
+  assert.ok(region.isConnected !== false, 'and the pinned region is still rendered')
+
+  toggle.click()
+  assert.equal(toggle.getAttribute('aria-expanded'), 'true', 'and it comes back')
+  assert.equal(sc.treeBody.getAttribute('data-stp-groups'), 'expanded')
+  assert.equal(
+    sheetRules(sc).some(rule => rule.includes('data-stp-groups') && rule.includes('display:none')), false,
+    'expanded means no hide rule',
+  )
+  run.dispose()
+  console.log('✔ directories: folding takes the directories and their sessions, and leaves the region above and below alone')
+}
+
+// --- 3c: only an explicit `'1'` folds. Everything else is the default.
+for (const [seed, wantCollapsed] of [
+  [{}, false],
+  [{ 'dsh-session-top:groups-collapsed': '0' }, false],
+  [{ 'dsh-session-top:groups-collapsed': 'yes' }, false],
+  [{ 'dsh-session-top:groups-collapsed': '1' }, true],
+]) {
+  const sc = officialUiScaffold()
+  const run = await runBundle(sc, { pinned: [], storageSeed: seed })
+  const state = wantCollapsed ? 'collapsed' : 'expanded'
+  assert.equal(sc.treeBody.getAttribute('data-stp-groups'), state, `seed ${JSON.stringify(seed)} → ${state}`)
+  assert.equal(dirsToggle(sc).getAttribute('aria-expanded'), wantCollapsed ? 'false' : 'true', 'and the control agrees')
+  run.dispose()
+}
+console.log('✔ directories: only an explicit \'1\' folds; absent, junk and \'0\' all mean expanded')
+
+// --- 3d: the user's choice wins, survives reconciles, and writes ONE key.
+{
+  const sc = officialUiScaffold()
+  const run = await runBundle(sc, { pinned: [] })
+  const toggle = dirsToggle(sc)
+  toggle.click()
+  assert.deepEqual(
+    run.storageCalls.writes,
+    [['dsh-session-top:groups-collapsed', '1']],
+    'exactly one write, under this plugin\'s own new key',
+  )
+  // The failure this guards: a reconcile that re-applies its own default would
+  // slam the region open again on the next host notification.
+  for (let i = 0; i < 3; i += 1) { run.nudge(); await settle() }
+  assert.equal(toggle.getAttribute('aria-expanded'), 'false', 'a reconcile must never re-expand what the user folded')
+  assert.equal(dirsToggle(sc), toggle, 'and must not mount a second control')
+  toggle.click()
+  assert.deepEqual(run.storageCalls.writes.at(-1), ['dsh-session-top:groups-collapsed', '0'], 'unfolding is remembered the same way')
+  run.dispose()
+  console.log('✔ directories: an explicit fold survives every reconcile and is remembered under its own key')
+}
+
+// --- 3e: the per-directory state is exactly where the user left it when the
+// region comes back — the fold is one stylesheet rule, never a state change.
+{
+  const sc = officialUiScaffold()
+  const run = await runBundle(sc, { pinned: [] })
+  const toggle = dirsToggle(sc)
+  assert.equal(sc.head.getAttribute('aria-expanded'), 'false', 'precondition: the directory was closed on first sight')
+  // The user opens that one directory by hand, then folds the whole region.
+  sc.head.click()
+  assert.equal(sc.head.getAttribute('aria-expanded'), 'true', 'the user opened it')
+  const clicksBefore = sc.head.onclickCount
+  toggle.click()
+  assert.equal(sc.head.getAttribute('aria-expanded'), 'true', 'folding the region must not touch any group')
+  assert.equal(sc.head.onclickCount, clicksBefore, 'which takes no header click at all')
+  toggle.click()
+  assert.equal(
+    sc.head.getAttribute('aria-expanded'), 'true',
+    'and re-expanding the region must not re-run the first-sight default',
+  )
+  assert.equal(sc.head.onclickCount, clicksBefore, 'which would have taken another click')
+  run.dispose()
+  console.log('✔ directories: re-expanding the region leaves every group exactly as the user left it')
+}
+
+// --- 3f: a browser that refuses storage still gets a working control.
+{
+  const sc = officialUiScaffold()
+  const run = await runBundle(sc, { pinned: [], storage: 'throw' })
+  const toggle = dirsToggle(sc)
+  assert.ok(toggle !== null, 'a refused storage must not take the control with it')
+  assert.equal(toggle.getAttribute('aria-expanded'), 'true', 'and the default still applies')
+  toggle.click()
+  assert.equal(toggle.getAttribute('aria-expanded'), 'false', 'folding still works without storage')
+  assert.equal(
+    run.logs.filter(([, line]) => /director|groups/i.test(line) && /error|fail/i.test(line)).length, 0,
+    'a refused storage is not a failure to report',
+  )
+  run.dispose()
+  console.log('✔ directories: storage refusal degrades to the default and keeps working')
+}
+
+// --- 3g: what is NOT provably a workspace-directory region is left alone.
+{
+  const sc = makeTree()
+  const run = await runBundle(sc, { pinned: [] })
+  assert.equal(sc.body.querySelector('[data-stp-groups-toggle]'), null, 'an unknown sidebar must get no control')
+  assert.equal(sc.treeBody.getAttribute('data-stp-groups'), null, 'and no marker — the rules would then reach it')
+  run.dispose()
+}
+{
+  // codex-ui renders one `.dcu-wb-project` PER workspace, with no single seat
+  // holding them all. Inventing one would be pretending to a host seam this
+  // build cannot prove, so the master switch stays off there — while the
+  // per-directory default fold, which needs no such seam, still runs.
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [] })
+  await settle()
+  assert.equal(sc.body.querySelector('[data-stp-groups-toggle]'), null, 'codex gets no master switch')
+  assert.equal(sc.head.getAttribute('aria-expanded'), 'false', 'but the per-directory default fold still applies')
+  run.dispose()
+}
+console.log('✔ directories: an unknown sidebar is observe-only, and codex is not given a seam that does not exist')
+
+// --- 3h: the whole-sidebar rail is the host's business, not ours.
+{
+  const sc = officialUiScaffold({ rail: true })
+  const run = await runBundle(sc, { pinned: [] })
+  assert.equal(dirsToggle(sc), null, 'the collapsed rail must not gain a directory control')
+  assert.equal(sc.treeBody.getAttribute('data-stp-groups'), null, 'and no fold on a layout the user did not choose')
+  run.dispose()
+  console.log('✔ directories: the narrow rail is left entirely to the host')
+}
+
+// --- 3i: only the body under the PROVEN tree is ever marked — never a
+// look-alike elsewhere on the page.
+//
+// The look-alike goes in AHEAD of the host's own sidebar subtree, so it comes
+// first in document order. Appended after it, the case would prove nothing: a
+// plugin that simply grabbed the first `[class*="treeBody"]` on the page would
+// find the real body anyway and pass. Placed first, only reaching the body
+// THROUGH the proven tree can mark the right one.
+//
+// The reference node is `root`, the sidebar subtree's own top element and a
+// direct child of `body` — NOT `listArea`, which the scaffold re-parented
+// under `root`. An unresolved reference is not an error in this fake, it
+// appends, which would put the look-alike last again and silently disarm the
+// case; the precondition below is what keeps that honest.
+{
+  const sc = officialUiScaffold()
+  const elsewhere = new El('div')
+  elsewhere.className = '_8WIE4q_treeBody _8WIE4q_wide'
+  sc.body.insertBefore(elsewhere, sc.root)
+  assert.ok(
+    sc.body.children.indexOf(elsewhere) < sc.body.children.indexOf(sc.root),
+    `precondition: the look-alike precedes the real sidebar, else this case proves nothing; order ${sc.body.children.indexOf(elsewhere)} vs ${sc.body.children.indexOf(sc.root)}`,
+  )
+  const run = await runBundle(sc, { pinned: [] })
+  assert.notEqual(sc.treeBody.getAttribute('data-stp-groups'), null, 'the proven body is marked')
+  assert.equal(elsewhere.getAttribute('data-stp-groups'), null, 'a look-alike is never adopted')
+  assert.equal(elsewhere.querySelector('[data-stp-groups-toggle]'), null, 'and never gains a control')
+  run.dispose()
+  console.log('✔ directories: only the body under the proven tree is marked')
+}
+
+// --- 3j: an idle second writes nothing.
+{
+  const sc = officialUiScaffold()
+  const run = await runBundle(sc, { pinned: [] })
+  let bodyWrites = 0
+  let toggleWrites = 0
+  const bodySet = sc.treeBody.setAttribute.bind(sc.treeBody)
+  sc.treeBody.setAttribute = (name, value) => {
+    if (name === 'data-stp-groups' || name === 'data-stp-groups-body') bodyWrites += 1
+    return bodySet(name, value)
+  }
+  const toggle = dirsToggle(sc)
+  const toggleSet = toggle.setAttribute.bind(toggle)
+  toggle.setAttribute = (name, value) => {
+    // `aria-expanded` is the only attribute an idle pass can change the VALUE
+    // of; the rest are re-asserted identically every pass, as the panels
+    // control already does.
+    if (name === 'aria-expanded') toggleWrites += 1
+    return toggleSet(name, value)
+  }
+  for (let i = 0; i < 5; i += 1) { run.nudge(); await settle() }
+  assert.equal(bodyWrites, 0, `an unchanged body must not be rewritten; got ${bodyWrites} writes across 5 idle passes`)
+  assert.equal(toggleWrites, 0, `and neither must the control; got ${toggleWrites}`)
+  run.dispose()
+  console.log('✔ directories: five idle reconciles write nothing at all')
+}
+
+// --- 3k: a sidebar that mounts LATE still gets the control.
+{
+  const sc = makeTree()
+  const run = await runBundle(sc, { pinned: [] })
+  assert.equal(sc.body.querySelector('[data-stp-groups-toggle]'), null, 'nothing to fold yet')
+
+  sc.tree.setAttribute('aria-label', 'sessions')
+  const head = new El('div')
+  head.setAttribute('role', 'treeitem')
+  head.setAttribute('data-row-key', 'workspace:w1')
+  head.setAttribute('aria-expanded', 'false')
+  sc.tree.appendChild(head)
+  run.nudge()
+  await settle()
+  const toggle = dirsToggle(sc)
+  assert.ok(toggle !== null, 'a sidebar that appears later must still get the control')
+  assert.equal(sc.treeBody.getAttribute('id'), toggle.getAttribute('aria-controls'))
+  assert.equal(toggle.getAttribute('aria-expanded'), 'true')
+  run.dispose()
+  console.log('✔ directories: a late sidebar gets the control on the next pass')
+}
+
+// --- 3l: dispose takes every trace of it back, and a remount does not stack.
+{
+  const sc = officialUiScaffold()
+  const first = await runBundle(sc, { pinned: [] })
+  const bodyId = sc.treeBody.getAttribute('id')
+  assert.ok(bodyId, 'the control lent the body an id while it was mounted')
+
+  first.dispose()
+  assert.equal(sc.body.querySelector('[data-stp-groups-toggle]'), null, 'dispose removes the control')
+  assert.equal(sc.treeBody.getAttribute('data-stp-groups'), null, 'and the fold attribute')
+  assert.equal(sc.treeBody.getAttribute('data-stp-groups-body'), null, 'and the marker')
+  assert.equal(sc.treeBody.getAttribute('id'), null, 'and the id it added')
+  assert.ok(sc.head.isConnected !== false, 'and not one host node of the region')
+  assert.equal(
+    sheetRules(sc).some(rule => rule.includes('data-stp-groups')), false,
+    'and the shared sheet must not keep a rule for a region nobody owns',
+  )
+
+  const second = await runBundle(sc, { pinned: [] })
+  assert.equal(sc.body.querySelectorAll('[data-stp-groups-toggle]').length, 1, 'exactly one control')
+  second.dispose()
+  console.log('✔ directories: dispose is complete and a remount does not stack controls')
+}
+
+// =====================================================================
+// REQUIREMENT 2 — a right-click offers the HOST's own session actions, on a
+// real official row AND on a plugin-drawn pinned row, anchored where the user
+// clicked, with nothing left behind afterwards.
+//
+// The host's menu is a "…" BUTTON menu per row (Rows.tsx:667-690), not a
+// `contextmenu` surface. Clicking that button is the only way to open it, so
+// the hand-off is a click on the host's own control — never a re-implementation
+// of rename/fork/archive/copy, never a graft into the portalled list.
+// =====================================================================
+
+/**
+ * Deliver a contextmenu at the pointer, the way a browser does: every
+ * document-capture listener sees it, in registration order.
+ */
+function rightClickAt(run, target, x, y) {
+  const event = {
+    defaultPrevented: false,
+    target,
+    clientX: x,
+    clientY: y,
+    button: 2,
+    preventDefault() { this.defaultPrevented = true },
+    stopPropagation() {},
+  }
+  for (const fn of [...(run.listeners.get('contextmenu') ?? [])]) fn(event)
+  return event
+}
+
+// --- 2a: a plain official row, unhandled by anyone, opens the HOST's own menu.
+{
+  const sc = officialUiScaffold()
+  const run = await runBundle(sc, { pinned: [] })
+  openWorkspace(sc)
+  const event = rightClickAt(run, sc.liveRow(), 120, 200)
+  await afterDispatch()
+
+  assert.equal(sc.liveRow().ellipsis.clicks, 1, "the host's own … button must be what opens")
+  const hostMenu = sc.liveRow().hostMenu()
+  assert.ok(hostMenu !== null, 'the host menu must be open, with the host\'s own items')
+  const labels = hostMenu.children.map(item => item.textContent)
+  for (const label of ['置顶', '重命名', '分叉会话', '归档会话', '复制 Session ID']) {
+    assert.ok(labels.includes(label), `the host's own action must survive: ${label}`)
+  }
+  assert.equal(
+    sc.body.querySelector('[data-stp-menu]'), null,
+    'a one-item plugin menu must not replace the host menu',
+  )
+  assert.equal(event.defaultPrevented, true, 'the browser default must not open underneath')
+  run.dispose()
+  console.log('✔ official row: right-click opens the host\'s own full session menu')
+}
+
+// --- 2b: the same row must NOT be stolen from an owner that already handled it.
+{
+  const sc = officialUiScaffold()
+  const run = await runBundle(sc, { pinned: [] })
+  openWorkspace(sc)
+  // Registered before the plugin's own listener, exactly as the shared owner is.
+  run.listeners.get('contextmenu').unshift((event) => {
+    if (event.target === sc.liveRow()) event.preventDefault()
+  })
+  const event = rightClickAt(run, sc.liveRow(), 120, 200)
+  await afterDispatch()
+
+  assert.equal(event.defaultPrevented, true)
+  assert.equal(sc.liveRow().ellipsis.clicks, 0, 'a menu that already exists must not be doubled')
+  assert.equal(sc.liveRow().hostMenu(), null)
+  run.dispose()
+  console.log('✔ official row: another owner\'s claim is never overridden')
+}
+
+// --- 2c: codex keeps its native menu — actions and all.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [] })
+  const event = rightClickAt(run, sc.row, 120, 200)
+  await afterDispatch()
+  assert.equal(
+    event.defaultPrevented, false,
+    'the host\'s own native menu must not be prevented or covered by a plugin menu',
+  )
+  assert.equal(sc.body.querySelector('[data-stp-menu]'), null, 'and not replaced by a plugin menu')
+  run.dispose()
+  console.log('✔ codex: the native session menu is left to the host, with its own actions')
+}
+
+// --- 2d: a PINNED row — the plugin's own row, whose official row the pin rule
+// has hidden — offers the same full host menu, at the row that was clicked.
+{
+  const sc = officialUiScaffold()
+  const run = await runBundle(sc, { pinned: [S1] })
+  openWorkspace(sc)
+  const region = sc.body.querySelector('[data-stp-region]')
+  const own = region.querySelector('[data-stp-row]')
+  assert.ok(own !== null, 'the pinned row must be on screen')
+  const clickX = 140
+  const clickY = 96
+  rightClickAt(run, own, clickX, clickY)
+  await settle()
+
+  assert.equal(
+    sc.body.querySelector('[data-stp-menu]'), null,
+    'a pinned row must not fall back to the one-item plugin menu',
+  )
+  assert.equal(sc.liveRow().ellipsis.clicks, 1, 'the pinned row must reach the host\'s own menu')
+  const hostMenu = sc.liveRow().hostMenu()
+  assert.ok(hostMenu !== null)
+  const labels = hostMenu.children.map(item => item.textContent)
+  for (const label of ['重命名', '分叉会话', '归档会话', '复制 Session ID']) {
+    assert.ok(labels.includes(label), `the host's own action must survive: ${label}`)
+  }
+  assert.equal(
+    labels.filter(label => label === '置顶' || label === '取消置顶').length, 1,
+    'the host already carries Pin/Unpin — a second copy is a duplicate action',
+  )
+
+  // Position. The hidden official row sits at y≈420; the user clicked y=96 on
+  // the pinned region at the top. The host puts the menu at the anchor it
+  // measured, so the anchor's own centre must be the pointer.
+  const anchor = hostMenu.anchorRect
+  assert.ok(
+    Math.abs((anchor.top + anchor.bottom) / 2 - clickY) < 40
+      && Math.abs((anchor.left + anchor.right) / 2 - clickX) < 40,
+    `the menu must anchor on the row the user clicked, not on the hidden group: got ${JSON.stringify(anchor)}`,
+  )
+  run.dispose()
+  console.log('✔ pinned row: the full host menu, anchored on the row that was clicked')
+}
+
+// --- 2e: closing restores everything — no stray inline styles, no re-folded
+// state, no duplicate rows.
+{
+  const sc = officialUiScaffold()
+  const run = await runBundle(sc, { pinned: [S1] })
+  openWorkspace(sc)
+  const region = sc.body.querySelector('[data-stp-region]')
+  rightClickAt(run, region.querySelector('[data-stp-row]'), 140, 96)
+  await settle()
+  assert.ok(sc.liveRow().hostMenu() !== null, 'precondition: the host menu opened')
+  // Captured now: closing puts the group back, which unmounts this row.
+  const row = sc.liveRow()
+
+  // The user picks an item: a pointerdown on the list, then the host closes.
+  const item = sc.liveRow().hostMenu().children[1]
+  item.dispatch('pointerdown')
+  row.ellipsis.click()
+  await settle()
+
+  assert.equal(row.style.props.size, 0, `inline styles must be handed back; left ${JSON.stringify([...row.style.props])}`)
+  assert.equal(row.style.priorities.size, 0)
+  assert.equal(region.querySelectorAll('[data-stp-row]').length, 1, 'no duplicated pinned row')
+  assert.ok(
+    sheetRules(sc).some(rule => rule.includes(S1) && rule.includes('display:none')),
+    'the pin hide rule must still be in force for the pinned session',
+  )
+  run.dispose()
+  console.log('✔ pinned row: closing hands every temporary style back')
+}
+
+// --- 2f: the group FOLDED case. The host renders no rows for a folded group
+// (`childRows = group.expanded ? … : []`), so the hand-off has to make the row
+// exist, use it, and put the group back exactly as it found it.
+{
+  const sc = officialUiScaffold({ folded: true })
+  const run = await runBundle(sc, { pinned: [S1] })
+  assert.equal(sc.tree.querySelector('[data-row-key^="session:"]'), null, 'precondition: no rows mounted')
+  assert.equal(sc.head.getAttribute('aria-expanded'), 'false', 'precondition: the group is folded')
+
+  const region = sc.body.querySelector('[data-stp-region]')
+  rightClickAt(run, region.querySelector('[data-stp-row]'), 140, 96)
+  await settle()
+
+  assert.ok(sc.liveRow().hostMenu() !== null, 'a folded group must still yield the host menu')
+  const anchor = sc.liveRow().hostMenu().anchorRect
+  assert.ok(
+    Math.abs((anchor.top + anchor.bottom) / 2 - 96) < 40,
+    `the menu must appear near the click, not inside the group it came from: ${JSON.stringify(anchor)}`,
+  )
+  assert.equal(sc.head.onclickCount, 1, 'exactly one expansion, through the header\'s own toggle')
+
+  // Close it.
+  const row = sc.liveRow()
+  sc.liveRow().hostMenu().children[1].dispatch('pointerdown')
+  row.ellipsis.click()
+  await settle()
+  assert.equal(
+    sc.head.getAttribute('aria-expanded'), 'false',
+    'the group the plugin expanded must be folded again when the menu closes',
+  )
+  assert.equal(sc.head.onclickCount, 2, 'and by exactly one more header toggle')
+  run.dispose()
+  console.log('✔ pinned row in a FOLDED group: menu opens, then the group is put back')
+}
+
+// --- 2g: dispose while that menu is open still hands everything back.
+{
+  const sc = officialUiScaffold({ folded: true })
+  const run = await runBundle(sc, { pinned: [S1] })
+  const region = sc.body.querySelector('[data-stp-region]')
+  rightClickAt(run, region.querySelector('[data-stp-row]'), 140, 96)
+  await settle()
+  assert.ok(sc.liveRow().ellipsis.clicks >= 1)
+  const row = sc.liveRow()
+
+  run.dispose()
+  await settle()
+  assert.equal(row.style.props.size, 0, 'dispose must drop the temporary anchor styles')
+  assert.equal(row.style.priorities.size, 0)
+  assert.equal(
+    sc.head.getAttribute('aria-expanded'), 'false',
+    'and leave no group expanded that it was the one to expand',
+  )
+  assert.equal(run.liveTimers().length, 0, 'and no timer of the watch left running')
+  console.log('✔ pinned row in a folded group: dispose mid-menu still restores everything')
+}
+
+// --- 2h: no host row to borrow at all — the one-item fallback stays as the
+// emergency exit, and the gesture is still not left to the browser.
+{
+  const sc = officialUiScaffold({ hostRowMenu: false })
+  const run = await runBundle(sc, { pinned: [] })
+  const event = rightClickAt(run, sc.row, 120, 200)
+  await afterDispatch()
+  assert.ok(sc.body.querySelector('[data-stp-menu]') !== null, 'the fallback menu must still exist')
+  assert.ok(sc.body.querySelector('[data-stp-pin-item]') !== null, 'with the pin action')
+  assert.equal(event.defaultPrevented, true, 'and never the browser default')
+  run.dispose()
+  console.log('✔ official row without a … button: the pin fallback, never the browser menu')
+}
+
+// --- 2i: codex serves its OWN session menu on right-click — but it serves it
+//     FROM a host row. A pinned session whose host row is not mounted (group
+//     folded, search view, mid-render) therefore has nothing to be served, and
+//     the gesture is already suppressed by the time we get here. Measured: the
+//     right-click did nothing at all, not even the browser's own menu.
+{
+  const sc = codexScaffold()
+  sc.row.remove() // the host renders no session row at all: every group folded
+  const run = await runBundle(sc, { pinned: [S1] })
+  const own = sc.body.querySelector('[data-stp-row]')
+  assert.ok(own !== null, 'precondition: the pinned row is on screen')
+  assert.equal(sc.body.querySelector('[data-dcu-session]'), null, 'precondition: and no host row to borrow')
+
+  const event = rightClickAt(run, own, 140, 96)
+  await settle()
+  const menu = sc.body.querySelector('[data-stp-menu]')
+  assert.ok(
+    menu !== null,
+    'a pinned codex row with no host row must still get the pin fallback, not a dead gesture',
+  )
+  const item = menu.querySelector('[data-stp-pin-item]')
+  assert.ok(item !== null, 'with the pin action')
+  assert.match(item.textContent, /取消置顶/, 'a pinned session offers Unpin')
+  assert.equal(event.defaultPrevented, true, 'and never the browser default')
+  run.dispose()
+  console.log('✔ codex pinned row with no host row: the pin fallback, not a dead right-click')
+}
+
+// --- 2j: with the host row MOUNTED, codex still owns the gesture. The fallback
+//     above is for the case where there is nothing to serve it — not a licence
+//     to cover a menu codex is about to open.
+//
+//     What "codex serves it" means here is the ROW'S OWN handler claiming the
+//     re-delivered event (lib/client.js:4617), so this case asserts the claim
+//     itself: that the handler really received the gesture, before it asserts
+//     that the plugin stood down for it. A mounted row is not a claim.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1] })
+  const own = sc.body.querySelector('[data-stp-row]')
+  assert.ok(sc.body.querySelector('[data-dcu-session]') !== null, 'precondition: the host row is there')
+  rightClickAt(run, own, 140, 96)
+  await settle()
+  assert.deepEqual(
+    sc.nativeClaims.map(claim => claim.id), [S1],
+    'codex\'s own row handler must really have received the forwarded gesture, exactly once',
+  )
+  assert.deepEqual(
+    [sc.nativeClaims[0].x, sc.nativeClaims[0].y], [140, 96],
+    'and at the pointer the user actually used',
+  )
+  const hostMenu = sc.body.querySelector('.dcu-host-menu')
+  assert.ok(hostMenu !== null, 'codex\'s own session menu is the one that opened')
+  assert.deepEqual(
+    [...hostMenu.children].map(item => item.textContent), CODEX_SESSION_MENU,
+    'with its own actions — nothing added, nothing removed',
+  )
+  assert.equal(
+    sc.body.querySelector('[data-stp-menu]'), null,
+    'a gesture codex claimed must never be covered by the plugin\'s one-item menu',
+  )
+  run.dispose()
+  console.log('✔ codex pinned row with its host row: the host\'s own handler claims it, and we stand down')
+}
+
+// =====================================================================
+// REQUIREMENT 3 — the Pinned region's OWN header folds its rows away.
+//
+// The host has no control for this region (the plugin drew it), so the fold is
+// this plugin's: a real, focusable, keyboard-operable disclosure control on the
+// header it already renders. Two things make it safe to have there, and both
+// are asserted below rather than assumed:
+//
+//   - the rows are HIDDEN by this plugin's own stylesheet, never removed. A row
+//     removed and re-added is a new node at the pointerup, and the browser then
+//     dispatches the click on the common ancestor instead — which is why a
+//     fold implemented by rebuilding the list silently eats clicks.
+//   - the fold state is a PREFERENCE, not projection: it must not be in the
+//     render signature, or every reconcile would rebuild the region.
+// =====================================================================
+
+/** The control that folds the pinned region. */
+const regionHeaderOf = (region) => region.querySelector('[data-stp-region-header]')
+/** The pinned rows, in DOM order. */
+const rowsOf = (region) => [...region.querySelectorAll('[data-stp-row]')]
+/** The trailing colour point of a row. */
+const swatchOf = (row) => row.querySelector('[data-stp-row-color]')
+/** The native colour control inside a row's colour point. */
+const colorInputOf = (row) => row.querySelector('[data-stp-color-input]')
+
+/**
+ * Everything about a row's colour a repaint is allowed to touch, as one value.
+ *
+ * `mutationLog` only sees childList and textContent, so it cannot see an
+ * attribute or a custom-property write at all — which is exactly the noise
+ * "a foreign write that changes nothing must repaint nothing" is about. This
+ * snapshot is the probe for it: same object in means nothing was written.
+ * @param {Element} row - the row.
+ * @returns {object} the row's whole colour surface.
+ */
+const colorSurfaceOf = (row) => {
+  const swatch = swatchOf(row)
+  const input = colorInputOf(row)
+  return {
+    attr: row.getAttribute('data-stp-color'),
+    prop: row.style.getPropertyValue('--stp-row-color').trim(),
+    set: swatch.hasAttribute('data-stp-row-color-set'),
+    input: input.value,
+    name: swatch.getAttribute('aria-label'),
+  }
+}
+
+// --- 3a: the header is a real, named, keyboard-operable disclosure control.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1] })
+  const region = sc.body.querySelector('[data-stp-region]')
+  const header = regionHeaderOf(region)
+  assert.ok(header !== null, 'the region must carry its own header control')
+  assert.equal(
+    header.getAttribute('aria-hidden'), null,
+    'the fold control cannot be aria-hidden — a keyboard/AT user would have nothing to operate',
+  )
+  assert.equal(header.getAttribute('role'), 'button')
+  assert.equal(header.getAttribute('tabindex'), '0', 'the fold must be reachable by Tab')
+  assert.equal(header.getAttribute('aria-expanded'), 'true', 'the region starts EXPANDED, as it always has')
+  assert.ok(
+    (header.getAttribute('aria-label') ?? '').length > 0,
+    'the control must name itself, since its glyph and count are decoration',
+  )
+  assert.equal(region.getAttribute('data-stp-collapsed'), 'false')
+  run.dispose()
+  console.log('✔ pinned region: the header is a focusable, named disclosure control, expanded by default')
+}
+
+// --- 3b: the hide rule is OURS, targets only DIRECT child rows, and is CSS.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1, S2] })
+  const region = sc.body.querySelector('[data-stp-region]')
+  assert.match(
+    staticCss(sc),
+    /\[data-stp-region\]\[data-stp-collapsed='true'\]\s*>\s*\[data-stp-row\]\s*\{[^}]*display:\s*none/,
+    'folding must be a direct-child stylesheet rule from this plugin, so no row node is destroyed',
+  )
+  const header = regionHeaderOf(region)
+  const before = rowsOf(region)
+  assert.equal(before.length, 2)
+
+  header.click()
+  assert.equal(region.getAttribute('data-stp-collapsed'), 'true')
+  assert.equal(header.getAttribute('aria-expanded'), 'false')
+  assert.deepEqual(
+    rowsOf(region), before,
+    'folding must not rebuild, reorder or remove a single row — identity is what makes a later click land',
+  )
+  assert.equal(region.querySelector('[data-stp-region-count]').textContent, '2', 'the count is kept')
+  assert.equal(regionHeaderOf(region), header, 'the header is not the thing being folded')
+
+  header.click()
+  assert.equal(region.getAttribute('data-stp-collapsed'), 'false')
+  assert.equal(header.getAttribute('aria-expanded'), 'true')
+  assert.deepEqual(rowsOf(region), before, 'and unfolding brings the same nodes back')
+  run.dispose()
+  console.log('✔ pinned region: the fold is a CSS rule over untouched rows, count and header intact')
+}
+
+// --- 3c: Enter and Space operate it, and Space does not scroll.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1] })
+  const region = sc.body.querySelector('[data-stp-region]')
+  const header = regionHeaderOf(region)
+
+  header.dispatch('keydown', { key: 'Enter' })
+  assert.equal(header.getAttribute('aria-expanded'), 'false', 'Enter folds')
+  const space = header.dispatch('keydown', { key: ' ' })
+  assert.equal(space.defaultPrevented, true, 'Space must be consumed, not left to scroll the sidebar')
+  assert.equal(header.getAttribute('aria-expanded'), 'true', 'Space unfolds')
+
+  // Keys that are not the fold must stay inert, and must not reach a row.
+  header.dispatch('keydown', { key: 'a' })
+  header.dispatch('keydown', { key: 'Tab' })
+  assert.equal(header.getAttribute('aria-expanded'), 'true')
+  assert.deepEqual(run.opened, [], 'operating the fold must never open a session')
+  assert.deepEqual(run.pinCalls, [], 'and never touch the pin set')
+  run.dispose()
+  console.log('✔ pinned region: Enter and Space operate the fold, and nothing navigates')
+}
+
+// --- 3d: the fold is a PREFERENCE, not projection. Pin changes under a folded
+//     region still render, still reuse their nodes, and the header never moves.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1] })
+  const region = sc.body.querySelector('[data-stp-region]')
+  const header = regionHeaderOf(region)
+  header.click()
+  assert.equal(region.getAttribute('data-stp-collapsed'), 'true')
+
+  // A pin arrives while the region is folded.
+  run.live.pinned = [S1, S2]
+  run.nudge()
+  await settle()
+  const rows = rowsOf(region)
+  assert.equal(rows.length, 2, 'a session pinned while folded must still get its row')
+  assert.equal(rows[1].getAttribute('data-stp-session'), S2, 'in the official order')
+  assert.equal(regionHeaderOf(region), header, 'and the header must survive the pin change')
+  assert.equal(region.getAttribute('data-stp-collapsed'), 'true', 'the fold must not be undone by a reconcile')
+  assert.equal(header.getAttribute('aria-expanded'), 'false')
+
+  // The proof that the preference is NOT in the render signature: three
+  // notifications that change nothing rebuild nothing.
+  const before = rowsOf(region)
+  const mutationsBefore = mutationLog.records
+  for (let i = 0; i < 3; i += 1) {
+    run.nudge()
+    await settle()
+  }
+  assert.deepEqual(rowsOf(region), before, 'an idle reconcile must not touch the rows')
+  assert.equal(mutationLog.records - mutationsBefore, 0, 'and must not write anything at all')
+
+  // And the row that was there before the fold is still the very same node.
+  assert.equal(rows[0], before[0])
+  run.dispose()
+  console.log('✔ pinned region: folding survives pin changes and is kept out of the render signature')
+}
+
+// --- 3e: the choice is remembered, and only an explicit '1' means folded.
+{
+  const sc = codexScaffold()
+  const folded = await runBundle(sc, {
+    pinned: [S1],
+    storageSeed: { 'dsh-session-top:region-collapsed': '1' },
+  })
+  const foldRegion = sc.body.querySelector('[data-stp-region]')
+  assert.equal(regionHeaderOf(foldRegion).getAttribute('aria-expanded'), 'false', 'a remembered fold is honoured')
+  folded.dispose()
+
+  for (const raw of ['0', '', 'true', 'yes']) {
+    const fresh = codexScaffold()
+    const open = await runBundle(fresh, {
+      pinned: [S1],
+      storageSeed: { 'dsh-session-top:region-collapsed': raw },
+    })
+    const region = fresh.body.querySelector('[data-stp-region]')
+    assert.equal(
+      regionHeaderOf(region).getAttribute('aria-expanded'), 'true',
+      `stored ${JSON.stringify(raw)} is not "1", so the region is expanded`,
+    )
+    assert.equal(open.storageCalls.writes.length, 0, 'reading a preference must not write one')
+    open.dispose()
+  }
+  console.log('✔ pinned region: only an explicit "1" folds; anything else is expanded')
+}
+
+// --- 3f: the whole round trip — what is written is exactly what the next
+//     mount reads back. (Each run gets its own storage, so the next mount is
+//     seeded with the value this one wrote rather than sharing a store.)
+{
+  const KEY = 'dsh-session-top:region-collapsed'
+  const sc = codexScaffold()
+  const first = await runBundle(sc, { pinned: [S1] })
+  regionHeaderOf(sc.body.querySelector('[data-stp-region]')).click()
+  const writes = first.storageCalls.writes.filter(([key]) => key === KEY)
+  assert.equal(writes.length, 1, 'the explicit choice is written under this plugin\'s own key')
+  assert.deepEqual(
+    [...new Set(first.storageCalls.writes.map(([key]) => key))],
+    [KEY],
+    'and nothing else is written',
+  )
+  const stored = writes[0][1]
+  assert.equal(stored, '1', 'a fold is stored as "1"')
+  first.dispose()
+
+  // A fresh mount seeded with exactly that value starts folded, and unfolding
+  // it writes the value that makes the NEXT mount start expanded.
+  const live = codexScaffold()
+  const second = await runBundle(live, { pinned: [S1], storageSeed: { [KEY]: stored } })
+  const header = regionHeaderOf(live.body.querySelector('[data-stp-region]'))
+  assert.equal(header.getAttribute('aria-expanded'), 'false', 'the next mount starts folded')
+  header.click()
+  assert.equal(second.storageCalls.writes.at(-1)[1], '0', 'an unfold is stored as "0"')
+  second.dispose()
+
+  const thirdSc = codexScaffold()
+  const third = await runBundle(thirdSc, { pinned: [S1], storageSeed: { [KEY]: '0' } })
+  assert.equal(
+    regionHeaderOf(thirdSc.body.querySelector('[data-stp-region]')).getAttribute('aria-expanded'),
+    'true',
+    'and that mount starts expanded',
+  )
+  third.dispose()
+  console.log('✔ pinned region: the fold round-trips through storage across mounts')
+}
+
+// --- 3g: a browser that refuses storage still gets a working control.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1], storage: 'throw' })
+  const region = sc.body.querySelector('[data-stp-region]')
+  const header = regionHeaderOf(region)
+  assert.equal(header.getAttribute('aria-expanded'), 'true', 'the default still applies without storage')
+  header.click()
+  assert.equal(region.getAttribute('data-stp-collapsed'), 'true', 'folding still works without storage')
+  assert.deepEqual(
+    run.logs.filter(([, line]) => /error|fail/i.test(line)),
+    [],
+    'a refused storage is not a failure to report',
+  )
+  run.dispose()
+  console.log('✔ pinned region: storage refusal degrades to the default and keeps working')
+}
+
+// =====================================================================
+// REQUIREMENT 4 — every pinned session can carry its own background colour.
+//
+// The colour is a LOCAL preference, kept under this plugin's own key and
+// nowhere else: it must never reach the pin set, the host's settings or the
+// shared menu owner's document, and it must survive unpin/repin without being
+// silently thrown away.
+//
+// The control is a `span[role="button"]`, NOT a `<button>`: the shared owner's
+// row test recognises a session row by a `button[aria-label]` descendant, so a
+// real button inside one of these rows would make the owner resolve the
+// CURRENT session instead of the one that was clicked. The native control
+// underneath it is a real `<input type="color">`, so there is no dependency and
+// no hand-rolled picker.
+// =====================================================================
+
+// --- 4a: the control exists at the row's trailing edge, in the host's
+//     vocabulary for "a session row" not at all.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1] })
+  const region = sc.body.querySelector('[data-stp-region]')
+  const row = rowsOf(region)[0]
+  const swatch = swatchOf(row)
+  assert.ok(swatch !== null, 'a colour control must sit at the row\'s trailing edge')
+  assert.equal(row.lastElementChild ?? row.children[row.children.length - 1], swatch, 'at the very end of the row')
+  assert.equal(swatch.tagName, 'SPAN', 'never a <button>: the shared owner reads that as a session row')
+  assert.equal(swatch.getAttribute('role'), 'button', 'it is still a control, and says so')
+  assert.equal(swatch.getAttribute('tabindex'), '0', 'and reachable by Tab')
+  assert.equal(row.querySelector('button'), null, 'no button may appear inside a plugin row')
+  assert.equal(row.getAttribute('data-row-key'), null)
+  assert.equal(row.getAttribute('data-dcu-session'), null)
+  assert.equal(row.getAttribute('role'), 'button')
+  assert.equal(row.getAttribute('aria-selected'), null)
+
+  const input = colorInputOf(row)
+  assert.ok(input !== null, 'a native colour input must be there: no dependency, no hand-rolled picker')
+  assert.equal(input.getAttribute('type'), 'color')
+  assert.equal(input.getAttribute('aria-hidden'), 'true', 'the swatch is the accessible control, not the input')
+  assert.equal(input.getAttribute('tabindex'), '-1', 'and the input is not a second tab stop')
+  // Default: no colour at all.
+  assert.equal(row.hasAttribute('data-stp-color'), false, 'a row carries no colour until one is chosen')
+  run.dispose()
+  console.log('✔ row colour: a native colour input behind a span control, in no host row vocabulary')
+}
+
+// --- 4b: choosing a colour applies at once, persists under our own key, and
+//     touches neither the pin set nor a session.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1] })
+  const region = sc.body.querySelector('[data-stp-region]')
+  const row = rowsOf(region)[0]
+  const input = colorInputOf(row)
+
+  input.value = '#1a2b3c'
+  input.dispatch('change', { target: input })
+
+  assert.equal(row.getAttribute('data-stp-color'), '#1a2b3c', 'the choice must show immediately')
+  assert.equal(row.style.getPropertyValue('--stp-row-color').trim(), '#1a2b3c', 'as a property the stylesheet mixes')
+  assert.deepEqual(
+    [...new Set(run.storageCalls.writes.map(([key]) => key))],
+    ['dsh-session-top:row-colors'],
+    'this plugin\'s own key, and only that key',
+  )
+  assert.deepEqual(JSON.parse(run.storageCalls.writes[0][1]), { [S1]: '#1a2b3c' })
+  assert.deepEqual(run.pinCalls, [], 'a colour is not a pin')
+  assert.deepEqual(run.opened, [], 'and not a navigation')
+  assert.equal(run.live.pinned.length, 1)
+
+  // A second row is unaffected.
+  run.live.pinned = [S1, S2]
+  run.nudge()
+  await settle()
+  assert.equal(rowsOf(region)[1].hasAttribute('data-stp-color'), false, 'colours are per session')
+  run.dispose()
+  console.log('✔ row colour: a choice applies at once and persists under the plugin\'s own key')
+}
+
+// --- 4c: dirty stored data is not a failure. Neither is a refused storage.
+{
+  const dirty = ['{not json', '[]', 'null', '42', '"#ffffff"',
+    JSON.stringify({ [S1]: 'red' }), JSON.stringify({ [S1]: '#12345' }), JSON.stringify({ [S1]: '#1234567' }),
+    JSON.stringify({ [S1]: null }), JSON.stringify({ [S1]: 5 })]
+  for (const seed of dirty) {
+    const sc = codexScaffold()
+    const run = await runBundle(sc, { pinned: [S1], storageSeed: { 'dsh-session-top:row-colors': seed } })
+    const region = sc.body.querySelector('[data-stp-region]')
+    const row = rowsOf(region)[0]
+    assert.equal(row.hasAttribute('data-stp-color'), false, `stored ${seed} must not paint a colour`)
+    assert.ok(swatchOf(row) !== null, 'and the control is still there to pick one')
+    // Picking one still works after every one of those.
+    const input = colorInputOf(row)
+    input.value = '#010203'
+    input.dispatch('change', { target: input })
+    assert.equal(row.getAttribute('data-stp-color'), '#010203', 'stored garbage must not poison a new choice')
+    run.dispose()
+  }
+  const fresh = codexScaffold()
+  const refused = await runBundle(fresh, { pinned: [S1], storage: 'throw' })
+  const refusedRow = rowsOf(fresh.body.querySelector('[data-stp-region]'))[0]
+  assert.equal(refusedRow.hasAttribute('data-stp-color'), false, 'no stored colour without storage')
+  const refusedInput = colorInputOf(refusedRow)
+  refusedInput.value = '#040506'
+  refusedInput.dispatch('change', { target: refusedInput })
+  assert.equal(refusedRow.getAttribute('data-stp-color'), '#040506', 'a colour still applies without storage')
+  assert.deepEqual(
+    refused.logs.filter(([, line]) => /error|fail/i.test(line)), [],
+    'a refused storage is not a failure to report',
+  )
+  refused.dispose()
+  console.log('✔ row colour: dirty or refused storage degrades to "no colour" and still works')
+}
+
+// --- 4d: a stored colour is honoured by the FIRST render, before any update.
+{
+  const sc = codexScaffold()
+  await runBundle(sc, {
+    pinned: [S1, S2],
+    storageSeed: {
+      'dsh-session-top:row-colors': JSON.stringify({ [S1]: '#123456', [S9]: '#abcdef' }),
+    },
+  })
+  const rows = rowsOf(sc.body.querySelector('[data-stp-region]'))
+  assert.equal(rows[0].getAttribute('data-stp-color'), '#123456', 'a stored colour must be on screen at mount')
+  assert.equal(rows[0].style.getPropertyValue('--stp-row-color').trim(), '#123456')
+  assert.equal(
+    colorInputOf(rows[0]).value, '#123456',
+    'the native input must open on the stored colour, not on its own default',
+  )
+  assert.match(swatchOf(rows[0]).getAttribute('aria-label'), /#123456/, 'and the control must name it')
+  assert.match(
+    swatchOf(rows[0]).getAttribute('aria-label'), /设置背景颜色/,
+    'a plain click always picks, so the name must always say so',
+  )
+  assert.equal(rows[1].hasAttribute('data-stp-color'), false, 'a session with no colour has none')
+  assert.equal(
+    colorInputOf(rows[1]).value, '#ffffff',
+    'and its input sits on the empty default',
+  )
+  assert.equal(swatchOf(rows[1]).getAttribute('aria-label').includes('#123456'), false)
+  console.log('✔ row colour: a stored colour is painted by the first render')
+}
+
+// --- 4e: #000000 is a colour, not a sentinel.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1] })
+  const row = rowsOf(sc.body.querySelector('[data-stp-region]'))[0]
+  const input = colorInputOf(row)
+  input.value = '#000000'
+  input.dispatch('change', { target: input })
+  assert.equal(row.getAttribute('data-stp-color'), '#000000', 'black is a legal colour')
+  assert.equal(row.hasAttribute('data-stp-color'), true, 'and it is not mistaken for "no colour"')
+  assert.deepEqual(JSON.parse(run.storageCalls.writes.at(-1)[1]), { [S1]: '#000000' })
+  run.dispose()
+  console.log('✔ row colour: #000000 is kept as a colour, never as a clear sentinel')
+}
+
+// --- 4f: clearing is explicit, and both ways say how they work.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1] })
+  const region = sc.body.querySelector('[data-stp-region]')
+  const row = rowsOf(region)[0]
+  const swatch = swatchOf(row)
+  const input = colorInputOf(row)
+  input.value = '#654321'
+  input.dispatch('change', { target: input })
+  assert.equal(row.getAttribute('data-stp-color'), '#654321')
+
+  // Shift-click restores the default.
+  swatch.dispatch('click', { shiftKey: true, target: swatch })
+  assert.equal(row.hasAttribute('data-stp-color'), false, 'Shift-click clears')
+  assert.deepEqual(JSON.parse(run.storageCalls.writes.at(-1)[1]), {}, 'and the stored map empties')
+  assert.equal(
+    input.value, '#ffffff',
+    'and the native input goes back to its default, so reopening the picker is not stale',
+  )
+
+  // So does Delete from the keyboard, with the control focused.
+  input.value = '#112233'
+  input.dispatch('change', { target: input })
+  assert.equal(input.value, '#112233')
+  swatch.dispatch('keydown', { key: 'Delete', target: swatch })
+  assert.equal(row.hasAttribute('data-stp-color'), false, 'Delete clears')
+  assert.equal(input.value, '#ffffff', 'and resets the input')
+
+  // The hints are on the control itself, in both states.
+  input.value = '#445566'
+  input.dispatch('change', { target: input })
+  assert.match(swatch.getAttribute('title'), /Shift/, 'the tooltip must name Shift-click')
+  assert.match(swatch.getAttribute('title'), /Delete/, 'and Delete')
+  assert.match(swatch.getAttribute('aria-label'), /Shift/, 'and so must the accessible name')
+  assert.match(swatch.getAttribute('aria-label'), /Delete/, 'both ways, not just one')
+  assert.match(swatch.getAttribute('aria-label'), /设置背景颜色/, 'a plain click picks, so the name says pick')
+  assert.match(swatch.getAttribute('aria-label'), /#445566/, 'which also says what is set')
+  input.value = '#445566'
+  input.dispatch('change', { target: input })
+  assert.deepEqual(run.opened, [], 'clearing is not a navigation')
+  assert.deepEqual(run.pinCalls, [], 'nor a pin change')
+  run.dispose()
+  console.log('✔ row colour: Shift-click and Delete both restore the default, and both are labelled')
+}
+
+// --- 4g: no colour gesture may navigate the session or re-pin it, and the row
+//     itself must still work exactly as before.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1] })
+  const row = rowsOf(sc.body.querySelector('[data-stp-region]'))[0]
+  const swatch = swatchOf(row)
+  const input = colorInputOf(row)
+
+  // Real bubbling, so a gesture that reached the row would open it.
+  swatch.dispatch('click', { target: swatch }, { bubble: true })
+  swatch.dispatch('keydown', { key: 'Enter', target: swatch }, { bubble: true })
+  swatch.dispatch('keydown', { key: ' ', target: swatch }, { bubble: true })
+  swatch.dispatch('click', { shiftKey: true, target: swatch }, { bubble: true })
+  // And the native input, whose own click and keys would otherwise land on the row.
+  input.dispatch('click', { target: input }, { bubble: true })
+  input.dispatch('keydown', { key: 'ArrowRight', target: input }, { bubble: true })
+  input.dispatch('input', { target: input }, { bubble: true })
+  input.dispatch('change', { target: input }, { bubble: true })
+  assert.deepEqual(run.opened, [], 'no colour gesture may open the session')
+  assert.deepEqual(run.pinCalls, [], 'nor change the pin set')
+
+  // A key that belongs to the control, delivered on the row, is the control's.
+  row.dispatch('keydown', { key: 'Enter', target: swatch })
+  assert.deepEqual(run.opened, [], 'the row must ignore a key aimed at its own control')
+  // The row's own keys still work.
+  row.dispatch('keydown', { key: 'Enter', target: row })
+  assert.deepEqual(run.opened, [S1], 'Enter on the row still opens the session')
+  row.dispatch('keydown', { key: ' ', target: row })
+  assert.deepEqual(run.opened, [S1, S1], 'and Space still does')
+  run.dispose()
+  console.log('✔ row colour: colour gestures never navigate; the row itself still does')
+}
+
+// --- 4h: a colour is not lost by an ordinary update, and unpinning never
+//     silently throws another session's colour away.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1, S2] })
+  const region = sc.body.querySelector('[data-stp-region]')
+  const rows = rowsOf(region)
+  for (const [row, color] of [[rows[0], '#0a0b0c'], [rows[1], '#0d0e0f']]) {
+    const input = colorInputOf(row)
+    input.value = color
+    input.dispatch('change', { target: input })
+  }
+
+  // A title and a timestamp change: the row is updated in place.
+  run.live.byId[S1] = { id: S1, displayTitle: 'renamed', updatedAt: 9 }
+  run.nudge()
+  await settle()
+  const after = rowsOf(region)
+  assert.equal(after[0], rows[0], 'the row is updated, not rebuilt')
+  assert.equal(after[0].getAttribute('data-stp-color'), '#0a0b0c', 'and its colour survives the update')
+  assert.equal(listenersOf(after), listenersOf(rows), 'an update must not add a listener')
+  assert.equal(after[0].querySelector('[data-stp-row-title]').textContent, 'renamed')
+
+  // Unpin everything: the region goes, the stored colours do not.
+  run.live.pinned = []
+  run.nudge()
+  await settle()
+  assert.equal(sc.body.querySelector('[data-stp-region]'), null, 'no pins, no region')
+  assert.deepEqual(
+    JSON.parse(run.storageCalls.writes.at(-1)[1]),
+    { [S1]: '#0a0b0c', [S2]: '#0d0e0f' },
+    'unpinning must never clear a stored colour',
+  )
+
+  // Re-pin: both colours come back.
+  run.live.pinned = [S1, S2]
+  run.nudge()
+  await settle()
+  const back = rowsOf(sc.body.querySelector('[data-stp-region]'))
+  assert.equal(back[0].getAttribute('data-stp-color'), '#0a0b0c', 'a re-pinned session keeps its colour')
+  assert.equal(back[1].getAttribute('data-stp-color'), '#0d0e0f')
+  run.dispose()
+  console.log('✔ row colour: an update keeps the colour, and unpin/repin never loses it')
+}
+
+// --- 4i: the colours are legible: the background is a light mix, and hover,
+//     focus and the active session stay legible OVER it.
+{
+  const sc = codexScaffold()
+  await runBundle(sc, { pinned: [S1] })
+  const css = staticCss(sc)
+  const ruleFor = (selector) => {
+    const match = css.match(new RegExp(`${selector.replace(/[[\]]/g, '\\$&')}[^{]*\\{[^}]*\\}`))
+    return match === null ? null : match[0]
+  }
+  const base = ruleFor("[data-stp-row][data-stp-color]")
+  assert.ok(base !== null, 'a coloured row needs its own background rule')
+  assert.match(base, /color-mix\(/, 'mixed, not opaque: the host\'s own tokens stay readable through it')
+  assert.match(base, /--stp-row-color/, 'mixed from the colour the user picked')
+  for (const selector of [
+    "[data-stp-row][data-stp-color]:hover",
+    "[data-stp-row][data-stp-color]:focus-visible",
+    "[data-stp-row][data-stp-color][aria-current='true']",
+  ]) {
+    const rule = ruleFor(selector)
+    assert.ok(rule !== null, `${selector} must stay distinguishable over a colour`)
+    assert.match(rule, /--stp-row-color/, `${selector} must keep the colour rather than paint over it`)
+  }
+  console.log('✔ row colour: hover, focus and current all stay legible over the chosen colour')
+}
+
+// --- 4j: right-click still belongs to the host — from the row AND from the
+//     colour point, which is the one place a new control could have broken it.
+{
+  const sc = officialUiScaffold()
+  const run = await runBundle(sc, { pinned: [S1] })
+  openWorkspace(sc)
+  const row = rowsOf(sc.body.querySelector('[data-stp-region]'))[0]
+  const swatch = swatchOf(row)
+  rightClickAt(run, swatch, 140, 96)
+  await settle()
+  assert.equal(
+    sc.body.querySelector('[data-stp-menu]'), null,
+    'the colour point must not fall back to the plugin\'s own one-item menu',
+  )
+  assert.equal(sc.liveRow().ellipsis.clicks, 1, "it must reach the host's own … control")
+  const labels = sc.liveRow().hostMenu().children.map(item => item.textContent)
+  for (const label of ['置顶', '重命名', '分叉会话', '归档会话', '复制 Session ID']) {
+    assert.ok(labels.includes(label), `the host's own action must survive the colour point: ${label}`)
+  }
+  assert.equal(labels.filter(label => label === '置顶' || label === '取消置顶').length, 1, 'one Pin, not two')
+
+  // And a row that now CARRIES a colour is still a session row for the menu.
+  const other = officialUiScaffold()
+  const second = await runBundle(other, { pinned: [S1] })
+  openWorkspace(other)
+  const colorRow = rowsOf(other.body.querySelector('[data-stp-region]'))[0]
+  const input = colorInputOf(colorRow)
+  input.value = '#778899'
+  input.dispatch('change', { target: input })
+  assert.equal(colorRow.getAttribute('data-stp-color'), '#778899', 'precondition: the row is coloured')
+  rightClickAt(second, colorRow, 140, 96)
+  await settle()
+  assert.equal(other.body.querySelector('[data-stp-menu]'), null, 'still the host menu, not the plugin\'s')
+  assert.equal(other.liveRow().ellipsis.clicks, 1, 'a coloured row is still a session row for the menu')
+  const labels2 = other.liveRow().hostMenu().children.map(item => item.textContent)
+  for (const label of ['重命名', '分叉会话', '归档会话', '复制 Session ID']) {
+    assert.ok(labels2.includes(label), `the host's own action must survive a coloured row: ${label}`)
+  }
+  second.dispose()
+  run.dispose()
+  console.log('✔ row colour: the host\'s full session menu is untouched, from row and colour point')
+}
+
+// --- 4k: a timestamp that arrives AFTER the first render must not reorder the
+//     row. The summaries land after the pin registry, so a session whose
+//     summary has no `updatedAt` yet renders no time cell at all — and the cell
+//     created when it finally arrives has to go where a first-render row would
+//     have put it, in front of the trailing colour point, not after it.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1] })
+  // A summary with NO timestamp: the first render draws no time cell.
+  run.live.byId[S1] = { id: S1, displayTitle: 'one' }
+  run.nudge()
+  await settle()
+  const region = sc.body.querySelector('[data-stp-region]')
+  const row = rowsOf(region)[0]
+  const swatch = swatchOf(row)
+  assert.ok(swatch !== null)
+  assert.equal(row.querySelector('[data-stp-row-time]'), null, 'precondition: no time cell yet')
+  assert.equal(
+    row.children[row.children.length - 1], swatch,
+    'precondition: the colour point is the trailing child',
+  )
+
+  // The timestamp arrives late.
+  run.live.byId[S1] = { id: S1, displayTitle: 'one', updatedAt: Date.now() - 3 * 86_400_000 }
+  run.nudge()
+  await settle()
+  const cell = row.querySelector('[data-stp-row-time]')
+  assert.ok(cell !== null, 'the late timestamp renders its cell')
+  assert.equal(cell.textContent, '3天')
+  assert.equal(
+    row.children[row.children.length - 1], swatch,
+    'the colour point must still be the trailing child, not the middle one',
+  )
+  const order = row.children.map(child =>
+    child.getAttribute('data-stp-row-slot') !== null ? 'slot'
+      : child.getAttribute('data-stp-row-title') !== null ? 'title'
+        : child.getAttribute('data-stp-row-time') !== null ? 'time'
+          : child.getAttribute('data-stp-row-color') !== null ? 'color' : '?')
+  assert.deepEqual(order, ['slot', 'title', 'time', 'color'], 'exactly what a first render produces')
+  assert.equal(rowsOf(region)[0], row, 'and the row is updated in place')
+  assert.equal(swatchOf(row), swatch, 'the colour control is not rebuilt either')
+  assert.equal(listenersOf([row]), 2, 'and no listener was added')
+  run.dispose()
+  console.log('✔ row colour: a timestamp arriving late keeps the colour point at the row\'s end')
+}
+
+// --- 4l: TWO WINDOWS, ONE ORIGIN, BOTH LOADED FIRST.
+//
+// The conflict is not hypothetical and it is not a race inside one mount: it is
+// the ordinary case of the same preference open twice. Window A mounts, window
+// B mounts — both have now read an empty store into memory. A sets its colour.
+// B, whose in-memory map is stale BY CONSTRUCTION, sets a different one.
+//
+// What must not happen is B writing out the map it loaded at mount. Storage is
+// the shared truth, so the settled write has to read it again, merge only this
+// session's id, and write that back.
+{
+  const KEY = 'dsh-session-top:row-colors'
+  const scA = codexScaffold()
+  const scB = codexScaffold()
+  // One origin: the two mounts are two windows over ONE Storage.
+  const origin = newStorageFixture()
+  const a = await runBundle(scA, { pinned: [S1], storageFixture: origin, alongside: true })
+  const b = await runBundle(scB, { pinned: [S1, S2], storageFixture: origin, alongside: true })
+  const rowFor = (sc, id) => rowsOf(sc.body.querySelector('[data-stp-region]'))
+    .find(row => row.getAttribute('data-stp-session') === id)
+
+  assert.deepEqual(
+    origin.calls.writes, [],
+    'precondition: reading the preference at mount must not write one, in either window',
+  )
+
+  // Window A colours its own session.
+  const aInput = colorInputOf(rowFor(scA, S1))
+  aInput.value = '#0a0b0c'
+  aInput.dispatch('change', { target: aInput })
+  assert.deepEqual(
+    JSON.parse(origin.calls.writes.at(-1)[1]), { [S1]: '#0a0b0c' },
+    'precondition: window A wrote its own colour',
+  )
+  assert.deepEqual(
+    [...new Set(origin.calls.writes.map(([key]) => key))], [KEY],
+    'precondition: under this plugin\'s own key, and no other',
+  )
+
+  // Window B colours a DIFFERENT session. It has heard nothing.
+  const bInput = colorInputOf(rowFor(scB, S2))
+  bInput.value = '#0d0e0f'
+  bInput.dispatch('change', { target: bInput })
+  assert.deepEqual(
+    JSON.parse(origin.calls.writes.at(-1)[1]),
+    { [S1]: '#0a0b0c', [S2]: '#0d0e0f' },
+    "window B's write must merge into what storage actually holds, not overwrite it with the map it loaded at mount",
+  )
+
+  // And clearing from B deletes B's own id and nothing else — the entry another
+  // window owns survives a clear here.
+  const bSwatch = swatchOf(rowFor(scB, S2))
+  bSwatch.dispatch('click', { shiftKey: true, target: bSwatch })
+  assert.deepEqual(
+    JSON.parse(origin.calls.writes.at(-1)[1]),
+    { [S1]: '#0a0b0c' },
+    'clearing removes THIS session\'s colour and leaves every other id alone',
+  )
+  a.dispose()
+  b.dispose()
+  console.log('✔ row colour: two windows on one origin merge instead of overwriting each other')
+}
+
+// --- 4m: a picker DRAG previews, and only the gesture that ends it persists.
+//     `input` fires per pixel of a native colour picker; writing storage on
+//     every one of them is a synchronous disk write per pixel of a drag.
+{
+  const KEY = 'dsh-session-top:row-colors'
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1] })
+  const row = rowsOf(sc.body.querySelector('[data-stp-region]'))[0]
+  const input = colorInputOf(row)
+  const colorWrites = () => run.storageCalls.writes.filter(([key]) => key === KEY)
+
+  input.value = '#123abc'
+  input.dispatch('input', { target: input })
+  assert.equal(row.getAttribute('data-stp-color'), '#123abc', 'a drag must be on screen as it happens')
+  assert.equal(row.style.getPropertyValue('--stp-row-color').trim(), '#123abc')
+  assert.equal(
+    colorWrites().length, 0,
+    'a drag must not write storage on every pixel of it — the value is not chosen yet',
+  )
+
+  input.value = '#123abd'
+  input.dispatch('input', { target: input })
+  assert.equal(colorWrites().length, 0, 'nor on the next pixel')
+  assert.equal(row.getAttribute('data-stp-color'), '#123abd')
+
+  input.dispatch('change', { target: input })
+  assert.equal(colorWrites().length, 1, 'ending the picker persists exactly once')
+  assert.deepEqual(JSON.parse(colorWrites()[0][1]), { [S1]: '#123abd' })
+  assert.equal(row.getAttribute('data-stp-color'), '#123abd', 'and the row keeps it')
+  assert.equal(
+    listenersOf([row]), 2,
+    'the drag must not add a listener — the same control handled both events',
+  )
+  run.dispose()
+  console.log('✔ row colour: a picker drag previews, and only the finished choice persists')
+}
+
+// --- 4n: a write by ANOTHER window reaches this one, repaints in place, and is
+//     never written back. This is the only way two windows agree without a
+//     reload, so the delivery is not optional; and a listener that wrote on
+//     receipt would start an echo that ends in a storage-event storm.
+{
+  const KEY = 'dsh-session-top:row-colors'
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1, S2] })
+  const region = sc.body.querySelector('[data-stp-region]')
+  const rows = rowsOf(region)
+  const initial = rows.map(colorSurfaceOf)
+
+  // Somebody else's key. Nothing about colours may move, and nothing may be
+  // written: this plugin does not get to police other plugins' storage.
+  dispatchWindowEvent(run, 'storage', { key: 'some-other-plugin:prefs', newValue: '{"a":1}' })
+  assert.deepEqual(rows.map(colorSurfaceOf), initial, 'an unrelated key must not repaint a row')
+  assert.equal(run.storageCalls.writes.length, 0, 'and must not be answered with a write')
+
+  // Our key, a real change from another window.
+  writeFromOtherWindow(run, KEY, JSON.stringify({ [S1]: '#010203', [S2]: '#040506' }))
+  assert.equal(rows[0].getAttribute('data-stp-color'), '#010203', 'the row takes the foreign colour')
+  assert.equal(rows[0].style.getPropertyValue('--stp-row-color').trim(), '#010203')
+  assert.equal(
+    colorInputOf(rows[0]).value, '#010203',
+    'the native input follows, or reopening the picker on that row is stale',
+  )
+  assert.match(swatchOf(rows[0]).getAttribute('aria-label'), /#010203/, 'and the control names it')
+  assert.equal(rows[1].getAttribute('data-stp-color'), '#040506')
+  assert.deepEqual(
+    rowsOf(region), rows,
+    'repainted IN PLACE — a rebuilt row is a new node at the pointerup, which eats clicks',
+  )
+  assert.equal(listenersOf(rows), 4, 'and no listener was added or lost')
+  assert.equal(
+    run.storageCalls.writes.length, 0,
+    'a foreign write is repainted, never written back — that would echo',
+  )
+
+  // The same value delivered again: an event that changes nothing repaints
+  // nothing. Every write inside paintRowColor is guarded, and this is where
+  // that claim is either true or not.
+  const settled = rows.map(colorSurfaceOf)
+  dispatchWindowEvent(run, 'storage', {
+    key: KEY,
+    newValue: JSON.stringify({ [S1]: '#010203', [S2]: '#040506' }),
+  })
+  assert.deepEqual(rows.map(colorSurfaceOf), settled, 'an unchanged foreign write must write no DOM')
+  assert.equal(run.storageCalls.writes.length, 0)
+
+  // Dispose takes the listener with it.
+  run.dispose()
+  assert.equal(
+    run.windowListeners.get('storage')?.length ?? 0, 0,
+    'dispose must remove the storage listener it added',
+  )
+  dispatchWindowEvent(run, 'storage', { key: KEY, newValue: JSON.stringify({ [S1]: '#999999' }) })
+  assert.equal(
+    rows[0].getAttribute('data-stp-color'), '#010203',
+    'a disposed mount must not repaint from storage',
+  )
+  console.log('✔ row colour: a foreign window\'s write repaints in place, is never echoed, and dies with the mount')
+}
+
+// --- 4o: the picker is OPEN. A foreign write must not yank the colour out from
+//     under the pointer, and the gesture that ends the drag must merge into the
+//     storage that arrived WHILE it was open, not into the map from before it.
+{
+  const KEY = 'dsh-session-top:row-colors'
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1, S2] })
+  const rows = rowsOf(sc.body.querySelector('[data-stp-region]'))
+  const s2Input = colorInputOf(rows[1])
+
+  // The picker opens on the second row and the user drags: preview, no storage.
+  s2Input.value = '#0d0e0f'
+  s2Input.dispatch('input', { target: s2Input })
+  assert.equal(rows[1].getAttribute('data-stp-color'), '#0d0e0f', 'precondition: the drag is on screen')
+  assert.equal(run.storageCalls.writes.length, 0, 'precondition: nothing is stored yet')
+
+  // Meanwhile another window colours two OTHER sessions, one of which is not
+  // even pinned here.
+  writeFromOtherWindow(run, KEY, JSON.stringify({ [S1]: '#0a0b0c', [S9]: '#0f1011' }))
+  assert.equal(rows[0].getAttribute('data-stp-color'), '#0a0b0c', 'the other row takes the foreign colour at once')
+  assert.equal(
+    rows[1].getAttribute('data-stp-color'), '#0d0e0f',
+    'and the row being picked keeps the colour being picked — the drag is not over',
+  )
+
+  // The picker closes.
+  s2Input.dispatch('change', { target: s2Input })
+  assert.deepEqual(
+    JSON.parse(run.storageCalls.writes.at(-1)[1]),
+    { [S1]: '#0a0b0c', [S9]: '#0f1011', [S2]: '#0d0e0f' },
+    'the committed colour merges into the storage that arrived during the drag, foreign ids and all',
+  )
+  assert.equal(rows[1].getAttribute('data-stp-color'), '#0d0e0f')
+  assert.deepEqual(run.pinCalls, [], 'and none of this is a pin')
+  assert.deepEqual(run.opened, [], 'nor a navigation')
+  run.dispose()
+  console.log('✔ row colour: a foreign write mid-drag repaints the others and spares the open picker')
+}
+
+// =====================================================================
+// REQUIREMENT 5 — THE COLOUR DIALOG, and ONE colour map for every row.
+//
+// The control is no longer a hidden <input type="color"> and nothing else: it is
+// a dialog a person can type into, drive from the keyboard, read, correct and
+// cancel — and it is the SAME surface from the row's colour point, from the
+// plugin's own fallback menu and from the official session-row menu, so a
+// session's colour never depends on which entry point found it.
+// =====================================================================
+
+const COLOR_KEY = 'dsh-session-top:row-colors'
+/** The decorative pin glyph the plugin's own menu item leads with. */
+const PIN_GLYPH = '\u{1F4CC}'
+/** The dialog this mount currently has open, or null. */
+const dialogOf = (sc) => sc.body.querySelector('[data-stp-color-dialog]')
+const hexOf = (dialog) => dialog.querySelector('[data-stp-color-hex]')
+const buttonOf = (dialog, attr) => dialog.querySelector(`[${attr}]`)
+const nativeOf = (dialog) => dialog.querySelector('[data-stp-color-native]')
+const alertOf = (sc) => sc.body.querySelector('[data-stp-alert]')
+
+// --- 5a: it opens as a real, named dialog on the visible page, prefilled.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, {
+    pinned: [S1],
+    storageSeed: { [COLOR_KEY]: JSON.stringify({ [S1]: '#123456' }) },
+  })
+  const region = sc.body.querySelector('[data-stp-region]')
+  swatchOf(rowsOf(region)[0]).dispatch('click', { shiftKey: false })
+  const dialog = dialogOf(sc)
+  assert.ok(dialog !== null, 'clicking the colour point must open the plugin dialog')
+  assert.equal(dialog.getAttribute('role'), 'dialog')
+  assert.equal(dialog.getAttribute('aria-hidden'), null, 'a dialog under aria-hidden is a dialog nobody can use')
+  assert.ok((dialog.getAttribute('aria-label') ?? '').length > 0, 'it must name itself')
+  assert.equal(dialog.parentElement, sc.body, 'it is on the visible page, not in the off-screen menu anchor')
+  assert.equal(hexOf(dialog).value, '#123456', 'it opens on the colour the row actually carries')
+  run.dispose()
+  console.log('✔ colour dialog: the colour point opens a named role=dialog, prefilled with the stored colour')
+}
+
+// --- 5b: 应用 commits, and ONLY 应用 and 恢复默认 commit.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1] })
+  const region = sc.body.querySelector('[data-stp-region]')
+  const row = rowsOf(region)[0]
+  const swatch = swatchOf(row)
+
+  swatch.dispatch('click', { shiftKey: false })
+  let dialog = dialogOf(sc)
+  hexOf(dialog).value = '#1a2b3c'
+  buttonOf(dialog, 'data-stp-color-cancel').click()
+  assert.equal(dialogOf(sc), null, '取消 closes the dialog')
+  assert.deepEqual(run.storageCalls.writes, [], 'and stores NOTHING — a cancelled colour is not a colour')
+  assert.equal(row.hasAttribute('data-stp-color'), false, 'nor does it paint one')
+
+  // Typing alone changes nothing either; only the native helper follows it.
+  swatch.dispatch('click', { shiftKey: false })
+  dialog = dialogOf(sc)
+  const hex = hexOf(dialog)
+  hex.value = '#1a2b3c'
+  hex.dispatch('input', { target: hex })
+  assert.deepEqual(run.storageCalls.writes, [], 'typing into the box is not a commit')
+  const native = nativeOf(dialog)
+  native.value = '#0a0b0c'
+  native.dispatch('input', { target: native })
+  assert.equal(hex.value, '#0a0b0c', 'the native swatch drives the box')
+  assert.deepEqual(run.storageCalls.writes, [], 'and still is not a commit')
+
+  buttonOf(dialog, 'data-stp-color-apply').click()
+  assert.equal(dialogOf(sc), null, '应用 closes the dialog')
+  assert.deepEqual(
+    [...new Set(run.storageCalls.writes.map(([key]) => key))],
+    [COLOR_KEY],
+    'and writes under this plugin\'s own key, and no other',
+  )
+  // What is committed is what the BOX holds — and the helper moved it, so the
+  // value the user last saw is the value that is stored.
+  assert.deepEqual(JSON.parse(run.storageCalls.writes.at(-1)[1]), { [S1]: '#0a0b0c' })
+  assert.equal(row.getAttribute('data-stp-color'), '#0a0b0c', 'the row shows it at once')
+  assert.deepEqual(run.pinCalls, [], 'a colour is not a pin')
+  assert.deepEqual(run.opened, [], 'and not a navigation')
+
+  // 恢复默认 deletes THIS id and leaves every other alone.
+  run.live.pinned = [S1, S2]
+  run.nudge()
+  await settle()
+  swatchOf(rowsOf(region)[0]).dispatch('click', { shiftKey: false })
+  dialog = dialogOf(sc)
+  buttonOf(dialog, 'data-stp-color-reset').click()
+  assert.deepEqual(JSON.parse(run.storageCalls.writes.at(-1)[1]), {}, '恢复默认 clears exactly one id')
+  assert.equal(rowsOf(region)[0].hasAttribute('data-stp-color'), false)
+  run.dispose()
+  console.log('✔ colour dialog: only 应用 and 恢复默认 commit; 取消 and typing store nothing')
+}
+
+// --- 5c: an invalid value is refused in place, and #000000 is a colour.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1] })
+  const region = sc.body.querySelector('[data-stp-region]')
+  const row = rowsOf(region)[0]
+  swatchOf(row).dispatch('click', { shiftKey: false })
+  for (const bad of ['red', '#12345', '#1234567', 'rgb(1,2,3)', '', '#abcdefg']) {
+    const dialog = dialogOf(sc)
+    hexOf(dialog).value = bad
+    buttonOf(dialog, 'data-stp-color-apply').click()
+    assert.equal(dialogOf(sc), dialog, `${JSON.stringify(bad)} must not close the dialog`)
+    assert.equal(hexOf(dialog).getAttribute('aria-invalid'), 'true', `${JSON.stringify(bad)} must be reported invalid`)
+    assert.deepEqual(run.storageCalls.writes, [], `${JSON.stringify(bad)} must not be written`)
+    assert.equal(row.hasAttribute('data-stp-color'), false)
+  }
+  const dialog = dialogOf(sc)
+  hexOf(dialog).value = '#000000'
+  buttonOf(dialog, 'data-stp-color-apply').click()
+  assert.deepEqual(JSON.parse(run.storageCalls.writes.at(-1)[1]), { [S1]: '#000000' }, '#000000 is a colour')
+  assert.equal(row.getAttribute('data-stp-color'), '#000000')
+  run.dispose()
+  console.log('✔ colour dialog: invalid hex is refused in place, #000000 stays a colour')
+}
+
+// --- 5c-bis: the refusal is actually VISIBLE and actually SAYS something.
+// aria-invalid alone is not feedback: the live dialog refused `oops`, set
+// aria-invalid='true', stored nothing — and left the message div carrying
+// `hidden`, so nothing was on screen and nothing was announced. Both halves of
+// the pair are asserted here: the attribute AND the element that is readable.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1] })
+  const region = sc.body.querySelector('[data-stp-region]')
+  swatchOf(rowsOf(region)[0]).dispatch('click', { shiftKey: false })
+  const dialog = dialogOf(sc)
+  const error = buttonOf(dialog, 'data-stp-color-error')
+  assert.equal(error.getAttribute('hidden'), '', 'an unused error line starts hidden')
+  assert.equal(error.textContent, '', 'and starts empty')
+
+  hexOf(dialog).value = 'oops'
+  buttonOf(dialog, 'data-stp-color-apply').click()
+  assert.equal(error.getAttribute('hidden'), null, 'a refusal MUST unhide the message, or the user sees nothing')
+  assert.notEqual(error.textContent, '', 'and it must carry the actual text to read')
+  assert.equal(error.getAttribute('role'), 'status', 'a live region, so it is announced too')
+  assert.equal(hexOf(dialog).getAttribute('aria-invalid'), 'true')
+
+  // A corrected value clears BOTH halves again.
+  hexOf(dialog).value = '#1a2b3c'
+  buttonOf(dialog, 'data-stp-color-apply').click()
+  assert.deepEqual(JSON.parse(run.storageCalls.writes.at(-1)[1]), { [S1]: '#1a2b3c' })
+  run.dispose()
+  console.log('✔ colour dialog: a refused value SHOWS its message; a good one hides it again')
+}
+
+// --- 5d-bis: Enter on a BUTTON is that button, never a silent commit.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1] })
+  const region = sc.body.querySelector('[data-stp-region]')
+  const row = rowsOf(region)[0]
+  const swatch = swatchOf(row)
+
+  // Enter on 取消 must cancel. The inverted handler committed instead, which is
+  // the worst version of this bug: the user asked to discard and it saved.
+  // A real browser ALSO activates the focused button on Enter; this fake does
+  // not, so the click stands in for that platform step. What is under test is
+  // that the dialog's own keydown handler stayed out of the way.
+  swatch.dispatch('click', { shiftKey: false })
+  let dialog = dialogOf(sc)
+  hexOf(dialog).value = '#1a2b3c'
+  buttonOf(dialog, 'data-stp-color-cancel').dispatch('keydown', { key: 'Enter' }, { bubble: true })
+  assert.deepEqual(run.storageCalls.writes, [], 'Enter on 取消 stores nothing, whatever the field holds')
+  buttonOf(dialog, 'data-stp-color-cancel').click()
+  assert.equal(dialogOf(sc), null, 'and 取消 still closes the dialog')
+
+  // Enter on 恢复默认 must reset, not save the field's value.
+  swatch.dispatch('click', { shiftKey: false })
+  dialog = dialogOf(sc)
+  hexOf(dialog).value = '#1a2b3c'
+  buttonOf(dialog, 'data-stp-color-reset').dispatch('keydown', { key: 'Enter' }, { bubble: true })
+  assert.deepEqual(run.storageCalls.writes, [], 'Enter on 恢复默认 does not commit the typed hex')
+  buttonOf(dialog, 'data-stp-color-reset').click()
+  assert.equal(row.hasAttribute('data-stp-color'), false, 'and the colour is actually cleared')
+
+  // Enter on the FIELD is still apply — the shortcut this dialog promises.
+  swatch.dispatch('click', { shiftKey: false })
+  dialog = dialogOf(sc)
+  hexOf(dialog).value = '#1a2b3c'
+  dialog.dispatch('keydown', { key: 'Enter', target: hexOf(dialog) })
+  assert.deepEqual(JSON.parse(run.storageCalls.writes.at(-1)[1]), { [S1]: '#1a2b3c' }, 'Enter from the field still applies')
+  assert.equal(dialogOf(sc), null)
+
+  // And an Enter with no target at all (the dialog itself) still applies.
+  swatch.dispatch('click', { shiftKey: false })
+  dialog = dialogOf(sc)
+  hexOf(dialog).value = '#0a0b0c'
+  dialog.dispatch('keydown', { key: 'Enter' })
+  assert.deepEqual(JSON.parse(run.storageCalls.writes.at(-1)[1]), { [S1]: '#0a0b0c' }, 'a targetless Enter still applies')
+  run.dispose()
+  console.log('✔ colour dialog: Enter belongs to a focused button; only the field submits')
+}
+
+// --- 5d: Escape cancels, Enter applies, and focus always goes back.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1] })
+  const region = sc.body.querySelector('[data-stp-region]')
+  const swatch = swatchOf(rowsOf(region)[0])
+
+  swatch.dispatch('click', { shiftKey: false })
+  let dialog = dialogOf(sc)
+  assert.equal(hexOf(dialog).focusCalls, 1, 'the field takes focus when the dialog opens')
+  dialog.dispatch('keydown', { key: 'Escape' })
+  assert.equal(dialogOf(sc), null, 'Escape closes the dialog')
+  assert.deepEqual(run.storageCalls.writes, [], 'Escape stores nothing')
+  assert.equal(swatch.focusCalls, 1, 'and focus goes back to the control that opened it')
+
+  swatch.dispatch('click', { shiftKey: false })
+  dialog = dialogOf(sc)
+  hexOf(dialog).value = '#0d0e0f'
+  dialog.dispatch('keydown', { key: 'Enter' })
+  assert.equal(dialogOf(sc), null, 'Enter applies and closes')
+  assert.deepEqual(JSON.parse(run.storageCalls.writes.at(-1)[1]), { [S1]: '#0d0e0f' })
+  assert.equal(swatch.focusCalls, 2, 'and gives it back on the way out, whichever way it closed')
+  run.dispose()
+  console.log('✔ colour dialog: Escape cancels, Enter applies, focus is always handed back')
+}
+
+// --- 5e: dispose removes it, and a dialog from a dead mount cannot write.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1] })
+  const region = sc.body.querySelector('[data-stp-region]')
+  swatchOf(rowsOf(region)[0]).dispatch('click', { shiftKey: false })
+  const dialog = dialogOf(sc)
+  assert.ok(dialog !== null)
+  run.dispose()
+  assert.equal(dialogOf(sc), null, 'dispose must take the dialog off the page')
+  const before = run.storageCalls.writes.length
+  hexOf(dialog).value = '#0a0b0c'
+  buttonOf(dialog, 'data-stp-color-apply').click()
+  dialog.dispatch('keydown', { key: 'Enter' })
+  assert.equal(run.storageCalls.writes.length, before, 'a dialog from a disposed mount writes nothing')
+  console.log('✔ colour dialog: dispose removes it and a dead dialog can no longer write')
+}
+
+// --- 5f: a refused storage is reported, never silently swallowed.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1], storage: 'throw' })
+  const region = sc.body.querySelector('[data-stp-region]')
+  swatchOf(rowsOf(region)[0]).dispatch('click', { shiftKey: false })
+  const dialog = dialogOf(sc)
+  hexOf(dialog).value = '#1a2b3c'
+  buttonOf(dialog, 'data-stp-color-apply').click()
+  assert.equal(dialogOf(sc), null, 'the colour still applies to this session')
+  const alert = alertOf(sc)
+  assert.ok(alert !== null, 'but the user is told it will not be remembered')
+  assert.equal(alert.getAttribute('data-stp-alert-reason'), 'unavailable')
+  run.dispose()
+  console.log('✔ colour dialog: a refused storage is surfaced, never a silent downgrade')
+}
+
+// --- 5g: the plugin's OWN fallback menu opens the SAME dialog, for an ordinary
+//     UNPINNED session, and the colour shows on the host's own row.
+{
+  const sc = officialUiScaffold({ hostRowMenu: false })
+  const run = await runBundle(sc, { pinned: [] })
+  openWorkspace(sc)
+  const row = sc.liveRow()
+  assert.ok(row !== null, 'the host row is mounted')
+
+  rightClickAt(run, row, 120, 200)
+  await afterDispatch()
+  const own = sc.body.querySelector('[data-stp-menu]')
+  assert.ok(own !== null, 'with no host "…" control, the plugin serves its own menu')
+  assert.deepEqual(
+    [...own.querySelectorAll('[role="menuitem"]')].map(node => node.textContent),
+    [`${PIN_GLYPH}置顶该会话`, '自定义行背景颜色…'],
+    'the fallback menu carries the colour entry as well as the pin action',
+  )
+  own.querySelector('[data-stp-color-item]').click()
+  await afterDispatch()
+  const dialog = dialogOf(sc)
+  assert.ok(dialog !== null, 'the menu entry opens the same dialog')
+  assert.equal(dialog.getAttribute('data-stp-session'), S1, 'for the right session')
+  hexOf(dialog).value = '#1a2b3c'
+  buttonOf(dialog, 'data-stp-color-apply').click()
+  assert.deepEqual(
+    JSON.parse(run.storageCalls.writes.at(-1)[1]), { [S1]: '#1a2b3c' },
+    'an UNPINNED session gets a stored colour of its own',
+  )
+  assert.deepEqual(run.pinCalls, [], 'and choosing one is not a pin')
+  assert.equal(row.getAttribute('data-stp-color'), '#1a2b3c', 'the HOST row is tinted at once, from the same map')
+  assert.equal(row.style.getPropertyValue('--stp-row-color').trim(), '#1a2b3c')
+
+  // Pinning it keeps the colour, and the pinned row carries the same value.
+  own.querySelector('[data-stp-pin-item]').click()
+  // The pin round-trip is async (registry write → reconcile → region render), so
+  // wait for the region to actually hold the row instead of guessing a duration.
+  await waitUntil(
+    () => (sc.body.querySelector('[data-stp-region]')?.querySelectorAll('[data-stp-row]').length ?? 0) === 1,
+    'the pinned region to render exactly one row',
+  )
+  const pinned = rowsOf(sc.body.querySelector('[data-stp-region]'))
+  assert.equal(pinned.length, 1, 'the session is now pinned')
+  assert.equal(pinned[0].getAttribute('data-stp-color'), '#1a2b3c', 'pinning keeps the colour')
+  run.dispose()
+  console.log('✔ colour dialog: the fallback menu opens it for an ordinary session, and the host row shows the colour')
+}
+
+// --- 5h: another window's write repaints the host rows too, and dispose hands
+//     every host-row mark back.
+{
+  const sc = officialUiScaffold({ hostRowMenu: false })
+  const run = await runBundle(sc, { pinned: [] })
+  openWorkspace(sc)
+  const row = sc.liveRow()
+  writeFromOtherWindow(run, COLOR_KEY, JSON.stringify({ [S1]: '#0a0b0c' }))
+  assert.equal(row.getAttribute('data-stp-color'), '#0a0b0c', 'the host row takes the foreign colour at once')
+  assert.equal(run.storageCalls.writes.length, 0, 'and the foreign write is never echoed')
+
+  writeFromOtherWindow(run, COLOR_KEY, JSON.stringify({}))
+  assert.equal(row.getAttribute('data-stp-color'), null, 'a cleared foreign colour is taken back off the row')
+  assert.equal(row.style.getPropertyValue('--stp-row-color').trim(), '', 'and so is the property behind it')
+
+  writeFromOtherWindow(run, COLOR_KEY, JSON.stringify({ [S1]: '#0a0b0c' }))
+  assert.equal(row.getAttribute('data-stp-color'), '#0a0b0c')
+  run.dispose()
+  assert.equal(row.getAttribute('data-stp-color'), null, 'dispose takes the colour off the host row')
+  assert.equal(row.style.getPropertyValue('--stp-row-color').trim(), '', 'attribute and property both')
+  assert.equal(row.getAttribute('data-row-key'), `session:${S1}`, 'and nothing of the host is left changed')
+  console.log('✔ host row colour: a foreign write repaints it, a clear takes it back, dispose returns it')
+}
+
+// =====================================================================
+// REQUIREMENT 6 — THE OFFICIAL SESSION-ROW MENU ITEM.
+//
+// The stock sidebar has no `contextmenu` surface: every row owns a "…" button
+// whose menu is built from the `sidebar.workspaces.session.menu.item` slot
+// (rows/Rows.tsx:681-685), and the host registers its own Pin item there as
+// `{name, id: 'pin', order: 100, locale, inject, component}`. So an entry added
+// to that slot is the ONLY way an ordinary row can offer a colour — and it has
+// to be a real registration: never a graft into a rendered menu, never a
+// replacement of the host's own item, and never a private colour store.
+// =====================================================================
+
+const SLOT_ROW_MENU = 'sidebar.workspaces.session.menu.item'
+const OFFICIAL_COLOR_ID = 'dsh-session-top.row-color'
+const OFFICIAL_COLOR_LABEL = '自定义行背景颜色…'
+
+/**
+ * A slot registry with the host's own Pin entry already in it, as in real life.
+ *
+ * The host component is transcribed from the REAL source, not paraphrased
+ * (ui-workspace `session-actions/PinSession.tsx:30-44`):
+ *
+ *   const [, setMenuOpen] = useMenuOpenState()   // a TUPLE, not a setter
+ *   const { pinned, archived } = usePinState(props)
+ *   if (archived) return null
+ *   onSelect: setMenuOpen(false); (pinned ? unpinSession : pinSession)(sessionId)
+ *
+ * Three details the old fixture got wrong, each of which could let a plugin
+ * pass against a component that behaves differently:
+ *
+ *   1. `useMenuOpenState` returns a TUPLE. The old fixture returned a bare
+ *      function, so destructuring `[, setMenuOpen]` would have produced
+ *      `undefined` and the "close the menu first" step would have been untested.
+ *   2. EACH HOOK IS CALLED EXACTLY ONCE. The real component calls each in
+ *      `usePinState` and reuses the value; the old fixture re-called
+ *      `usePinned`/`useArchived` inside the label and inside onSelect, which
+ *      let a plugin that swapped the hooks mid-render go unnoticed.
+ *   3. THE CLOSE COMES FIRST, THEN THE ACTION, on the SAME values. That order
+ *      is the whole reason both pin callbacks can be overridden: the component
+ *      decides which to call BEFORE this plugin's dialog exists.
+ */
+function makeRowMenuSlots() {
+  const entries = []
+  const subs = new Set()
+  const businessRpc = []
+  const hookCalls = []
+  const hostComponent = (props) => {
+    const menuOpenState = props.useMenuOpenState()
+    const setMenuOpen = menuOpenState[1]
+    hookCalls.push(['useMenuOpenState'])
+    const pinned = props.usePinned(p => p.has(props.sessionId))
+    hookCalls.push(['usePinned'])
+    const archived = props.useArchived(a => a.has(props.sessionId))
+    hookCalls.push(['useArchived'])
+    if (archived) return null
+    return {
+      label: props.t(pinned ? 'menu.unpinSession' : 'menu.pinSession'),
+      onSelect: () => {
+        setMenuOpen(false)
+        ;(pinned ? props.unpinSession : props.pinSession)(props.sessionId)
+      },
+    }
+  }
+  const state = { pinned: new Set(), archived: new Set(), open: false }
+  const inject = (sessionId) => ({
+    sessionId,
+    useMenuOpenState: () => [state.open, (next) => { state.open = next }],
+    usePinned: selector => selector(state.pinned),
+    useArchived: selector => selector(state.archived),
+    pinSession: async (id) => { businessRpc.push(['pin', id]) },
+    unpinSession: async (id) => { businessRpc.push(['unpin', id]) },
+    t: key => `host:${key}`,
+  })
+  const host = {
+    options: { name: SLOT_ROW_MENU, id: 'pin', order: 100, locale: 'dsh-ui-sidebar' },
+    component: hostComponent,
+    inject,
+    registrant: 'ui-sidebar',
+  }
+  entries.push(host)
+  return {
+    businessRpc,
+    hookCalls,
+    state,
+    entries,
+    registry: {
+      entries: name => (name === SLOT_ROW_MENU ? [...entries] : []),
+      subscribe: (name, cb) => { subs.add(cb); return () => subs.delete(cb) },
+      register: (options, component) => {
+        const cell = options.key ?? options.id
+        if (entries.some(e => (e.options.key ?? e.options.id) === cell)) {
+          throw new Error(`list slot "${options.name}" already has an entry with id "${cell}"`)
+        }
+        const entry = { options, component, inject: options.inject, registrant: options.registrant }
+        entries.push(entry)
+        for (const cb of [...subs]) cb()
+        return () => {
+          const at = entries.indexOf(entry)
+          if (at >= 0) entries.splice(at, 1)
+          for (const cb of [...subs]) cb()
+        }
+      },
+      listenersFor: () => subs.size,
+      /** The live subscribers, so a case can fire a real host-side notification. */
+      listeners: () => [...subs],
+    },
+  }
+}
+
+{
+  const sc = officialUiScaffold({ hostRowMenu: false })
+  const slots = makeRowMenuSlots()
+  const run = await runBundle(sc, { pinned: [], slots: slots.registry })
+
+  assert.deepEqual(
+    slots.entries.map(e => e.options.id),
+    ['pin', OFFICIAL_COLOR_ID],
+    'a NEW namespaced id, added beside the host entry — never a shadow of it',
+  )
+  const ours = slots.entries.find(e => e.options.id === OFFICIAL_COLOR_ID)
+  assert.equal(ours.options.order, 450, 'and it reads after the host\'s own Pin item')
+  assert.equal(ours.options.locale, 'dsh-ui-sidebar', 'the host\'s locale namespace is kept, so its other keys still translate')
+  assert.equal(slots.entries[0].options.order, 100, 'the host\'s own Pin entry is untouched')
+  assert.equal(slots.entries[0].registrant, 'ui-sidebar')
+
+  // Render it the way the host would, and drive it.
+  const props = ours.inject(S1, 'one')
+  assert.deepEqual(slots.businessRpc, [], 'injection must not touch a pin RPC')
+  const rendered = ours.component(props)
+  assert.equal(rendered.label, OFFICIAL_COLOR_LABEL, 'the host\'s own component, with OUR label for its two keys')
+  assert.equal(props.t('menu.pinSession'), 'host:menu.pinSession', 'every other key still reaches the host\'s translator')
+  // Fixed hook order, one call each — the contract the real component relies on
+  // to decide which action to call before this plugin's dialog exists.
+  assert.deepEqual(
+    slots.hookCalls, [['useMenuOpenState'], ['usePinned'], ['useArchived']],
+    'the host component calls each hook exactly once, in the real order',
+  )
+  slots.state.open = true
+  rendered.onSelect()
+  assert.equal(slots.state.open, false, 'the host\'s own menu is closed first, by the host\'s own call')
+  await afterDispatch()
+  const dialog = dialogOf(sc)
+  assert.ok(dialog !== null, 'the item opens the plugin dialog')
+  assert.equal(dialog.getAttribute('data-stp-session'), S1, 'for the clicked session')
+  assert.deepEqual(slots.businessRpc, [], 'and the business RPCs are unreachable from this item')
+  assert.deepEqual(run.pinCalls, [], 'including the workspace controller\'s own')
+
+  hexOf(dialog).value = '#1a2b3c'
+  buttonOf(dialog, 'data-stp-color-apply').click()
+  assert.deepEqual(
+    JSON.parse(run.storageCalls.writes.at(-1)[1]), { [S1]: '#1a2b3c' },
+    'the same dialog, the same map, the same key',
+  )
+
+  // An UNPINNED row still reaches the dialog and still never reaches a pin RPC:
+  // both callbacks are overridden, so the branch the host takes cannot change
+  // what the item does.
+  slots.state.pinned = new Set([S1])
+  const pinnedProps = ours.inject(S1, 'one')
+  const pinnedRendered = ours.component(pinnedProps)
+  assert.equal(pinnedRendered.label, OFFICIAL_COLOR_LABEL, 'a pinned row offers the colour item under the same label')
+  pinnedRendered.onSelect()
+  await afterDispatch()
+  assert.deepEqual(slots.businessRpc, [], 'the unpin branch is overridden too, so no RPC fires either')
+  assert.ok(dialogOf(sc) !== null, 'the pinned branch opened its own dialog')
+  slots.state.pinned = new Set()
+
+  // A session the host calls archived offers nothing, exactly as its own
+  // component does — that is the host's contract, not ours.
+  const archivedProps = ours.inject(S1, 'one')
+  archivedProps.useArchived = () => true
+  assert.equal(ours.component(archivedProps), null, 'an archived session offers nothing, as the host does')
+  assert.equal(
+    ours.component({ ...props, t: undefined, usePinned: () => true }).label, OFFICIAL_COLOR_LABEL,
+    'and the label override does not depend on a translator being present',
+  )
+
+  run.dispose()
+  assert.deepEqual(slots.entries.map(e => e.options.id), ['pin'], 'dispose takes the item back out')
+  assert.equal(slots.entries[0].options.order, 100, 'and leaves the host\'s entry exactly as it was')
+  assert.equal(slots.registry.listenersFor(), 0, 'and releases the slot watch')
+  console.log('✔ official row menu: a namespaced colour item beside the host\'s own Pin entry, and nothing else touched')
+}
+
+// --- the host's OWN Pin entry registers LATE, then goes away again.
+//
+// The previous case only proved the plugin did not throw against an EMPTY slot.
+// Apply order is not knowable — the plugin can mount before the host's own
+// registrations land — so what has to hold is the watch: the entry appears, the
+// colour item follows it, the entry is withdrawn, and the colour item leaves
+// with it instead of being stranded in a slot nobody renders.
+{
+  const sc = officialUiScaffold({ hostRowMenu: false })
+  const slots = makeRowMenuSlots()
+  // Start from a slot the host has not filled yet, then let it arrive.
+  const hostEntry = slots.entries.splice(0, 1)[0]
+  const run = await runBundle(sc, { pinned: [], slots: slots.registry })
+  assert.deepEqual(slots.entries.map(e => e.options.id), [], 'the host has registered nothing yet, so nothing is added')
+
+  // The host registers its own Pin entry AFTER the plugin mounted.
+  slots.entries.push(hostEntry)
+  for (const cb of [...slots.registry.listeners()]) cb()
+  assert.deepEqual(
+    slots.entries.map(e => e.options.id), ['pin', OFFICIAL_COLOR_ID],
+    'a host entry that arrives late is still picked up',
+  )
+  const late = slots.entries.find(e => e.options.id === OFFICIAL_COLOR_ID)
+  const lateProps = late.inject(S1, 'one')
+  const lateRendered = late.component(lateProps)
+  assert.equal(lateRendered.label, OFFICIAL_COLOR_LABEL)
+  lateRendered.onSelect()
+  await afterDispatch()
+  assert.ok(dialogOf(sc) !== null, 'the late-registered item works like any other')
+  buttonOf(dialogOf(sc), 'data-stp-color-cancel').click()
+
+  // And when the host withdraws its own entry, the colour entry goes too.
+  slots.entries.splice(slots.entries.indexOf(hostEntry), 1)
+  for (const cb of [...slots.registry.listeners()]) cb()
+  assert.deepEqual(
+    slots.entries.map(e => e.options.id), [],
+    'the colour entry does not outlive the host entry it is derived from',
+  )
+  run.dispose()
+  console.log('✔ official row menu: a host entry arriving late is picked up, and withdrawn with it')
+}
+
+// --- a host that registers its Pin entry LATE still gets the item.
+{
+  const sc = officialUiScaffold({ hostRowMenu: false })
+  const slots = makeRowMenuSlots()
+  const late = { ...slots.registry }
+  late.entries = () => []
+  late.register = () => { throw new Error('nothing registers while the slot is empty') }
+  const run = await runBundle(sc, { pinned: [], slots: late })
+  assert.deepEqual(late.entries().length, 0, 'nothing to register into, and no error thrown')
+  run.dispose()
+  console.log('✔ official row menu: a host whose Pin entry has not registered yet is simply left alone')
+}
+
+// --- and a host with no slot registry at all is inert.
+{
+  const sc = officialUiScaffold({ hostRowMenu: false })
+  const run = await runBundle(sc, { pinned: [] })
+  assert.doesNotThrow(() => run.dispose(), 'a missing slot registry must not throw out of mount or dispose')
+  console.log('✔ official row menu: a host without the slot surface stays exactly as it was')
+}
+
+// =====================================================================
+// REQUIREMENT 7 — THE FOOTER.
+//
+// Four surfaces, four markers, every one proven from an aria-label or from a
+// common ancestor, and every one handed back on dispose. (The rules behind the
+// markers are asserted at the end of this file, where the stylesheet helpers
+// live.)
+// =====================================================================
+
+{
+  const sc = officialUiScaffold({ footer: true })
+  const run = await runBundle(sc, { pinned: [] })
+  const f = sc.footerParts
+  assert.equal(f.actions.getAttribute('data-stp-footer'), '', 'the common host of the balance region and the import control')
+  assert.equal(f.balance.getAttribute('data-stp-footer-balance'), '')
+  assert.equal(f.importer.getAttribute('data-stp-footer-import'), '')
+  assert.equal(f.pinnedEntry.getAttribute('data-stp-footer-pin'), '')
+  assert.equal(f.account.getAttribute('data-stp-account'), '')
+  // The mark is on the CONTROL, never on a wrapper that merely contains it.
+  // `getAttribute` is the DOM-truthful read: `hasAttribute` returns a boolean,
+  // so asserting it equals null was a harness mistake, not a stronger claim.
+  assert.equal(f.balanceWrap.getAttribute('data-stp-footer-balance'), null)
+  assert.equal(f.importWrap.getAttribute('data-stp-footer-import'), null)
+
+  // Idle passes must write nothing at all: the marks are compared, not re-set.
+  let writes = 0
+  for (const node of [f.actions, f.balance, f.importer, f.pinnedEntry, f.account]) {
+    const real = node.setAttribute.bind(node)
+    node.setAttribute = (name, value) => {
+      if (String(name).startsWith('data-stp')) writes += 1
+      return real(name, value)
+    }
+  }
+  for (let i = 0; i < 5; i += 1) { run.nudge(); await settle() }
+  assert.equal(writes, 0, `five idle reconciles must not re-mark anything; got ${writes} writes`)
+
+  run.dispose()
+  for (const node of [f.actions, f.balance, f.importer, f.pinnedEntry, f.account]) {
+    for (const attr of ['data-stp-footer', 'data-stp-footer-balance', 'data-stp-footer-import', 'data-stp-footer-pin', 'data-stp-account']) {
+      assert.equal(node.getAttribute(attr), null, `dispose must give ${attr} back`)
+    }
+  }
+  assert.equal(f.balance.getAttribute('aria-label'), '简化侧栏显示', 'and leave the host element as it was found')
+  console.log('✔ footer: four proven marks, five idle passes write nothing, dispose returns every one')
+}
+
+// --- a host whose footer is NOT there gets nothing at all.
+{
+  const sc = officialUiScaffold({ footer: false })
+  const run = await runBundle(sc, { pinned: [] })
+  assert.equal(sc.body.querySelector('[data-stp-footer]'), null, 'a sidebar with no footer surfaces is never marked')
+  run.dispose()
+
+  const rail = officialUiScaffold({ rail: true, footer: true })
+  const railRun = await runBundle(rail, { pinned: [] })
+  assert.equal(rail.body.querySelector('[data-stp-footer]'), null, 'the collapsed rail is left to the host')
+  railRun.dispose()
+  console.log('✔ footer: no footer, no marks; the narrow rail is never touched')
+}
+
+// --- an UNPROVEN sidebar is left alone, exactly like every other surface here.
+{
+  const sc = makeTree()
+  sc.tree.setAttribute('role', 'tree')
+  sc.tree.setAttribute('aria-label', 'file explorer')
+  const run = await runBundle(sc, { pinned: [] })
+  assert.equal(sc.body.querySelector('[data-stp-account]'), null, 'an unknown sidebar is observe-only')
+  run.dispose()
+  console.log('✔ footer: an unproven sidebar is left entirely alone')
+}
+
+// --- typography. The user-facing bug is a font-size one and it is invisible to
+// every other test in this file, because every one of them asserts DOM shape and
+// never computed style. These cases read the stylesheet the plugin actually
+// injects, because that is where the bug lives.
+
+// A property/value grammar narrow enough to make an invalid declaration FAIL
+// rather than pass by containment. This is the point of the section: a test that
+// only grepped for "13px" would have been green against the broken shorthand.
+const TYPOGRAPHY_ANCHOR = '[data-stp-typography]'
+
+const TYPO_VALUE_OK = {  'font-family': v => /^(inherit|var\(--stp-token-font,\s*inherit\)|[A-Za-z-]+(,\s*[A-Za-z-]+)*)$/.test(v),
+  'font-size': v => /^\d+(\.\d+)?px$/.test(v),
+  'font-weight': v => /^[1-9]00$/.test(v),
+  'line-height': v => /^\d+(\.\d+)?(px)?$/.test(v),
+}
+
+/** The sheet with its comments removed, so a comment is never read as a rule. */
+const withoutComments = css => css.replace(/\/\*[\s\S]*?\*\//g, ' ')
+
+/**
+ * Every `selector { … }` rule in the sheet, split on the braces.
+ *
+ * A stylesheet has no nesting here, so the naive split is exact — and it is
+ * what stops a lookup from matching a SELECTOR STRING INSIDE ANOTHER SELECTOR
+ * (`[data-stp-row]` is a substring of `[data-stp-region] > [data-stp-row]`).
+ * Comments are stripped first: they sit between rules, and a brace split would
+ * otherwise glue each one onto the head of the rule that follows it.
+ * @param {string} css - the stylesheet text.
+ * @returns {{selector: string, body: string}[]} the rules, in order.
+ */
+function rulesOf(css) {
+  return (withoutComments(css).match(/[^{}]+\{[^{}]*\}/g) ?? []).map(rule => ({
+    selector: rule.slice(0, rule.indexOf('{')).trim().replace(/\s+/g, ' '),
+    body: rule.slice(rule.indexOf('{') + 1, rule.lastIndexOf('}')),
+  }))
+}
+
+/**
+ * The declarations of the FIRST rule whose selector is exactly `selector`.
+ *
+ * A trailing `!important` is stripped from the value and reported separately by
+ * `importantOf`, because the footer rules carry it deliberately — the host wins
+ * the cascade there with an inline height and a `button[class]` rule, and a
+ * plain declaration provably loses. Reading `28px !important` as the value of
+ * `height` would make every value assertion in this file compare against a
+ * string the browser never uses.
+ * @param {string} css - the stylesheet text.
+ * @param {string} selector - the exact selector, whitespace-normalised.
+ * @returns {Record<string, string>} property to value, without the flag.
+ */
+function declsOf(css, selector) {
+  const rule = rulesOf(css).find(r => r.selector === selector)
+  assert.ok(rule !== undefined, `the stylesheet must carry a rule for ${selector}`)
+  const out = {}
+  for (const line of rule.body.split(';')) {
+    const colon = line.indexOf(':')
+    if (colon === -1) continue
+    const prop = line.slice(0, colon).trim()
+    let value = line.slice(colon + 1).trim()
+    if (value.endsWith('!important')) value = value.slice(0, -'!important'.length).trim()
+    if (prop !== '') out[prop] = value
+  }
+  return out
+}
+
+/**
+ * The properties this plugin declares `!important` in one rule.
+ *
+ * Asserted on purpose and in one place: an `!important` is the only way to beat
+ * the host's inline height on the import control and its `button[class]` rule
+ * on the pinned entry, so it is required there — but it is also the sharpest
+ * tool in the sheet, and it must stay confined to the handful of layout
+ * declarations on markers this plugin proved itself.
+ * @param {string} css - the stylesheet text.
+ * @param {string} selector - the exact selector, whitespace-normalised.
+ * @returns {string[]} the property names carrying the flag.
+ */
+function importantOf(css, selector) {
+  const rule = rulesOf(css).find(r => r.selector === selector)
+  if (rule === undefined) return []
+  return rule.body.split(';')
+    .filter(line => line.includes('!important'))
+    .map(line => line.slice(0, line.indexOf(':')).trim())
+    .filter(Boolean)
+}
+
+{
+  const sc = officialUiScaffold()
+  await runBundle(sc, { pinned: [S1] })
+  const css = withoutComments(staticCss(sc))
+
+  // (1) NO `font` SHORTHAND ANYWHERE. The shorthand is what broke: with
+  // `--stp-token-font` empty, `font: 400 13px/20px var(--stp-token-font,
+  // inherit)` substitutes `inherit` into the family slot, and a global keyword
+  // in a shorthand makes the WHOLE declaration invalid, so every property in it
+  // silently reverted to the host's inherited 14px.
+  const shorthands = [...css.matchAll(/(^|[;{\s])font\s*:/g)].map(m => m[0])
+  assert.equal(
+    shorthands.length, 0,
+    `no rule may use the font shorthand — it is dropped, not merely ignored; found ${JSON.stringify(shorthands)}`,
+  )
+
+  // (2) The same failure does not hide in any OTHER shorthand that takes the
+  // token. `font-weight: var(...)` would be fine; only font-family may read it.
+  const familyReaders = [...css.matchAll(/font-family\s*:\s*([^;]+)/g)].map(m => m[1].trim())
+  assert.ok(familyReaders.length > 0, 'font-family must still read the host token')
+  for (const value of familyReaders) {
+    assert.match(value, /^var\(--stp-token-font,\s*inherit\)$/, `unexpected font-family value: ${value}`)
+  }
+
+  // (3) THE PINNED REGION IS THE LARGER SURFACE, and both surfaces are compact:
+  // the user asked for a tighter sidebar that shows more rows, so the pinned row
+  // drops 16px → 14px (20px line box) with a 26px row, and the workspace title
+  // below drops 13px → 12px (16px line box). These are exact assertions on
+  // purpose: "smaller" is not a number a stylesheet can be wrong about.
+  const header = declsOf(css, '[data-stp-region-header]')
+  assert.equal(header['font-size'], '12px')
+  assert.equal(header['line-height'], '16px')
+  assert.equal(header['font-weight'], '600')
+  const row = declsOf(css, '[data-stp-row]')
+  assert.equal(row['font-size'], '14px', 'a pinned row must read larger than a workspace row')
+  assert.equal(row['line-height'], '20px')
+  assert.equal(row['font-weight'], '500')
+  assert.equal(row['min-height'], '26px', 'the compact row target, with a hit area far above 24px')
+  const time = declsOf(css, '[data-stp-row-time]')
+  assert.equal(time['font-size'], '11px')
+  assert.equal(time['line-height'], '14px')
+
+  // The colour point keeps a 24px hit area around a 14px visual, so compacting
+  // the row never made the colour control smaller to click.
+  const swatch = declsOf(css, '[data-stp-row-color]')
+  assert.equal(swatch['width'], '14px')
+  assert.equal(swatch['height'], '14px')
+  assert.equal(swatch['padding'], '5px', 'the 5px ring is what makes the control 24px')
+  assert.equal(swatch['box-sizing'], 'content-box', 'the padding must sit outside the 14px visual')
+  const swatchVisual = declsOf(css, '[data-stp-row-color]::after')
+  assert.equal(swatchVisual['width'], '14px', 'the visible swatch is drawn by the pseudo-element')
+
+  // (4) The WORKSPACE BELOW recedes to a still-readable 12px, which is below
+  // the host's own independent 14px title — so the override has to be a real
+  // declaration on the title, not merely the absence of one.
+  const hostRules = rulesOf(css).filter(r => r.selector.includes(TYPOGRAPHY_ANCHOR))
+  assert.ok(hostRules.length > 0, 'the host rows must have their own typography rules')
+  const titleRule = hostRules.find(rule => rule.selector.includes("_title"))
+  assert.ok(titleRule !== undefined, `a scoped title rule is required; got ${JSON.stringify(hostRules.map(r => r.selector))}`)
+  const titleDecls = declsOf(css, titleRule.selector)
+  assert.equal(titleDecls['font-size'], '12px')
+  assert.equal(titleDecls['line-height'], '16px')
+  // Every host rule hangs off the marker, so none of them can match a tree the
+  // plugin has not proved. This is the selector half of the scope guarantee.
+  for (const rule of hostRules) {
+    assert.ok(
+      rule.selector.startsWith(TYPOGRAPHY_ANCHOR),
+      `host typography rule escapes the marker: ${rule.selector}`,
+    )
+  }
+
+  // (4b) THE SAME SCOPE, for the host's own ROW RHYTHM: the row box is compacted
+  // but nothing is hidden, and the 24px minimum hit area survives it.
+  const rhythm = hostRules.find(rule => rule.selector.includes("data-row-key^='session:'")
+    && declsOf(css, rule.selector)['min-height'] !== undefined)
+  assert.ok(rhythm !== undefined, 'a scoped row-rhythm rule is required')
+  assert.equal(declsOf(css, rhythm.selector)['min-height'], '24px', 'a host row never drops below a 24px target')
+  const rowRhythmRules = hostRules.filter(rule => rule.selector.includes('[data-stp-color]'))
+  assert.ok(rowRhythmRules.length >= 2, 'a colour chosen for an ordinary host row must be painted from the same map')
+  for (const rule of rowRhythmRules) {
+    assert.ok(rule.selector.includes("data-row-key^='session:'") || rule.selector.includes('data-dcu-session'),
+      `the host colour rule must be keyed on the host's own row vocabulary: ${rule.selector}`)
+  }
+
+  // (4c) THE HOST ROW HEIGHT IS STATED, NOT ONLY MINIMIZED. The host declares
+  // a fixed height on both of its row kinds (`.projectRow` 34px, `.sessionRow`
+  // 32px in rows/Rows.module.css), and a declared height beats a minimum: on the
+  // live page the padding landed and the directory row stayed at 34px. A rule
+  // with only `min-height` is exactly the shape that failed.
+  const heightRule = hostRules.find(rule => {
+    const d = declsOf(css, rule.selector)
+    return rule.selector.includes("data-row-key^='workspace:'") && d['height'] !== undefined
+  })
+  assert.ok(heightRule !== undefined, `a scoped explicit height is required; got ${JSON.stringify(hostRules.map(r => r.selector))}`)
+  const heightDecls = declsOf(css, heightRule.selector)
+  assert.equal(heightDecls['height'], '26px', 'the directory row must come down from the host\'s 34px')
+  assert.equal(heightDecls['box-sizing'], 'border-box', 'otherwise the padding adds to the height instead of sitting inside it')
+  for (const rule of hostRules) {
+    if (rule.selector.includes("data-row-key^='session:'") && declsOf(css, rule.selector)['height'] !== undefined) {
+      assert.equal(declsOf(css, rule.selector)['height'], '26px', 'the session row shares the same compact height')
+    }
+  }
+
+  // (4d) THE FOOTER COMPACTION IS DECLARED, AND SCOPED TO ITS MARKERS. Every
+  // value here is the one the live page needed: the host declares 42px on the
+  // import control and 28px on the pinned entry, and a bare `min-height` cannot
+  // reduce either. Nothing is hidden and every target stays at or above 24px.
+  const FOOTER_TARGETS = [
+    ['[data-stp-footer-import]', '28px'],
+    ['[data-stp-footer-pin]', '24px'],
+    ['[data-stp-account]', '32px'],
+  ]
+  for (const [selector, want] of FOOTER_TARGETS) {
+    const decls = declsOf(css, selector)
+    assert.equal(decls['height'], want, `${selector} must state the height the host's own declaration beats`)
+    assert.ok(parseInt(want, 10) >= 24, `${selector} must stay a real click target`)
+  }
+  const summary = declsOf(css, "[data-stp-footer-balance] [class*='cm-simple-summary']")
+  assert.equal(summary['height'], '20px')
+  const foot = declsOf(css, "[data-stp-footer-balance] [class*='cm-foot']")
+  assert.equal(foot['height'], '24px', 'the clickable balance cell keeps a full click target')
+  const peak = declsOf(css, "[data-stp-footer-balance] [class*='cm-peak-strip']")
+  assert.equal(peak['height'], '18px')
+  // Scoped, or the footer rules would restyle any same-named cell on the page.
+  for (const rule of rulesOf(css)) {
+    if (!rule.selector.includes('[data-stp-footer') && !rule.selector.includes('[data-stp-account]')) continue
+    assert.ok(
+      rule.selector.startsWith('[data-stp-footer') || rule.selector.startsWith('[data-stp-account'),
+      `footer rule escapes its marker: ${rule.selector}`,
+    )
+  }
+  // Nothing in the footer may be hidden — it is compaction, not removal.
+  const footerRules = rulesOf(css).filter(r => r.selector.includes('[data-stp-footer'))
+  for (const rule of footerRules) {
+    assert.ok(!/display\s*:\s*none/.test(rule.body), `a footer rule hides something: ${rule.selector}`)
+  }
+
+  // (4d-bis) !important IS REQUIRED HERE, AND ONLY HERE. Read off the live
+  // CSSOM: the import control carries the host's INLINE height (42px) and the
+  // pinned entry is styled `button.__dsh-session-pin-footer__` after an
+  // `all: unset`, which outranks a single-attribute selector. Both were still
+  // 42px/28px after their markers landed, so a plain declaration provably
+  // loses. It is also the sharpest tool in the sheet, so the set of properties
+  // carrying it is pinned here rather than left to drift.
+  const MUST_WIN = ['height', 'min-height', 'box-sizing', 'padding', 'margin', 'line-height', 'font-size', 'padding-top', 'padding-bottom']
+  const IMPORTANT_RULES = ['[data-stp-footer-import]', '[data-stp-footer-pin]']
+  for (const selector of IMPORTANT_RULES) {
+    const flagged = importantOf(css, selector)
+    for (const want of ['height', 'min-height', 'line-height', 'padding']) {
+      assert.ok(flagged.includes(want), `${selector} must state ${want} as !important, or the host's declaration wins`);
+    }
+    for (const prop of flagged) {
+      assert.ok(MUST_WIN.includes(prop), `${selector} declares !important on ${prop}, which is not a layout property that has to win`);
+    }
+  }
+  for (const selector of ["[data-stp-footer-balance] [class*='cm-simple-summary']",
+    "[data-stp-footer-balance] [class*='cm-foot']",
+    "[data-stp-footer-balance] [class*='cm-peak-strip']"]) {
+    const flagged = importantOf(css, selector)
+    assert.ok(flagged.includes('height'), `${selector} must state height as !important, or the host's cell height wins`);
+    for (const prop of flagged) {
+      assert.ok(MUST_WIN.includes(prop), `${selector} declares !important on ${prop}, which is not a layout property that has to win`);
+    }
+  }
+  // And nowhere else in the sheet, apart from the two folding rules that have
+  // always needed it: hiding a host row and collapsing this plugin's own region
+  // are the operations that must beat the host's own stylesheet outright.
+  const ALWAYS_ALLOWED = ['[data-stp-region][hidden]', "[data-stp-region][data-stp-collapsed='true'] > [data-stp-row]"]
+  const flaggedElsewhere = rulesOf(css).filter(r => /!important/.test(r.body))
+    .filter(r => !IMPORTANT_RULES.includes(r.selector)
+      && !r.selector.startsWith('[data-stp-footer-balance]')
+      && !ALWAYS_ALLOWED.includes(r.selector))
+    .map(r => r.selector)
+  assert.deepEqual(flaggedElsewhere, [], `!important is confined to the declarations that have to win: ${JSON.stringify(flaggedElsewhere)}`)
+
+  // (4d-ter) The disclosure stays a usable target: compaction took its line box
+  // to 18px, under the 24px floor the rest of the compaction holds to.
+  const headerDecls = declsOf(css, '[data-stp-region-header]')
+  assert.equal(headerDecls['min-height'], '24px', 'the pinned-region disclosure is still a real click target')
+  assert.equal(headerDecls['box-sizing'], 'border-box', 'otherwise its padding adds outside the target')
+
+  // (4e) THE FALLBACK MENU'S TWO ITEMS SHARE ONE STYLE, so the colour entry
+  // cannot read as a different kind of row from the pin entry above it. One
+  // combined rule is the proof: if the two ever diverged they would need a
+  // second, later rule, and this selector would stop covering both.
+  const menuItemRule = rulesOf(css).find(r =>
+    r.selector.includes('[data-stp-menu] [data-stp-pin-item]')
+    && r.selector.includes('[data-stp-menu] [data-stp-color-item]'))
+  assert.ok(menuItemRule !== undefined, 'the two fallback menu items must be styled by one shared rule')
+  const menuItemDecls = declsOf(css, menuItemRule.selector)
+  assert.ok(menuItemDecls['min-height'] !== undefined, 'the fallback menu items must be styled, not left to the UA')
+  assert.equal(menuItemDecls['min-height'], '24px', 'a menu row is still a click target')
+  assert.equal(menuItemDecls['background'], 'transparent', 'and it is not a filled default button')
+  for (const selector of ['[data-stp-menu] [data-stp-pin-item]', '[data-stp-menu] [data-stp-color-item]']) {
+    assert.ok(
+      rulesOf(css).every(r => !r.selector.split(', ').includes(selector)
+        || r.selector === menuItemRule.selector
+        || /:hover|:focus-visible/.test(r.selector)),
+      `${selector} must not get its own base rule that could drift from the pin item's`,
+    )
+  }
+
+  // (5) EVERY longhand the sheet writes is a value its own grammar accepts.
+  // Without this, "no font shorthand" alone could be satisfied by a typo'd
+  // property name that silently matches nothing.
+  for (const { selector, body } of rulesOf(css)) {
+    for (const line of body.split(';')) {
+      const colon = line.indexOf(':')
+      if (colon === -1) continue
+      const prop = line.slice(0, colon).trim()
+      let value = line.slice(colon + 1).trim()
+      // The flag is checked separately by `importantOf`; the grammar below is
+      // about the VALUE, and `16px !important` is not a value the browser uses.
+      if (value.endsWith('!important')) value = value.slice(0, -'!important'.length).trim()
+      const check = TYPO_VALUE_OK[prop]
+      if (check === undefined || value === '') continue
+      assert.ok(
+        check(value),
+        `${selector} → ${prop}: ${value} is not a valid ${prop} — it would be dropped exactly like the shorthand was`,
+      )
+    }
+  }
+  console.log('✔ typography: no font shorthand survives; pinned rows are 14px over a 12px workspace, both compact')
+}
+
+// --- SCOPE. The typography rules must reach the one tree the plugin proved and
+// no other tree on the page. The stock sidebar's search view renders its OWN
+// `[role="tree"][aria-label]` with its own `_title` spans, and a document-wide
+// rule would restyle it — which is exactly the R19 failure this plugin already
+// suffered once.
+{
+  const sc = officialUiScaffold()
+  // A second, equally-shaped tree that the host would own and this plugin has
+  // no proof for: same role, same label attribute, same title class.
+  const other = new El('div')
+  other.setAttribute('role', 'tree')
+  other.setAttribute('aria-label', 'search results')
+  const otherRow = new El('div')
+  otherRow.setAttribute('data-row-key', 'session:other')
+  const otherTitle = new El('span')
+  otherTitle.className = 'qCniVq_title'
+  otherRow.appendChild(otherTitle)
+  other.appendChild(otherRow)
+  sc.body.appendChild(other)
+
+  const run = await runBundle(sc, { pinned: [S1] })
+  assert.ok(
+    sc.tree.getAttribute('data-stp-typography') !== null,
+    'the proven tree must be marked',
+  )
+  assert.equal(
+    other.getAttribute('data-stp-typography'), null,
+    'an unrelated tree must never be marked — the rules would then reach it',
+  )
+  console.log('✔ typography scope: only the proven tree is marked, not a second tree of the same shape')
+
+  // Repeated reconciles must not keep writing to the DOM. "Assign when the
+  // value differs" is what makes an idle pass genuinely idle.
+  let writes = 0
+  const realSet = sc.tree.setAttribute.bind(sc.tree)
+  sc.tree.setAttribute = (name, value) => {
+    if (name === 'data-stp-typography') writes += 1
+    return realSet(name, value)
+  }
+  for (let i = 0; i < 5; i += 1) { run.nudge(); await settle() }
+  assert.equal(writes, 0, `an unchanged tree must not be rewritten; got ${writes} writes across 5 idle passes`)
+  console.log('✔ typography marker: five idle reconciles write nothing at all')
+
+  // Teardown hands the attribute back and touches nothing else on the host.
+  // The workspace header is the row that is still MOUNTED here: pinning folds
+  // the group, which by design unmounts its session rows, so asserting on one
+  // of those would be asserting about the fold, not about dispose.
+  const rowKeyBefore = sc.head.getAttribute('data-row-key')
+  run.dispose()
+  assert.equal(
+    sc.tree.getAttribute('data-stp-typography'), null,
+    'dispose must give the marker back',
+  )
+  assert.equal(
+    sc.head.getAttribute('data-row-key'), rowKeyBefore,
+    'the host group header is untouched',
+  )
+  assert.ok(sc.head.isConnected !== false, 'dispose must not remove host rows')
+  assert.ok(sc.tree.isConnected !== false, 'dispose must not remove the host list')
+  console.log('✔ typography marker: dispose returns the attribute and leaves the host as it was')
+}
+
+// --- UNKNOWN SIDEBAR STAYS OBSERVE-ONLY. A labelled tree that carries no host
+// marker is not a sidebar, and the typography rules must not appear on it.
+// The shape is deliberately the GENERIC one — the same `[role="tree"]` +
+// aria-label that findTree() accepts as a candidate — with nothing inside it
+// that proves whose it is. Adding a data-row-key row here would make it
+// provable and the case would assert nothing.
+{
+  const sc = makeTree()
+  sc.tree.setAttribute('role', 'tree')
+  sc.tree.setAttribute('aria-label', 'file explorer')
+  const fileRow = new El('div')
+  fileRow.setAttribute('role', 'treeitem')
+  const fileName = new El('span')
+  fileName.className = 'qCniVq_title'
+  fileRow.appendChild(fileName)
+  sc.tree.appendChild(fileRow)
+  const run = await runBundle(sc, { pinned: [S1] })
+  assert.equal(
+    sc.tree.getAttribute('data-stp-typography'), null,
+    'an unproven tree must not be marked — typography stays observe-only',
+  )
+  run.dispose()
+  console.log('✔ typography: an unproven sidebar is left entirely alone')
 }
 
 console.log('\nALL SIDEBAR-FLAVOR DOM CHECKS PASSED')

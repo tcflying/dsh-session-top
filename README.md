@@ -14,7 +14,7 @@ ZCode 风格的会话列表 for DeepSeek Harness 0.2.x：会话有新活动就�
 |---|---|---|
 | 1 | **活跃上浮**：任何 session 有新活动就排到所在列表最上 | `src/index.js` 的 `onSessionEvent` 记录活动时间 → `reorderSessions()` 通过官方 `workspace.insertSessionBefore` 把该 session 上浮到所属工作区账户顶部。算法在 `src/core.js` 的 `planFloatToTop`。 |
 | 2 | **右键置顶**：右键会话行出「置顶该会话」/「取消置顶」 | `src/client.js` 的 `registerSharedMenu`（发布进共享扩展表，由 owner 渲染）+ `onContextMenu` / `openMenu`（owner 不在场时的自有兜底菜单，在光标处弹出）。 |
-| 3 | **置顶语义**：抽出工作区 → 侧栏顶部平铺「已置顶」区，原分组默认折叠，分组内不重复显示 | `src/client.js` 的 `renderRegion`（平铺渲染）+ `applyPinRules`（样式表规则隐藏分组内的原行）+ `reconcileGroups` / `setGroupExpanded`（折叠分组）。 |
+| 3 | **置顶语义**：抽出工作区 → 侧栏顶部平铺「已置顶」区，每个目录首次出现时默认收起（用户自己展开过就不再收），分组内不重复显示 | `src/client.js` 的 `renderRegion`（平铺渲染）+ `applyPinRules`（样式表规则隐藏分组内的原行）+ `reconcileGroups`（折叠分组）。 |
 | 4 | **取消置顶**：回到原工作区分组内按活跃度的位置，「已置顶」区移除 | 同一套 `reconcile`：pin 规则为空 → 分组内的行由样式表自动恢复显示；`reconcileGroups` 把分组重新展开。 |
 | 5 | **持久化**：置顶状态跨重启保留 | 置顶集合直接用宿主已有的 registry 全局 pin 集（`workspaceRegistry.pinnedSessionIds`），经官方 `workspaces.pinSession` / `unpinSession` RPC 写入。宿主自己落盘，插件不存第二份。 |
 
@@ -74,6 +74,19 @@ ZCode 风格的会话列表 for DeepSeek Harness 0.2.x：会话有新活动就�
 
 所以这里 DOM 层是正确工具，代码里把每一处 DOM 操作都收窄并加了守卫。
 
+唯一的例外是**只读影子**：别的插件（`dsh-session-pin`）在
+`sidebar.footer.action` / `shell.overlay` 上挂着自己的置顶计数和面板，
+它数的是自己的私有 store，于是顶部 5 条、底部却写「(2)」。这里对这两条
+entry 各注册一条低一档 priority 的影子，复用原 component 和原 inject，
+只把 `pin` 换成读官方 `pinnedSessionIds` 的门面（写入也走官方 RPC），
+不动对方的 entry、不动它的私有 store；teardown 时影子自己释放。
+面板的 workspace 分区、行颜色、tags 仍由对方的 store 提供。
+`test/pin-integration.mjs` 守这一条。
+
+同源的只有这两条：`sessions.row.action`（行上的置顶/色点）和
+`conversation.session.header.actions`（会话头部开关）**仍读第三方自己的状态**，
+本轮没动，所以不能称为「全部置顶表面已统一」。
+
 ### 两个容易踩的官方实现细节
 
 写这个插件时踩到两个不看源码就想不到的点，都已在代码注释里标明：
@@ -109,9 +122,121 @@ ZCode 风格的会话列表 for DeepSeek Harness 0.2.x：会话有新活动就�
 | 主题 token | `--dcu-sidebar-*` | `--dsh-*` |
 | 右键菜单 | 发布进**共享扩展表**，由 `@baihejiangnan/dsh-session-context-menu` 渲染 | 同左（两种侧栏共用同一条接缝） |
 
+### 侧栏上另外几件实际行为
+
+**全局面板默认折叠，并且记住。** 顶部 `nav[class*="panelList"]` 首次默认折叠，插件在
+它上面加一个真 `<button>` 控制（`aria-expanded` / `aria-controls` 齐全）；用户的展开
+或收起记在 `localStorage` 的 `dsh-session-top:panels-collapsed`，下次装载按记忆还原。
+窄栏和未知 flavor 交给宿主，插件只观察。
+
+**侧栏上有两级折叠，互不相干。**
+
+一级是**每个目录自己的**默认收起：`reconcileGroups` 在**第一次看见**一个可折叠目录时
+把它收一次——这就是规格里的「原分组默认折叠」，与置顶与否无关。「首次」是**每次页面
+mount/刷新都重新算一遍**：刷新后每个目录又是首见，又是收一次，**每个目录的展开状态不
+进 `localStorage`，跨刷新不记忆**。只有「用户自己展开过就不再收」这一条是有范围的：它
+指的是**本次 mount 期间**——用户手动展开过的目录，之后任何通知、改名、重排、别的置顶
+变化都不会再把它收回去。置顶集只影响**变化
+那一刻**的分组，最后一个置顶被取走后该分组重新展开。收起走分组表头自己的
+`aria-expanded`，只点一次、读回 `aria-expanded` 才算落地，未落地的那一次不会重复点。
+
+二级是**「工作区目录」总开关**，在目录区**正上方**（控制放在被折叠块的外面，否则它会
+跟着自己折叠的那一块一起消失）。点一下把**目录和目录里的会话一起**收起来：一条 CSS
+规则，不删节点、不改父节点，所以每个目录自己的展开状态原样保留，展开回去时各目录
+仍停在用户留下的样子。默认展开，只有显式的 `1` 算折叠，记在
+`dsh-session-top:groups-collapsed` —— **目录这两级折叠中，仅总开关记入
+`localStorage`；单个目录不记忆**。（面板区、置顶区、行颜色另有各自的 key。）
+
+这一层**目前只支持官方 ui-sidebar**。它要折叠的那一块是从**已证明的**
+`[role="tree"][aria-label]` 往上取的父节点，还要求它确实装着 `workspace:` 表头（官方
+FLAT 视图根本没有目录）、且侧栏不在 56px 窄栏态——按宿主哈希类名全局去找会把页面上任何
+长得像的容器一起收掉（`test/sidebar-dom.mjs` 的 3i 用一个排在真身**前面**的仿冒容器守
+这条）。codex-ui 每个工作区一个 `.dcu-wb-project`，没有一个装着它们全部的座位，所以不
+提供这一层；但它的**每个目录**默认收起照常生效，因为那条规则只需要各自的分组表头。
+
+**官方侧栏的右键直接复用宿主自己的菜单。** 官方行的入口是 "…" 按钮菜单，所以插件不
+改写那份菜单：右键时把宿主那一行临时挪到指针下、点它自己的 "…"，弹出的就是宿主原生
+那一整份（置顶/取消置顶、重命名、分叉会话、归档会话、复制 Session ID），置顶不出现
+第二份。宿主行因为分组折叠而不存在时，先用分组表头把它展开出来；仍然拿不到才退回
+插件自有的单项菜单。菜单关闭、第二次右键、卸载，都会把临时样式和只有插件展开过的那个
+分组还回去。codex-ui 有自己的原生右键菜单，只观察、不抢。
+
+**颜色菜单入口在哪、哪没有。** 这取决于这一版装了什么菜单 owner，**不是所有右键都有
+颜色项**，说清楚边界：
+
+- **官方侧栏（有 host session row）**：本插件通过公开 slot
+  `sidebar.workspaces.session.menu.item` 注册一个**独立命名的**新条目
+  （id `dsh-session-top.row-color`，order 450，排在宿主自己 order 100 的置顶项之后），
+  复用宿主的 `PinSessionMenuItem` 组件和 `inject`。结果就是**宿主那一整份菜单照旧**，后面
+  多出第六项「自定义行背景颜色…」。宿主自己的置顶项**一个字都没改**：不 shadow、不替换、
+  不改 order，它晚到、被换掉或被撤销时，颜色项跟着它的宿主项走。
+- **装了共享 owner（`@baihejiangnan/dsh-session-context-menu`）**：走共享扩展表，
+  它渲染进 owner 自己的菜单。
+- **两者都没有的行**：只剩插件自有的 fallback 菜单（置顶 + 颜色两项）和置顶行尾的色点。
+
+宿主的归档会话上不提供颜色项——这是宿主组件自己的契约（archived 返回 null），不是
+本插件加的限制。
+
+**置顶区自己也能折叠，每条会话行还能自己上色。** 「已置顶」那一行是一个可聚焦的
+真实控件（`role="button"`、`aria-expanded` 齐全，Enter/Space 都能用），点它把下面的置顶
+行收起来——只隐藏、不删除，所以行节点、顺序和计数都不动；选择记在
+`dsh-session-top:region-collapsed`，只有显式的 `1` 算折叠，默认展开。颜色按
+`{sessionId:'#rrggbb'}` 存在 `dsh-session-top:row-colors`，只接受严格六位 hex
+（`#000000` 是合法颜色），取消置顶再置顶颜色还在。背景是混色，hover、焦点和当前会话
+的高亮都仍然看得清。
+
+**颜色对话框是插件自己的，菜单入口和行尾色点共用它。** 右键菜单里的「自定义行背景
+颜色…」和置顶行末尾的色点打开同一个对话框：一个六位 hex 输入框（带原生取色器辅助）、
+**应用 / 取消 / 恢复默认**三个按钮。**Enter 从输入框提交**；**Esc 取消**。
+**只有「应用」和「恢复默认」会写存储**——恢复默认写的是一次清除（只删这一个
+sessionId），不是「什么都不做」；**取消和 Esc 一点都不写**。非法值就地拒绝并显示提示
+文字（`role="status"`，同时置 `aria-invalid`）——不是只把边框标红而不给话看。
+
+回焦：从**行尾色点**打开的对话框关闭时，焦点交还那个色点。从**右键菜单**打开的，
+只有菜单自己交还焦点的那条路径能回到原行；菜单项随后连同菜单一起消失时，焦点会落回
+页面而不是原行（已知 P2）。
+
+**对话框里的取色器只是辅助，不直接写盘。** 它拖动/改值时的 `input` 和 `change` 都只
+把颜色填进输入框，**必须再按「应用」才存**。行尾那个旧的隐藏原生取色器（兼容路径）
+仍保持"`input` 只预览、`change` 才保存"，那是另一条路径的行为，不是新对话框的默认交互。
+
+**行标题字号分两档，作用域很窄。** 只有被 `data-stp-typography` 标记的那棵树里、
+工作区与会话行的 `_title`（以及同位的改名输入框）降到 12px/400/16；置顶区自己那几行
+保持 14px/500/20。
+
+**紧凑化：真实页面上量到的值。** 下面每个数字都是在真实官方侧栏上量到的 before → after，
+不是设计意图：
+
+| 位置 | before | after |
+| --- | ---: | ---: |
+| 置顶区总高（5 条） | 201px | 159px |
+| 单条置顶 | 32px | 26px |
+| 「已置顶」折叠头 | 28px | 24px |
+| 单个工作区目录行 | 34px | 26px |
+| 单条会话行（宿主） | 32px | 26px |
+| 今日 / 余额 / 时段区 | 74.91px | 63.14px |
+| 导入会话 | 42px | 28px |
+| 已置顶底部入口 | 28px | 24px |
+| 账号菜单 | 44px | 32px |
+
+只压行高、组间距和底部留白：**不隐藏任何信息**，每个主要可点控件的命中区保持在
+24px 及以上。底部几个控件的紧凑值必须用 `!important` 才能生效——导入按钮的高度是宿主
+写在**行内样式**里的，普通规则压不过；置顶底部入口则是宿主 `button[class]` 规则加
+`all: unset`，单属性选择器也压不过。这些 `!important` 只出现在这几个已证 marker 上，
+测试里对此有断言。
+
+**行尾那个旧的隐藏取色器（兼容路径）才是一落定就写盘。** 拖动时的 `input` 只做实时
+预览、不写存储，`change`（松手/回车/关闭）才保存并按 key 触发一次跨上下文同步。这条
+只适用于那个兼容控件；上面说的新对话框必须按「应用」。已知边界：同一 origin 下多个
+窗口各自改色走的是「读整张表 → 合并 → 整张写回」，没有锁也没有 CAS，并发写按
+last writer wins，理论上会覆盖掉对方那一次修改。
+
+这些行为都不引入新依赖。
+
 ### 右键接缝：共享扩展表，不是 DOM 嫁接
 
-会话右键菜单属于 `@baihejiangnan/dsh-session-context-menu`（0.2.14）。它的
+会话右键菜单属于 `@baihejiangnan/dsh-session-context-menu`（本文以 v0.2.14 的
+tagged 产物为准；未发布的 main 菜单内容已有差异，见下文）。它的
 client 侧在 `globalThis[Symbol.for('dsh.session-context-menu.extensions')]` 上建一张
 共享扩展表，**表由它自己创建和维护**，并在自己 apply 期间持有 lease；每个
 `visible({session, row})` 通过的条目都被渲染进它自己的 `.dshcm-menu`，点按时
@@ -136,10 +261,30 @@ client 侧在 `globalThis[Symbol.for('dsh.session-context-menu.extensions')]` �
 `preventDefault`，我们的兜底什么都不做，两边不会同时开菜单，空白区域也永远不会被
 认领。
 
+**置顶行自己被右键时，判据换成"转发出去的事件本身"。** 区域行不是宿主行，
+codex 不会为它开菜单，所以这里的归属只有两个来源：转发到该会话真实宿主行上的
+那一轮 dispatch 里，谁调用了 `preventDefault()`。转发**送达**不等于有人**认领**
+——宿主行存在只说明送得出去。所以 `redispatchContextMenu` 返回事件对象而不是
+成功标志，`openOwnRowMenu` 在同一个微任务回调里读它的 `defaultPrevented`：
+owner 认领 → 只有 owner 的完整菜单；codex 自己的会话行处理器认领
+（`dsh-codex-ui/lib/client.js:4617`，同步 `preventDefault` + `stopPropagation`）
+→ 宿主菜单原样保留；**没有任何人认领** → 退到本插件的置顶/取消置顶菜单。
+连重投递都构造不出来（没有 `MouseEvent` 或宿主行拒绝）时同样退到兜底：那说明
+既没人服务这次右键、也不可能有人服务，此时"因为宿主行在所以不动"是把右键丢在
+地上。普通宿主行的 codex 原生门（`nativeContextMenu`）保持不变，仍然只观察。
+
 `test/shared-menu.mjs` 直接照抄 0.2.14 的 `ownerRegistry()` 与它的
 `onContextMenu` 来驱动真 bundle，逐条验证上表（含 owner 卸载后接管、owner 晚加载、
 owner 先加载、owner 重载）；`test/sidebar-dom.mjs` 对两种侧栏各建一套骨架 DOM，
 验证上表其余各行。
+
+**菜单内容随 owner 版本变化，测试按 sha256 钉版本。** v0.2.14 的 tagged 产物菜单里
+**没有**「删除会话」；未发布的 main 才加了
+`deleteSession`。`test/owner-menu-real.mjs` 按 owner `lib/client.js` 的 sha256
+绑定一份手写菜单契约（v0.2.14 = `6960b05c…`，main@ab40cced = `9ccc3ab8…`），
+expected 全部是字面量、逐项精确断言，不从实际渲染结果里过滤。遇到未登记的
+sha256 会**直接失败**并打印该 hash 与已登记版本；新增版本时读它自己
+`if (row) {` 那段的 `add()` 调用，把 sha256 和它调用的标签加进契约即可。
 
 ### token 适配
 
@@ -257,6 +402,10 @@ ctx.inject(['workspaces'], (child) => mount(child, warn))
 | 3 | `flavor === null` | **只观察** | 否 |
 | 4 | 解析出宿主的 session 行，且 dispatch 结束时仍无人处理 | 延后一个微任务开自己的兜底菜单 | **是**（dispatch 之后） |
 
+区域行的重投递是第 2 条的内部动作，判据同第 1、4 条但作用在**转发出去的**那个
+事件上：谁 `preventDefault()` 就是谁认领，无人认领才落到置顶/取消置顶兜底菜单，
+连事件都发不出去也落到兜底。"宿主行存在"不是认领。
+
 React 把监听挂在 **root 容器**上，所以捕获阶段任何中断都会让宿主菜单永远
 打不开 —— codex-ui 的行菜单因此死过两次。现在「不认识 = 只观察」，不做任何
 事件修改、不开自己的菜单。owner 在场时它自己 `preventDefault`，第 4 条就永远
@@ -267,7 +416,9 @@ React 把监听挂在 **root 容器**上，所以捕获阶段任何中断都会�
 仍然能到达；另有行为测试：flavor none 完全不干预、区域行不带宿主标记、
 侧栏晚于插件渲染时仍被正确识别、以及 `MutationObserver` 静止一秒零突变且行节点
 身份不变（这些我都注入回归验证过会失败）。归属的四种时序在
-`test/shared-menu.mjs` 里对着 0.2.14 的真实 owner 代码逐条验证。
+`test/shared-menu.mjs` 里对着 0.2.14 的真实 owner 代码逐条验证；转发后"有人认领
+/ 没人认领 / 构造不出事件 / 已卸载"四种判据在
+`test/owner-menu-real.mjs` 里对着两个未修改的真实 owner 产物逐条验证。
 
 ## 降级契约
 

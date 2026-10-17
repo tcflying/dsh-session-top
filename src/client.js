@@ -389,30 +389,335 @@ window.__ModuleLoader__.load({
     /** How long after the last change we re-run the DOM reconciliation. */
     const RECONCILE_DEBOUNCE_MS = 60
 
-    /** Inject the plugin stylesheet once, keeping the dynamic pin rules separate. */
+    // ------------------------------------------------- global-panels region
+
+    /** State hook this plugin puts on the ONE nav it folds. */
+    const PANELS_STATE_ATTR = 'data-stp-panels'
+    /** The control's own attribute, so it can be found again after a re-render. */
+    const PANELS_TOGGLE_ATTR = 'data-stp-panels-toggle'
+    /** The id this plugin lends the nav so `aria-controls` has a target. */
+    const PANELS_ID = 'dsh-session-top-panels'
+    /**
+     * The remembered choice. Namespaced to this plugin and to nothing else:
+     * a key that collided with a host or another plugin's would let either of
+     * them silently decide whether the region is folded.
+     */
+    const PANELS_STORAGE_KEY = 'dsh-session-top:panels-collapsed'
+    /** The host's own nav vocabulary — `SidebarRoot.tsx:280`. */
+    const PANELS_NAV_SELECTOR = 'nav[class*="panelList"]'
+    /** What the folded control says it is, and what the host calls the region. */
+    const PANELS_TOGGLE_LABEL = '全局面板'
+
+    /**
+     * Is this element inside the sidebar's collapsed rail?
+     *
+     * The rail is a whole-sidebar state the HOST owns and renders correctly on
+     * its own (its own CSS drops the panel list there, and shows the icons it
+     * wants). Folding a region that is not on screen is not "tidier" — it is
+     * the plugin's preference applied to a layout the user did not choose, and
+     * it fights the expand/collapse toggle they are about to use.
+     * @param {Element | null} element - a node inside the sidebar.
+     * @returns {boolean} true when the rail is in effect.
+     */
+    function sidebarRailIn(element) {
+      for (let node = element; node != null && typeof node.matches === 'function'; node = node.parentElement) {
+        if (typeof node.className === 'string' && node.className.split(/\s+/).some(c => c.includes('collapsed'))) return true
+        if (node.getAttribute?.('data-sidebar-collapsed') === 'true') return true
+      }
+      return false
+    }
+
+    /**
+     * Read the remembered panels state.
+     *
+     * Absent, unreadable and "no preference recorded" are the same answer —
+     * FOLDED — which is the whole point of the default. Every access is guarded:
+     * storage throws in private mode, with site data disabled and on a quota
+     * error, and a preference is never worth taking the region down for.
+     * @returns {boolean} true when the region should start folded.
+     */
+    function readPanelsPreference() {
+      try {
+        const raw = globalThis.localStorage?.getItem?.(PANELS_STORAGE_KEY)
+        // Only an explicit "0" is an expanded region. Anything else — absent,
+        // a value another version wrote, junk — is the default.
+        return raw !== '0'
+      } catch {
+        return true
+      }
+    }
+
+    /**
+     * Record the user's explicit choice. Best effort, and never fatal.
+     * @param {boolean} collapsed - the state the user just chose.
+     */
+    function writePanelsPreference(collapsed) {
+      try {
+        globalThis.localStorage?.setItem?.(PANELS_STORAGE_KEY, collapsed === true ? '1' : '0')
+      } catch { /* the region still works, it just will not be remembered */ }
+    }
+
+    // ------------------------------------------- workspace-directory region
+
+    /**
+     * The state hook on the ONE body this plugin folds: the seat the host
+     * renders the workspace directory headers AND their sessions into
+     * (`WorkspaceBrowser.tsx:669` — `HoverCardGroup` > AnimatedRows + fade).
+     */
+    const GROUPS_STATE_ATTR = 'data-stp-groups'
+    /** The marker, so the rule can only ever reach a body this plugin proved. */
+    const GROUPS_BODY_ATTR = 'data-stp-groups-body'
+    /** The control's own attribute, so it is found again after a re-render. */
+    const GROUPS_TOGGLE_ATTR = 'data-stp-groups-toggle'
+    /** The id lent to the body so `aria-controls` has a target. */
+    const GROUPS_ID = 'dsh-session-top-groups'
+    /**
+     * The remembered choice, under this plugin's own key. Only the literal
+     * `'1'` folds: an absent key, junk, or another version's value all mean the
+     * default, which is EXPANDED — the directories being closed one by one is
+     * the tidying that matters, hiding the whole column is the user's call.
+     */
+    const GROUPS_STORAGE_KEY = 'dsh-session-top:groups-collapsed'
+    /** What the folded control says it is, and what the host calls the region. */
+    const GROUPS_TOGGLE_LABEL = '工作区目录'
+
+    /** @returns {boolean} the remembered state; the default on any refusal. */
+    function readGroupsPreference() {
+      try {
+        return globalThis.localStorage?.getItem?.(GROUPS_STORAGE_KEY) === '1'
+      } catch {
+        return false
+      }
+    }
+
+    /** Record the fold the user just chose. Never fatal. */
+    function writeGroupsPreference(collapsed) {
+      try {
+        globalThis.localStorage?.setItem?.(GROUPS_STORAGE_KEY, collapsed === true ? '1' : '0')
+      } catch { /* the fold still works, it just will not be remembered */ }
+    }
+
+    // ------------------------------------------------- pinned-region fold
+
+    /**
+     * The state hook on the region element, so the stylesheet decides what is
+     * hidden and no row is ever removed: a row destroyed and re-created is a
+     * different node at the pointerup, and the click then lands on the common
+     * ancestor instead.
+     */
+    const REGION_COLLAPSED_ATTR = 'data-stp-collapsed'
+
+    /**
+     * The remembered fold, under this plugin's own key. Only the literal
+     * `'1'` means folded; anything else is the default, which is EXPANDED.
+     */
+    const REGION_COLLAPSED_STORAGE_KEY = 'dsh-session-top:region-collapsed'
+
+    /** @returns {boolean} the remembered state; the default on any refusal. */
+    function readRegionCollapsed() {
+      try {
+        return globalThis.localStorage?.getItem?.(REGION_COLLAPSED_STORAGE_KEY) === '1'
+      } catch {
+        return false
+      }
+    }
+
+    /**
+     * Record the fold the user just chose. Never fatal.
+     * @param {boolean} collapsed - the state the user chose.
+     */
+    function writeRegionCollapsed(collapsed) {
+      try {
+        globalThis.localStorage?.setItem?.(REGION_COLLAPSED_STORAGE_KEY, collapsed === true ? '1' : '0')
+      } catch { /* the fold still works, it just will not be remembered */ }
+    }
+
+    // ------------------------------------------------------- row colours
+
+    /**
+     * Per-session background colours, under this plugin's own key. Never the
+     * host's settings and never the pin registry: a colour is a local
+     * preference and must survive an unpin/repin pair.
+     */
+    const ROW_COLORS_STORAGE_KEY = 'dsh-session-top:row-colors'
+
+    /**
+     * A colour, or null. Strictly six hex digits, so `#000000` is an ordinary
+     * colour and never doubles as a "clear it" sentinel, and nothing else
+     * reaches the stylesheet.
+     * @param {unknown} value - the candidate.
+     * @returns {string | null} the normalized colour, or null.
+     */
+    function normalizeRowColor(value) {
+      if (typeof value !== 'string') return null
+      return /^#[0-9a-f]{6}$/i.test(value) ? value.toLowerCase() : null
+    }
+
+    /** The colour a swatch shows when a row has none of its own. */
+    const EMPTY_SWATCH_HEX = '#ffffff'
+
+    /** Presence + value: the row's colour, and what the CSS keys on. */
+    const ROW_COLOR_ATTR = 'data-stp-color'
+    /** The colour control at a row's trailing edge. */
+    const SWATCH_ATTR = 'data-stp-row-color'
+    /** On the swatch: it stands for a colour the row actually carries. */
+    const SWATCH_SET_ATTR = 'data-stp-row-color-set'
+
+    /**
+     * The plugin's own colour dialog: a six-digit hex box with 应用 / 取消 /
+     * 恢复默认, a native swatch beside it as a helper, Escape to cancel, Enter
+     * to apply, and focus handed back to whatever opened it.
+     *
+     * Its own element in the viewport, NOT inside `[data-stp-anchor]`: the
+     * anchor is off-screen with zero size and carries the menu, which positions
+     * itself. A dialog in there would be invisible and outside the tab order's
+     * viewport, which is the failure the notice host already had to be split off
+     * to avoid.
+     */
+    const COLOR_DIALOG_ATTR = 'data-stp-color-dialog'
+    /** The hex field: the only control that commits. */
+    const COLOR_HEX_ATTR = 'data-stp-color-hex'
+    /** The native `<input type="color">`, a helper and nothing more. */
+    const COLOR_NATIVE_ATTR = 'data-stp-color-native'
+    /** 应用 / 取消 / 恢复默认. */
+    const COLOR_BUTTON_ATTR = 'data-stp-color-button'
+    const COLOR_APPLY_ATTR = 'data-stp-color-apply'
+    const COLOR_CANCEL_ATTR = 'data-stp-color-cancel'
+    const COLOR_RESET_ATTR = 'data-stp-color-reset'
+    const COLOR_ERROR_ATTR = 'data-stp-color-error'
+
+    /* ------------------------------------------------------------- the footer
+       Four markers, one per element the compaction rules are allowed to reach.
+       They are DOM on HOST nodes, so they are handed back on every teardown and
+       whatever else the lease says — a marked node this instance can no longer
+       justify must not stay marked. Each is written only onto an element a
+       PROVEN lookup found: the balance region and the import control are
+       located by their own stable aria-labels inside the sidebar root this
+       plugin already proved, and the footer host is the nearest common
+       ancestor of those two (never a page-wide sweep for buttons). */
+    const FOOTER_ATTR = 'data-stp-footer'
+    const FOOTER_BALANCE_ATTR = 'data-stp-footer-balance'
+    const FOOTER_IMPORT_ATTR = 'data-stp-footer-import'
+    const FOOTER_PIN_ATTR = 'data-stp-footer-pin'
+    const ACCOUNT_ATTR = 'data-stp-account'
+
+    /** The stock sidebar's own aria-labels for the footer surfaces. */
+    const BALANCE_REGION_LABEL = '简化侧栏显示'
+    const IMPORT_CONTROL_LABEL = '导入会话'
+    const ACCOUNT_MENU_LABEL = '账号菜单'
+      /** The pinned-count entry's own first cell of text, inside the footer host. */
+      const FOOTER_PIN_TEXT = '已置顶'
+      /** The pinned-count entry's own stable `aria-label`, inside the footer host. */
+      const FOOTER_PIN_LABEL = '已置顶的会话'
+
+    /**
+     * Marks this plugin has written onto host nodes, newest last.
+     *
+     * A list rather than a fixed set of variables because each one has to be
+     * handed back EXACTLY what was taken and nothing else, and teardown runs
+     * them all the same way. Only this plugin's own attributes are ever removed.
+     * @type {Array<{el: Element, attr: string}>}
+     */
+    const hostMarks = []
+
+    /** Put one marker on one host element, remembering it for the hand-back. */
+    const markHost = (el, attr) => {
+      if (el === null || el === undefined || typeof el.setAttribute !== 'function') return false
+      try {
+        el.setAttribute(attr, '')
+      } catch {
+        return false
+      }
+      hostMarks.push({ el, attr })
+      return true
+    }
+
+    /** Take every marker back off the host, and forget them. Idempotent. */
+    const clearHostMarks = (attr) => {
+      for (let i = hostMarks.length - 1; i >= 0; i -= 1) {
+        const mark = hostMarks[i]
+        if (attr !== undefined && mark.attr !== attr) continue
+        hostMarks.splice(i, 1)
+        try {
+          if (mark.el.getAttribute?.(mark.attr) !== null) mark.el.removeAttribute(mark.attr)
+        } catch { /* the element went with its own tree; there is nothing left to own */ }
+      }
+    }
+
+    /**
+     * Marks the ONE tree element this plugin has positively identified as the
+     * host's session list.
+     *
+     * It exists so the typography rules below can reach the host's own rows and
+     * titles without ever being able to reach anything else. A document-wide
+     * `[role="tree"]` rule would restyle a file tree, a search tree or any other
+     * third-party widget; a `[class*="_title"]` rule with no anchor is the same
+     * mistake with a different spelling. One attribute, written only onto the
+     * element findTree() proved, and removed on every path that un-proves it.
+     */
+    const TYPOGRAPHY_ATTR = 'data-stp-typography'
+
+    /**
+     * Inject the plugin stylesheet once, keeping the dynamic pin rules separate.
+     *
+     * TYPOGRAPHY IS WRITTEN IN LONGHAND, NEVER IN THE "font" SHORTHAND.
+     *
+     * Every rule below used to read the shorthand "font: <weight> <size>/<lh>
+     * var(--stp-token-font, inherit)". That is invalid CSS: "inherit" is a
+     * global keyword, and a shorthand does not accept a global keyword in the
+     * family slot, so the declaration as a whole was at-risk and, in the real
+     * page, dropped (measured there: CSS.supports('font', '400 13px/20px
+     * inherit') === false, and --stp-token-font is empty, so the fallback is
+     * always the one being substituted). A dropped declaration is not "the old
+     * look" — it is NO declaration, so the whole element fell back to the
+     * host's inherited 14px. That is the entire "the pinned rows look smaller
+     * than the rest" report: the pinned region was never smaller by design, it
+     * was larger by accident of a dropped rule and only just.
+     *
+     * The four longhands below are each independently valid, so a missing
+     * token degrades one property instead of the whole face. Only
+     * font-family still reads the token, and var(..., inherit) IS legal there
+     * because the substituted "inherit" is then parsed as a font-family value.
+     */
     const STYLE_TEXT = `
 [data-stp-region] {
-  display: flex; flex-direction: column; gap: 1px;
-  padding: 2px 8px 6px; margin: 0 0 4px;
+  display: flex; flex-direction: column; gap: 0;
+  padding: 1px 6px 4px; margin: 0 0 2px;
 }
 [data-stp-region][hidden] { display: none !important; }
+/* Folding the region hides its DIRECT child rows and nothing else — the header
+   and its count stay, and no row node is destroyed, so identity (and therefore
+   every click, focus and gesture on it) survives the fold. */
+[data-stp-region][data-stp-collapsed='true'] > [data-stp-row] { display: none !important; }
 [data-stp-region-header] {
   display: flex; align-items: center; gap: 6px;
-  padding: 4px 4px 4px 6px; border-radius: 6px;
-  font: 600 11px/16px var(--stp-token-font, inherit);
+  /* The disclosure is a click target like any other row. Its 16px line box
+     compacted it to 18px, which is under the 24px floor the rest of the
+     compaction holds to; 24px restores the target without giving back any
+     horizontal space or shrinking the type. */
+  min-height: 24px; box-sizing: border-box;
+  padding: 1px 4px 1px 6px; border-radius: 6px;
+  font-family: var(--stp-token-font, inherit);
+  font-size: 12px; font-weight: 600; line-height: 16px;
   color: var(--stp-token-tertiary, currentColor);
-  user-select: none;
+  user-select: none; cursor: pointer;
 }
+[data-stp-region-header]:hover { background: var(--stp-token-hover, rgba(127,127,127,.10)); }
+[data-stp-region-header]:focus-visible {
+  outline: 2px solid var(--stp-token-primary, currentColor); outline-offset: -2px;
+}
+[data-stp-region-caret] { flex: none; font-size: 10px; line-height: 1; }
 [data-stp-region-count] {
   margin-left: auto; opacity: .8;
   font-variant-numeric: tabular-nums;
 }
 [data-stp-row] {
-  display: flex; align-items: center; gap: 8px;
-  min-height: 28px; padding: 2px 8px 2px 10px;
+  display: flex; align-items: center; gap: 6px;
+  min-height: 26px; padding: 0 6px 0 8px;
   border-radius: 8px; cursor: pointer; position: relative;
   min-width: 0; box-sizing: border-box;
-  font: 400 13px/20px var(--stp-token-font, inherit);
+  font-family: var(--stp-token-font, inherit);
+  font-size: 14px; font-weight: 500; line-height: 20px;
   color: var(--stp-token-primary, inherit);
 }
 [data-stp-row]:hover, [data-stp-row]:focus-visible {
@@ -420,8 +725,49 @@ window.__ModuleLoader__.load({
   outline: none;
 }
 [data-stp-row][aria-current='true'] { background: var(--stp-token-hover, rgba(127,127,127,.16)); }
+/* A colour the user picked for one session. MIXED, never opaque: the host's own
+   text token and its own hover/selected surfaces stay readable on top of it, and
+   hover / focus / active each keep their own mix rather than painting it over.
+   The value itself arrives as the custom property --stp-row-color on the
+   row, so no arbitrary string is ever interpolated into this stylesheet. */
+[data-stp-row][data-stp-color] {
+  background: color-mix(in srgb, var(--stp-row-color, transparent) 22%, transparent);
+}
+[data-stp-row][data-stp-color]:hover, [data-stp-row][data-stp-color]:focus-visible {
+  background: color-mix(in srgb, var(--stp-row-color, transparent) 34%, var(--stp-token-hover, rgba(127,127,127,.10)));
+}
+[data-stp-row][data-stp-color][aria-current='true'] {
+  background: color-mix(in srgb, var(--stp-row-color, transparent) 42%, var(--stp-token-hover, rgba(127,127,127,.16)));
+}
+/* The colour point: a 24px hit area carrying a 14px visual. The area is the
+   element (so focus lands on something big enough to hit) and the swatch is its
+   ::after, which keeps the border and the fill off the transparent padding. */
+[data-stp-row-color] {
+  flex: none; box-sizing: content-box; position: relative;
+  width: 14px; height: 14px; padding: 5px;
+  border: 0; background: transparent; cursor: pointer;
+}
+[data-stp-row-color]::after {
+  content: ''; position: absolute; left: 5px; top: 5px;
+  width: 14px; height: 14px; border-radius: 4px;
+  border: 1px solid var(--stp-token-border, rgba(127,127,127,.45));
+  background: transparent;
+}
+[data-stp-row-color][data-stp-row-color-set]::after { background: var(--stp-row-color, transparent); }
+[data-stp-row-color]:hover::after { border-color: var(--stp-token-primary, currentColor); }
+[data-stp-row-color]:focus-visible {
+  outline: 2px solid var(--stp-token-primary, currentColor); outline-offset: 1px;
+}
+/* The real <input type="color"> behind the swatch. Rendered (display:none
+   makes a programmatic click() a no-op) and invisible, and it never takes a
+   pointer or a tab stop of its own. */
+[data-stp-color-input] {
+  position: absolute; left: 0; top: 0;
+  width: 1px; height: 1px; padding: 0; border: 0; margin: 0;
+  opacity: 0; pointer-events: none;
+}
 [data-stp-row-slot] {
-  width: 16px; height: 16px; flex: none;
+  width: 14px; height: 14px; flex: none;
   display: flex; align-items: center; justify-content: center;
   color: var(--stp-token-secondary, currentColor);
 }
@@ -431,19 +777,39 @@ window.__ModuleLoader__.load({
 }
 [data-stp-row-time] {
   flex: none; color: var(--stp-token-tertiary, currentColor);
-  font-size: 12px; font-variant-numeric: tabular-nums;
+  font-size: 11px; line-height: 14px; font-variant-numeric: tabular-nums;
 }
 [data-stp-pin-item] {
   display: flex; align-items: center; gap: 8px; width: 100%;
   border: 0; background: transparent; cursor: pointer; text-align: left;
   padding: 6px 10px; border-radius: 6px;
-  font: 400 13px/20px var(--stp-token-font, inherit);
+  font-family: var(--stp-token-font, inherit);
+  font-size: 13px; font-weight: 400; line-height: 20px;
   color: var(--stp-token-primary, inherit);
 }
 [data-stp-pin-item]:hover, [data-stp-pin-item]:focus-visible {
   background: var(--stp-token-hover, rgba(127,127,127,.12));
   outline: none;
 }
+/* The controls for the two regions this plugin folds — the global-panels nav
+   and the workspace directories. Deliberately the size of one host row and
+   styled from the same tokens, so folding a region does not change the
+   sidebar's rhythm. The 24px hit area is kept: only the margin around it and
+   the line box inside it are tightened. */
+[data-stp-panels-toggle], [data-stp-groups-toggle] {
+  display: flex; align-items: center; gap: 6px; box-sizing: border-box;
+  min-height: 24px; width: calc(100% - 4px); margin: 0 2px 2px;
+  padding: 0 8px; border: 0; border-radius: 6px;
+  background: transparent; cursor: pointer; text-align: left;
+  font-family: var(--stp-token-font, inherit);
+  font-size: 11px; font-weight: 400; line-height: 16px;
+  color: var(--stp-token-tertiary, currentColor);
+}
+[data-stp-panels-toggle]:hover, [data-stp-groups-toggle]:hover { background: var(--stp-token-hover, rgba(127,127,127,.10)); }
+[data-stp-panels-toggle]:focus-visible, [data-stp-groups-toggle]:focus-visible {
+  outline: 2px solid var(--stp-token-primary, currentColor); outline-offset: -2px;
+}
+[data-stp-panels-caret], [data-stp-groups-caret] { flex: none; font-size: 10px; line-height: 1; }
 [data-stp-anchor] { position: fixed; left: -9999px; top: -9999px; width: 0; height: 0; pointer-events: none; }
 /* The user-facing notice host. It is its OWN element, not the menu anchor: the
    anchor is positioned off-screen with zero size, so anything left inside it is
@@ -461,7 +827,8 @@ window.__ModuleLoader__.load({
   border: 1px solid var(--stp-token-border, rgba(127,127,127,.32));
   background: var(--stp-token-bg, Canvas);
   color: var(--stp-token-primary, inherit);
-  font: 400 13px/20px var(--stp-token-font, inherit);
+  font-family: var(--stp-token-font, inherit);
+  font-size: 13px; font-weight: 400; line-height: 20px;
   box-shadow: 0 8px 24px rgba(0,0,0,.24);
 }
 [data-stp-menu] {
@@ -472,9 +839,190 @@ window.__ModuleLoader__.load({
   background: var(--stp-token-bg, Canvas);
   color: var(--stp-token-primary, inherit);
   box-shadow: 0 8px 24px rgba(0,0,0,.24);
-  font: 400 13px/20px var(--stp-token-font, inherit);
+  font-family: var(--stp-token-font, inherit);
+  font-size: 13px; font-weight: 400; line-height: 20px;
   pointer-events: auto;
 }
+/* The two items this plugin contributes to its own fallback menu. One rule for
+   both, so the colour entry cannot read as a different kind of row from the pin
+   entry sitting directly above it. */
+[data-stp-menu] [data-stp-pin-item],
+[data-stp-menu] [data-stp-color-item] {
+  display: block; box-sizing: border-box; width: 100%;
+  min-height: 24px; margin: 0; padding: 2px 8px;
+  border: 0; border-radius: 6px; background: transparent; color: inherit;
+  font-family: var(--stp-token-font, inherit);
+  font-size: 13px; font-weight: 400; line-height: 20px;
+  text-align: start; cursor: pointer;
+}
+[data-stp-menu] [data-stp-pin-item]:hover,
+[data-stp-menu] [data-stp-color-item]:hover {
+  background: var(--stp-token-hover, rgba(127,127,127,.10));
+}
+[data-stp-menu] [data-stp-pin-item]:focus-visible,
+[data-stp-menu] [data-stp-color-item]:focus-visible {
+  outline: 2px solid var(--stp-token-primary, currentColor); outline-offset: -2px;
+}
+/* ---------------------------------------------------------------------------
+   HOST TYPOGRAPHY — the sidebar rows this plugin re-weights so the pinned
+   region reads as the LARGER surface and the workspace below it recedes.
+
+   Scope is the marker attribute plus the host's OWN row vocabulary. Three
+   things have to hold together:
+
+   1. The marker attribute is written only onto the tree findTree() proved,
+      so a file tree, a search tree or another plugin's list can never match —
+      the selector cannot reach them even though they carry the same shape.
+   2. The two data-row-key prefixes are the stock sidebar's own vocabulary
+      (restated from src/core.js), so only the two real row kinds inside that
+      one tree are addressed.
+   3. [class*="_title"] is Rows.module.css's exported _title, whose hashed
+      build class keeps the readable _title segment (measured on the running
+      app: qCniVq_title). It is matched only UNDER a marked tree, and a
+      session row's own siblings (rowActions, iconButton) do not contain
+      that segment, so the trailing controls are not restyled.
+
+   What it DOES set is deliberately bounded: the glyph size, the line box, and
+   — in the ROW RHYTHM block below — the vertical padding, margin and a 24px
+   minimum height of the host's own rows. No row is hidden or removed, no icon
+   is resized, and nothing outside a proven tree can match, so hit areas, the
+   narrow rail and the host's own ellipsis clipping keep working. The pinned
+   region above stays the LARGER surface (14px over the workspace's 12px),
+   which is the whole point of the complaint this section answers.
+   --------------------------------------------------------------------------- */
+[data-stp-typography] [data-row-key^='workspace:'] [class*='_title'],
+[data-stp-typography] [data-row-key^='session:'] [class*='_title'] {
+  font-size: 12px; font-weight: 400; line-height: 16px;
+}
+/* The inline rename input sits where the title was and must stay readable at
+   the SAME size, or renaming a session visibly reflows its own row. */
+[data-stp-typography] [data-row-key^='workspace:'] input,
+[data-stp-typography] [data-row-key^='session:'] input {
+  font-family: var(--stp-token-font, inherit);
+  font-size: 12px; font-weight: 400; line-height: 16px;
+}
+/* ROW RHYTHM. The same compaction on the host's own rows, so more of them fit
+   on screen. Scope is the marker plus the host's own row vocabulary, exactly as
+   the typography above is: nothing outside a PROVEN tree can match, no row is
+   hidden, and nothing is removed — only the space between rows and inside them
+   is taken back. min-height keeps a 24px hit area. */
+[data-stp-typography] { gap: 0; padding-top: 0; padding-bottom: 0; }
+/* An explicit height, not only min-height. The host sets a FIXED height on both
+   of its row kinds (.projectRow 34px, .sessionRow 32px in rows/Rows.module.css),
+   and a fixed height wins over a minimum: on the live page the padding landed
+   and the directory row stayed at 34px. The height has to be stated to be taken
+   back. 26px keeps the row a comfortable click target and is still the compact
+   value the acceptance asked for. border-box keeps the padding inside it. */
+[data-stp-typography] [data-row-key^='workspace:'],
+[data-stp-typography] [data-row-key^='session:'] {
+  height: 26px; min-height: 24px; box-sizing: border-box;
+  margin-top: 0; margin-bottom: 0;
+  padding-top: 1px; padding-bottom: 1px;
+}
+/* A colour chosen for a session the HOST renders in its own group. Same map,
+   same attribute and the same mix as a pinned row's; only the address changes,
+   and it is still the proven tree plus the host's own row vocabulary. */
+[data-stp-typography] [data-row-key^='session:'][data-stp-color],
+[data-stp-typography] [data-dcu-session][data-stp-color] {
+  background: color-mix(in srgb, var(--stp-row-color, transparent) 22%, transparent);
+}
+[data-stp-typography] [data-row-key^='session:'][data-stp-color]:hover,
+[data-stp-typography] [data-dcu-session][data-stp-color]:hover {
+  background: color-mix(in srgb, var(--stp-row-color, transparent) 34%, var(--stp-token-hover, rgba(127,127,127,.10)));
+}
+/* ---------------------------------------------------------------------------
+   THE PLUGIN'S OWN COLOUR DIALOG. Needed because a hidden
+   <input type="color"> is not something a person can drive: the six-digit hex
+   box is the control, and the native swatch beside it is the helper. The
+   dialog is its own on-screen element — never inside the off-screen menu anchor
+   — and it is placed by JS, so nothing here depends on a percentage offset.
+   --------------------------------------------------------------------------- */
+[data-stp-color-dialog] {
+  position: fixed; left: 0; top: 0; z-index: 2147483002;
+  box-sizing: border-box; display: flex; flex-direction: column; gap: 8px;
+  min-width: 248px; max-width: min(360px, calc(100vw - 32px));
+  padding: 12px; border-radius: 10px;
+  border: 1px solid var(--stp-token-border, rgba(127,127,127,.32));
+  background: var(--stp-token-bg, Canvas);
+  color: var(--stp-token-primary, inherit);
+  box-shadow: 0 8px 24px rgba(0,0,0,.24);
+  font-family: var(--stp-token-font, inherit);
+  font-size: 13px; font-weight: 400; line-height: 20px;
+}
+[data-stp-color-dialog-title] { font-weight: 600; }
+[data-stp-color-dialog-field] { display: flex; align-items: center; gap: 8px; }
+[data-stp-color-hex] {
+  flex: 1 1 auto; min-width: 0; box-sizing: border-box;
+  padding: 3px 6px; border-radius: 6px;
+  border: 1px solid var(--stp-token-border, rgba(127,127,127,.45));
+  background: transparent; color: inherit;
+  font-family: var(--stp-token-font, inherit);
+  font-size: 13px; font-weight: 400; line-height: 20px;
+}
+[data-stp-color-hex][aria-invalid='true'] { outline: 2px solid currentColor; outline-offset: 1px; }
+[data-stp-color-native] {
+  flex: none; box-sizing: border-box; width: 24px; height: 24px;
+  padding: 0; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--stp-token-border, rgba(127,127,127,.45));
+  background: transparent;
+}
+[data-stp-color-dialog-actions] { display: flex; align-items: center; gap: 6px; }
+[data-stp-color-button] {
+  min-height: 24px; padding: 0 10px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--stp-token-border, rgba(127,127,127,.45));
+  background: transparent; color: inherit;
+  font-family: var(--stp-token-font, inherit);
+  font-size: 12px; font-weight: 400; line-height: 20px;
+}
+[data-stp-color-button]:focus-visible {
+  outline: 2px solid var(--stp-token-primary, currentColor); outline-offset: 1px;
+}
+/* ---------------------------------------------------------------------------
+   THE SIDEBAR FOOTER. Compaction only — no rule here hides anything, and every
+   one hangs off a marker this plugin wrote onto an element it PROVED (see
+   reconcileFooter below): the common host of the balance region and the import
+   control, the import control itself, the pinned-count entry inside that host,
+   and the account menu. A host whose markup moves simply stops matching, which
+   is the same degrade-to-nothing every other scoped rule here has.
+   --------------------------------------------------------------------------- */
+[data-stp-footer] { gap: 0; }
+/* The balance stack measured 74.91px before and 65.14px after the markers landed.
+   Same cascade story as the controls below: the host sets these cells' padding
+   and line-height from its own rules, so the declarations that must win are
+   !important. Scoped to this plugin's marker plus the host's own readable class
+   segments, nothing hidden, and each cell keeps its content. */
+[data-stp-footer-balance] { margin-top: 0 !important; margin-bottom: 0 !important; }
+[data-stp-footer-balance] [class*='cm-simple-summary'],
+[data-stp-footer-balance] [class*='cm-foot'],
+[data-stp-footer-balance] [class*='cm-peak-strip'] {
+  margin-top: 0 !important; margin-bottom: 0 !important; min-height: 0 !important;
+  padding-top: 2px !important; padding-bottom: 2px !important;
+  line-height: 16px !important; box-sizing: border-box !important;
+}
+[data-stp-footer-balance] [class*='cm-simple-summary'] { height: 20px !important; }
+[data-stp-footer-balance] [class*='cm-foot'] { height: 24px !important; }
+[data-stp-footer-balance] [class*='cm-peak-strip'] { height: 18px !important; padding-top: 1px !important; padding-bottom: 1px !important; }
+/* The import control measured 42px and the pinned entry 28px AFTER their markers
+   landed, so this is a CASCADE problem, not a missing rule — read off the live
+   CSSOM:
+     - import carries the host's INLINE height (42px). No stylesheet rule,
+       however specific, can beat an inline declaration without !important.
+     - the pinned entry is styled "button.__dsh-session-pin-footer__" after an
+       "all: unset", which outranks a single-attribute selector.
+   So the declarations that must win state !important. Scope is unchanged and
+   stays on this plugin's own markers, nothing else is touched, and no host
+   inline style is edited. */
+[data-stp-footer-import] {
+  height: 28px !important; min-height: 28px !important; box-sizing: border-box !important;
+  padding: 0 8px !important; margin: 0 !important; line-height: 20px !important;
+}
+[data-stp-footer-pin] {
+  height: 24px !important; min-height: 24px !important; box-sizing: border-box !important;
+  padding: 0 6px !important; margin: 0 !important; line-height: 16px !important;
+  font-size: 11px !important;
+}
+[data-stp-account] { height: 32px; min-height: 32px; padding: 3px 8px; box-sizing: border-box; }
+[data-stp-account] > span { line-height: 18px; }
 `
 
     /**
@@ -489,6 +1037,43 @@ window.__ModuleLoader__.load({
     function pinRuleCss(flavor, pinnedIds) {
       if (flavor === null || pinnedIds.length === 0) return ''
       return pinnedIds.map(id => flavor.hideRule(id)).join('\n')
+    }
+
+    /**
+     * The fold rule for the global-panels region.
+     *
+     * Scoped twice over: to the host's own nav vocabulary (`panelList`, the
+     * readable segment its hashed CSS-module class keeps) AND to the state
+     * attribute this plugin puts on that one element. Nothing else in the
+     * document can match, so no other nav is ever hidden — the "don't broadly
+     * hide other navs" rule is enforced by the selector, not by care at the
+     * call site.
+     *
+     * @param {boolean} collapsed - whether the region is folded right now.
+     * @returns {string} the rule, or '' when it is expanded.
+     */
+    function panelsRuleCss(collapsed) {
+      if (collapsed !== true) return ''
+      return `nav[class*='panelList'][${PANELS_STATE_ATTR}='collapsed']{display:none !important;}`
+    }
+
+    /**
+     * The fold rule for the workspace-directory region.
+     *
+     * Scoped TWICE over, and the second half is the load-bearing one: to the
+     * marker this plugin puts on the body it proved by walking up from the
+     * identified session list, AND to the state attribute on that same body. A
+     * selector that matched the host's hashed `treeBody` class instead would be
+     * a global sweep — it would hide a look-alike seat the host renders
+     * elsewhere, which is exactly the mistake the pinned rules are scoped to
+     * avoid. Nothing in the document can match unless this plugin marked it.
+     *
+     * @param {boolean} collapsed - whether the region is folded right now.
+     * @returns {string} the rule, or '' when it is expanded.
+     */
+    function groupsRuleCss(collapsed) {
+      if (collapsed !== true) return ''
+      return `[${GROUPS_BODY_ATTR}][${GROUPS_STATE_ATTR}='collapsed']{display:none !important;}`
     }
 
 /**
@@ -569,9 +1154,10 @@ window.__ModuleLoader__.load({
     }
 
     /** Replace the dynamic stylesheet's contents. Never touches the static sheet. */
-    function applyPinRules(tag, flavor, pinnedIds) {
+    function applyPinRules(tag, flavor, pinnedIds, panelsCollapsed = false, groupsCollapsed = false) {
       if (tag === null || tag === undefined) return
-      const css = pinRuleCss(flavor, pinnedIds)
+      const css = [...pinRuleCss(flavor, pinnedIds).split('\n').filter(Boolean),
+        panelsRuleCss(panelsCollapsed), groupsRuleCss(groupsCollapsed)].filter(Boolean).join('\n')
       try {
         if (tag.textContent !== css) tag.textContent = css
       } catch (error) {
@@ -714,6 +1300,22 @@ window.__ModuleLoader__.load({
     const SERVICE_WAIT_TIMEOUT_MS = 20000
 
     /**
+     * Other plugins' slot entries whose pin count and pin list are re-sourced
+     * from the official pin set, and whether the entry's workspace section is
+     * part of that count.
+     *
+     * Matching is by exact slot name and entry id: the shadow sits on the same
+     * cell one priority lower and reuses the original component untouched.
+     */
+    const OFFICIAL_COUNT_SLOTS = [
+      { name: 'sidebar.footer.action', id: 'dsh-session-pin', pureSessionCount: true },
+      { name: 'shell.overlay', id: 'dsh-session-pin-panel', pureSessionCount: false },
+    ]
+
+    /** Marks the entries this plugin registers, so it never shadows itself. */
+    const SHADOW_REGISTRANT = 'dsh-session-top: official pin count'
+
+    /**
      * The current generation's session-subscription manager, published by
      * `mount` so the top-level `ctx.inject(['sessions'])` child fiber can drive
      * it.
@@ -828,6 +1430,9 @@ window.__ModuleLoader__.load({
         torndown = true
         observer?.disconnect()
         document.removeEventListener('contextmenu', onContextMenu, true)
+        // The borrowed anchor row and the group this plugin may have opened for
+        // it go back here, before anything else can act on a dead generation.
+        restoreOfficialAnchor()
         document.removeEventListener('pointerdown', onDismiss, true)
         document.removeEventListener('keydown', onDismiss, true)
         window.removeEventListener('blur', onDismiss)
@@ -848,6 +1453,48 @@ window.__ModuleLoader__.load({
         }
         headCache.clear()
         foldSignature.clear()
+        // The panels control and the fold attribute are DOM on host nodes, so
+        // they are handed back by the same walk that hands back the region —
+        // regardless of whether this instance still owns the lease, because a
+        // control nobody renders is not a shared resource.
+        try {
+          clearPanels()
+        } catch (error) {
+          console.error('[dsh-session-top] panels teardown failed:', error)
+        }
+        try {
+          clearDirectoryRegion()
+        } catch (error) {
+          console.error('[dsh-session-top] directory-region teardown failed:', error)
+        }
+        // The footer markers and the host-row colours are DOM on HOST nodes, so
+        // they are handed back on every teardown and regardless of the lease: a
+        // marked footer or a tinted row this instance can no longer justify must
+        // not stay that way. The dialog is plugin-owned and simply goes.
+        try {
+          clearFooter()
+        } catch (error) {
+          console.error('[dsh-session-top] footer teardown failed:', error)
+        }
+        try {
+          clearHostRowColors()
+        } catch (error) {
+          console.error('[dsh-session-top] host row colour teardown failed:', error)
+        }
+        try {
+          closeColorDialog()
+        } catch (error) {
+          console.error('[dsh-session-top] colour dialog teardown failed:', error)
+        }
+        // The typography marker is DOM on a HOST node, so it is handed back on
+        // every teardown and regardless of the lease: a marked tree this
+        // instance can no longer justify must not stay marked. Only this
+        // plugin's own attribute comes off.
+        try {
+          markTypography(null)
+        } catch (error) {
+          console.error('[dsh-session-top] typography teardown failed:', error)
+        }
         if (sharedMenuTimer !== null) {
           releaseTimer(sharedMenuTimer)
           sharedMenuTimer = null
@@ -1110,6 +1757,513 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /** Frozen stand-in for "no workspace pins", so the reference never moves. */
+      const NO_WORKSPACE_PINS = Object.freeze([])
+
+      /**
+       * The official pinned session ids, reference-stable while the set is
+       * unchanged: `useSyncExternalStore` compares snapshots by identity, so a
+       * fresh array per read would re-render every subscriber forever.
+       * @returns {readonly string[]} the pinned ids, in official order.
+       */
+      // Seeded with a real array, because an unpublished list answers
+      // `undefined` — the same value this cache holds before its first read,
+      // so an unseeded `ids` would be handed to callers as `null`.
+      const officialPinCache = { snapshot: undefined, ids: NO_WORKSPACE_PINS }
+      const officialPinnedIds = () => {
+        let snapshot
+        try {
+          snapshot = workspaces.list.getSnapshot()
+        } catch (error) {
+          warn(`official pin snapshot unreadable: ${describeError(error)}`)
+          return NO_WORKSPACE_PINS
+        }
+        if (snapshot !== officialPinCache.snapshot) {
+          officialPinCache.snapshot = snapshot
+          const raw = Array.isArray(snapshot?.pinnedSessionIds)
+            ? snapshot.pinnedSessionIds.map(String)
+            : []
+          const previous = officialPinCache.ids
+          officialPinCache.ids = previous.length === raw.length
+            && previous.every((id, index) => id === raw[index])
+            ? previous
+            : raw
+        }
+        return officialPinCache.ids
+      }
+
+      /**
+       * Write a pin through the official RPC and report a refusal. No optimistic
+       * update and no private-store fallback: the official list subscription is
+       * what repaints the surfaces.
+       * @param {string} id - the session.
+       * @param {boolean} want - true to pin, false to unpin.
+       * @returns {Promise<{ok: boolean}>} what the host said.
+       */
+      const applyOfficialPin = async (id, want) => {
+        const action = want ? pinSession : unpinSession
+        if (action === undefined) {
+          surfaceError(translate(
+            'pin.unavailable',
+            '本机工作区服务未提供置顶接口',
+          ), 'unavailable')
+          return { ok: false }
+        }
+        try {
+          await action(id)
+          return { ok: true }
+        } catch (error) {
+          if (alive()) {
+            surfaceError(`${want ? '置顶' : '取消置顶'}失败（${id}）：${describeError(error)}`, 'refused')
+          }
+          return { ok: false }
+        }
+      }
+
+      /** One facade per foreign pin controller, per shadow variant. */
+      const pinAdapters = new WeakMap()
+
+      /**
+       * A live view of a foreign pin face: official membership, official
+       * writes, the other controller's own store for everything else.
+       *
+       * The proxy forwards every other read to the ORIGINAL object and binds its
+       * methods to it, so row colours, tags and the workspace section keep
+       * resolving against live state, and nothing this facade does can write
+       * back into a store this plugin does not own.
+       * @param {any} pin - the foreign pin face.
+       * @param {boolean} pureSessionCount - true where the badge counts sessions only.
+       * @returns {any} the facade.
+       */
+      const makePinAdapter = (pin, pureSessionCount) => {
+        if (pin === null || typeof pin !== 'object') return pin
+        let variants = pinAdapters.get(pin)
+        if (variants === undefined) pinAdapters.set(pin, variants = {})
+        const variant = pureSessionCount ? 'count' : 'full'
+        if (variants[variant] !== undefined) return variants[variant]
+        const binds = new Map()
+        const overrides = {
+          getPinned: () => officialPinnedIds(),
+          isPinned: (id) => officialPinnedIds().includes(String(id)),
+          setPinned: (id, next) => applyOfficialPin(String(id), next !== false),
+          toggle: (id) => applyOfficialPin(
+            String(id),
+            !officialPinnedIds().includes(String(id)),
+          ),
+          // Merged, because the original controller also carries state of its
+          // own that its own surface must keep hearing about.
+          subscribe: (listener) => {
+            const stops = []
+            const attach = (source) => {
+              try {
+                const stop = source.subscribe(listener)
+                if (typeof stop === 'function') stops.push(stop)
+              } catch (error) {
+                warn(`could not merge a pin subscription: ${describeError(error)}`)
+              }
+            }
+            if (typeof pin.subscribe === 'function') attach(pin)
+            attach(workspaces.list)
+            let released = false
+            return () => {
+              if (released) return
+              released = true
+              for (const stop of stops) {
+                try {
+                  stop()
+                } catch (error) {
+                  warn(`could not release a merged pin subscription: ${describeError(error)}`)
+                }
+              }
+            }
+          },
+        }
+        if (pureSessionCount) overrides.getWorkspacePinned = () => NO_WORKSPACE_PINS
+        const adapter = new Proxy(pin, {
+          get(target, prop) {
+            if (Object.prototype.hasOwnProperty.call(overrides, prop)) return overrides[prop]
+            const value = Reflect.get(target, prop, target)
+            if (typeof value !== 'function') return value
+            let bound = binds.get(prop)
+            if (bound === undefined) {
+              bound = value.bind(target)
+              binds.set(prop, bound)
+            }
+            return bound
+          },
+          set(_target, prop, value) {
+            overrides[prop] = value
+            return true
+          },
+        })
+        variants[variant] = adapter
+        return adapter
+      }
+
+      /**
+       * Shadow the known foreign pin entries so their counts and lists read the
+       * official pin set. Registration, not mutation: the original entries are
+       * left exactly as they are, and every shadow is released on teardown.
+       */
+      const shadowOfficialCounts = () => {
+        let registry = undefined
+        try {
+          registry = ctx.get('slots')
+        } catch (error) {
+          warn(`slot registry lookup failed: ${describeError(error)}`)
+        }
+        if (registry === undefined) {
+          warn('no slot registry: foreign pin surfaces keep their own pin count')
+          return
+        }
+        if (typeof registry.register !== 'function'
+          || typeof registry.entries !== 'function'
+          || typeof registry.subscribe !== 'function') {
+          warn('slot registry has no public surface; foreign pin surfaces keep their own pin count')
+          return
+        }
+        const shadows = new Map()
+        let syncing = false
+        let resync = false
+        // Releasing a shadow notifies the registry, and a notify that lands
+        // while teardown is halfway through would re-register what teardown is
+        // releasing. Latched for the rest of this generation.
+        let disposing = false
+
+        /** @returns {object | undefined} the foreign entry this shadow belongs to. */
+        const findOriginal = (target) => {
+          let entries
+          try {
+            entries = registry.entries(target.name)
+          } catch (error) {
+            warn(`could not read slot "${target.name}": ${describeError(error)}`)
+            return undefined
+          }
+          return entries?.find(entry => entry?.options?.id === target.id
+            && entry.registrant !== SHADOW_REGISTRANT)
+        }
+
+        const release = (name) => {
+          const current = shadows.get(name)
+          if (current === undefined) return
+          shadows.delete(name)
+          try {
+            current.release()
+          } catch (error) {
+            warn(`could not release the "${name}" shadow: ${describeError(error)}`)
+          }
+        }
+
+        const sync = () => {
+          if (disposing) return
+          // Registering notifies, and this is called from that notification.
+          if (syncing) {
+            resync = true
+            return
+          }
+          syncing = true
+          try {
+            do {
+              resync = false
+              for (const target of OFFICIAL_COUNT_SLOTS) {
+                const original = findOriginal(target)
+                const current = shadows.get(target.name)
+                if (original === undefined) {
+                  release(target.name)
+                  continue
+                }
+                if (current !== undefined && current.original === original) continue
+                release(target.name)
+                if (typeof original.inject !== 'function') continue
+                // `children` / `store` are deliberately not copied: re-declaring
+                // them on a second entry is a load-time throw, and neither of
+                // these two entries declares one.
+                const options = {
+                  name: target.name,
+                  id: original.options.id,
+                  order: original.options.order,
+                  priority: (original.options.priority ?? 0) - 1,
+                  registrant: SHADOW_REGISTRANT,
+                  inject: (...args) => {
+                    const props = original.inject(...args)
+                    return { ...props, pin: makePinAdapter(props.pin, target.pureSessionCount) }
+                  },
+                }
+                try {
+                  shadows.set(target.name, {
+                    original,
+                    release: registry.register(options, original.component),
+                  })
+                } catch (error) {
+                  warn(`could not shadow "${target.name}": ${describeError(error)}`)
+                }
+              }
+            } while (resync)
+          } finally {
+            syncing = false
+          }
+        }
+
+        const unsubscribes = OFFICIAL_COUNT_SLOTS.map((target) => {
+          try {
+            return registry.subscribe(target.name, sync)
+          } catch (error) {
+            warn(`could not watch slot "${target.name}": ${describeError(error)}`)
+            return () => {}
+          }
+        })
+        disposers.push(() => {
+          disposing = true
+          for (const unsubscribe of unsubscribes.splice(0)) {
+            try {
+              unsubscribe()
+            } catch (error) {
+              warn(`could not release a slot watch: ${describeError(error)}`)
+            }
+          }
+          for (const name of [...shadows.keys()]) release(name)
+        })
+        sync()
+      }
+
+      shadowOfficialCounts()
+
+      /**
+       * Add ONE item to the stock sidebar's own session-row menu.
+       *
+       * The stock sidebar serves that menu from
+       * `sidebar.workspaces.session.menu.item` (`rows/Rows.tsx:681-685`), and
+       * the host registers its Pin item there as `{name, id: 'pin', order:
+       * 100, locale, inject, component}` (ui-sidebar `index.ts:285-289`). That
+       * is the ONLY place a colour entry can exist for an ordinary unpinned row
+       * on this host: there is no `contextmenu` surface to claim and the
+       * plugin-owned fallback only opens where no host menu can be borrowed.
+       *
+       * WHAT IT IS NOT. The host's Pin entry is not mutated, shadowed or
+       * replaced — it is left exactly as registered, and a SECOND, namespaced id
+       * is added next to it. The adapter reuses the host's own component and the
+       * host's own `inject` verbatim, so every hook, prop and behaviour is the
+       * host's; the adapter only swaps two functions and one label:
+       *
+       *   - `pinSession` AND `unpinSession` both become "open the colour dialog
+       *     for this session". The host's component calls `setMenuOpen(false)`
+       *     first and then whichever of the two applies, so overriding both is
+       *     what makes the item mean the same thing whichever state the row is
+       *     in. Neither business RPC is reachable from this item, by construction.
+       *   - `t` maps the two menu keys onto this plugin's own label and
+       *     delegates everything else to the host's translator, so no other item
+       *     in the same menu can be affected.
+       *
+       * The label override sits in the PROPS layer rather than in the locale
+       * namespace on purpose: the slot framework re-resolves `locale` last, so a
+       * translation injected at the entry level would win over ours and the item
+       * would say 置顶该会话.
+       *
+       * Degrades to nothing at all when the slot, the entry or a usable component
+       * is missing: the shared table and the row's own colour point are then the
+       * whole surface, which is what they were before.
+       *
+       * @returns {boolean} true when the item is registered right now.
+       */
+      const OFFICIAL_ROW_MENU_SLOT = 'sidebar.workspaces.session.menu.item'
+      const OFFICIAL_COLOR_ENTRY_ID = 'dsh-session-top.row-color'
+      /** Well after the host's own Pin item (order 100), so it reads last. */
+      const OFFICIAL_COLOR_ORDER = 450
+      const OFFICIAL_COLOR_REGISTRANT = 'dsh-session-top: official row colour'
+
+      /** @returns {string} this plugin's colour item label. */
+      const COLOR_MENU_LABEL = () => translate('menu.color', '自定义行背景颜色…')
+
+      /**
+       * A translator that owns exactly two keys and delegates the rest.
+       * @param {unknown} base - the host's own translator.
+       * @returns {(key: string, ...rest: unknown[]) => string} the adapter.
+       */
+      const colorMenuT = (base) => (key, ...rest) => {
+        if (key === 'menu.pinSession' || key === 'menu.unpinSession') return COLOR_MENU_LABEL()
+        try {
+          if (typeof base === 'function') {
+            const value = base(key, ...rest)
+            if (typeof value === 'string' && value.length > 0) return value
+          }
+        } catch { /* an untranslatable key falls through to itself, as the host does */ }
+        return String(key)
+      }
+
+      /**
+       * The element focus should go back to when the colour dialog closes.
+       *
+       * A menu closes by handing focus to whatever opened it, so a dialog opened
+       * from a menu that then vanishes has nothing to return to and focus lands
+       * on `<body>` — the keyboard user is dropped at the top of the page. Two
+       * candidates, in order: whatever currently holds focus (that IS the opener
+       * for every path that has one, because the host focused it to open the
+       * menu), and the host's own row for this session, reached through the
+       * proven tree rather than by a page-wide sweep.
+       *
+       * A row the host has already re-rendered is refused downstream by the
+       * `isConnected` check in `closeColorDialog`, which is the safe degradation.
+       *
+       * @param {string} id - the session whose colour is being edited.
+       * @returns {Element | null} a connected focus target, or null.
+       */
+      const openerFor = (id) => {
+        try {
+          const active = document.activeElement
+          if (active != null && active.isConnected !== false
+            && typeof active.focus === 'function'
+            && active.getAttribute?.(COLOR_DIALOG_ATTR) === null) return active
+        } catch { /* no document, or no focus model: the row lookup still stands */ }
+        try {
+          const tree = findTree(currentFlavor(Date.now()))
+          if (tree == null) return null
+          const row = tree.querySelector(`[data-row-key="session:${id}"]`)
+          if (row == null) return null
+          return row.isConnected === false ? null : row
+        } catch {
+          return null
+        }
+      }
+
+      /**
+       * Open the dialog for a session the host's menu just closed.
+       *
+       * Deferred one tick on purpose: the host's component has just closed its own
+       * menu, and a menu closing hands focus back to the row it was opened from —
+       * a dialog that focused its own field a tick earlier would lose it again.
+       * @param {string} id - the session.
+       */
+      const openColorDialogAfterMenuClose = (id) => {
+        afterDispatch(() => {
+          if (!alive()) return
+          if (typeof id !== 'string' || id.length === 0) return
+          openColorDialog(id, openerFor(id))
+        })
+      }
+
+      /**
+       * (Re)publish the colour item whenever the host's own Pin entry appears,
+       * changes or goes away.
+       *
+       * Same lifecycle as `shadowOfficialCounts` for the same reasons: apply
+       * order is not knowable, registration notifies, and a notify that lands
+       * while this is mid-sync is latched rather than re-entered.
+       * @returns {boolean} true when the item is in the slot afterwards.
+       */
+      const registerOfficialColorMenu = () => {
+        let registry = undefined
+        try {
+          registry = ctx.get('slots')
+        } catch (error) {
+          warn(`slot registry lookup failed: ${describeError(error)}`)
+        }
+        // No slot registry at all is a host without the surface, not a failure:
+        // the shared table and the colour point keep working.
+        if (registry === undefined) return false
+        if (typeof registry.register !== 'function'
+          || typeof registry.entries !== 'function'
+          || typeof registry.subscribe !== 'function') return false
+
+        const releases = new Map()
+        let syncing = false
+        let resync = false
+        let disposing = false
+
+        /** The host's own Pin entry, never this plugin's own registrations. */
+        const findPinEntry = () => {
+          let entries
+          try {
+            entries = registry.entries(OFFICIAL_ROW_MENU_SLOT)
+          } catch (error) {
+            warn(`could not read slot "${OFFICIAL_ROW_MENU_SLOT}": ${describeError(error)}`)
+            return undefined
+          }
+          return entries?.find(entry => entry?.options?.id === 'pin'
+            && entry.registrant !== SHADOW_REGISTRANT
+            && entry.registrant !== OFFICIAL_COLOR_REGISTRANT)
+        }
+
+        const release = (key) => {
+          const releaseOne = releases.get(key)
+          if (releaseOne === undefined) return
+          releases.delete(key)
+          try {
+            releaseOne()
+          } catch (error) {
+            warn(`could not release the official row-colour item: ${describeError(error)}`)
+          }
+        }
+
+        const sync = () => {
+          if (disposing) return
+          if (syncing) {
+            resync = true
+            return
+          }
+          syncing = true
+          try {
+            do {
+              resync = false
+              const original = findPinEntry()
+              if (original === undefined
+                || typeof original.component !== 'function'
+                || typeof original.inject !== 'function') {
+                for (const key of [...releases.keys()]) release(key)
+                continue
+              }
+              if (releases.has(original)) continue
+              for (const key of [...releases.keys()]) release(key)
+              // `children` / `store` are deliberately not re-declared: doing that
+              // is a load-time throw, and this entry declares neither.
+              const options = {
+                name: OFFICIAL_ROW_MENU_SLOT,
+                id: OFFICIAL_COLOR_ENTRY_ID,
+                order: OFFICIAL_COLOR_ORDER,
+                locale: original.options?.locale,
+                registrant: OFFICIAL_COLOR_REGISTRANT,
+                inject: (...args) => {
+                  const props = original.inject(...args)
+                  const openColor = (id) => { openColorDialogAfterMenuClose(id) }
+                  return { ...props, pinSession: openColor, unpinSession: openColor }
+                },
+              }
+              try {
+                releases.set(original, registry.register(options, function DshSessionTopRowColor(props) {
+                  return original.component({ ...props, t: colorMenuT(props?.t) })
+                }))
+              } catch (error) {
+                warn(`could not register the official row-colour item: ${describeError(error)}`)
+              }
+            } while (resync)
+          } finally {
+            syncing = false
+          }
+        }
+
+        const unsubscribes = [OFFICIAL_ROW_MENU_SLOT].map((slotName) => {
+          try {
+            const one = registry.subscribe(slotName, sync)
+            return typeof one === 'function' ? one : () => {}
+          } catch (error) {
+            warn(`could not watch slot "${slotName}": ${describeError(error)}`)
+            return () => {}
+          }
+        })
+        disposers.push(() => {
+          disposing = true
+          for (const unsubscribe of unsubscribes.splice(0)) {
+            try {
+              unsubscribe()
+            } catch (error) {
+              warn(`could not release the row-colour slot watch: ${describeError(error)}`)
+            }
+          }
+          for (const key of [...releases.keys()]) release(key)
+        })
+        sync()
+        return releases.size > 0
+      }
+
       /**
        * @returns {{workspaceId: string, title: string, sessionIds: string[]}[]} the workspace projection.
        */
@@ -1286,6 +2440,67 @@ window.__ModuleLoader__.load({
       let noticeEl = null
 
       /**
+       * The tree element currently carrying `TYPOGRAPHY_ATTR`, or null.
+       *
+       * The single source of truth for "what this plugin marked", so clearing
+       * can never reach an element it did not mark. A host node that was never
+       * marked has nothing to remove, and a host node that IS removed is
+       * skipped by the `isConnected` guard below.
+       */
+      let typographyMarked = null
+
+      /**
+       * Take the typography marker back off whatever element this plugin put it
+       * on.
+       *
+       * Removes only its OWN attribute — never a node, never a class, never
+       * anything else the host rendered — so a sidebar that unmounted, swapped
+       * or collapsed is left byte-for-byte as it was found.
+       */
+      const clearTypography = () => {
+        if (typographyMarked === null) return
+        const el = typographyMarked
+        typographyMarked = null
+        if (typeof el?.removeAttribute !== 'function') return
+        try {
+          if (el.getAttribute?.(TYPOGRAPHY_ATTR) !== null) el.removeAttribute(TYPOGRAPHY_ATTR)
+        } catch { /* the element went with its tree; there is nothing left to own */ }
+      }
+
+      /**
+       * Mark the identified tree — or unmark, when there is none.
+       *
+       * Three properties this must have, all of them load-bearing:
+       *
+       *   - IDEMPOTENT. An unchanged tree is a no-op return, not a rewrite. The
+       *     observer watches childList only, so a repeated attribute write
+       *     would not loop — but "assign when the value differs" is the same
+       *     rule the rest of this file already follows for rendered rows, and
+       *     an idle pass that touches the DOM is a pass that can be the reason
+       *     the next one is needed.
+       *   - EXCLUSIVE. Switching trees clears the previous one in the same
+       *     call, so two trees are never marked at once and a sidebar swap
+       *     leaves no orphan marker behind.
+       *   - HANDS BACK. Called with null on every path that un-proves the
+       *     sidebar (unknown flavor, no tree, unmounted host) and from
+       *     `teardown`, so "marked" never outlives "identified".
+       *
+       * @param {Element | null} tree - the proven tree element, or null.
+       */
+      const markTypography = (tree) => {
+        if (typographyMarked === tree) return
+        clearTypography()
+        if (tree === null || tree === undefined) return
+        try {
+          tree.setAttribute(TYPOGRAPHY_ATTR, '')
+          typographyMarked = tree
+        } catch {
+          // A tree that refuses attributes is one the rules must not address.
+          // Leaving it unmarked keeps the scope honest instead of widening it.
+        }
+      }
+
+      /**
        * Create (once) the region, the context-menu host and the notice host,
        * all plugin-owned.
        *
@@ -1432,6 +2647,657 @@ window.__ModuleLoader__.load({
       })
 
       /**
+       * What this mount last saw in storage, by session.
+       *
+       * A CACHE, never the truth. The same preference is normally open in two
+       * windows of the same origin, and each of them filled this map when it
+       * mounted — so whichever mounted first has been holding a stale copy ever
+       * since. Nothing is written out of this map directly: freshness is
+       * re-established from storage at every settled write, and from another
+       * window's `storage` event in between.
+       */
+      const rowColors = new Map()
+      let rowColorsLoaded = false
+
+      /**
+       * Colours a picker is dragging RIGHT NOW, by session.
+       *
+       * A native colour input fires `input` per pixel of the drag. Those are
+       * previews, not choices: painting them is the whole point of the control,
+       * persisting them is a synchronous storage write per pixel. The id is
+       * dropped the moment the drag settles, which is also what lets a foreign
+       * window's `storage` event repaint every OTHER row without yanking the
+       * colour out from under the pointer.
+       */
+      const previewRowColors = new Map()
+
+      /**
+       * The validated colour map, read from storage RIGHT NOW.
+       *
+       * Every entry goes through `normalizeRowColor`, so nothing unvalidated
+       * can reach the stylesheet. Bad JSON, an array, a non-object, a refused
+       * storage — all of them answer "no colours", which is the same answer as
+       * an empty map and never a failure to report.
+       * @returns {Map<string, string>} a FRESH map, which the caller owns.
+       */
+      const readRowColors = () => {
+        const colors = new Map()
+        try {
+          const raw = globalThis.localStorage?.getItem?.(ROW_COLORS_STORAGE_KEY)
+          if (typeof raw !== 'string' || raw.length === 0) return colors
+          const parsed = JSON.parse(raw)
+          if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return colors
+          for (const [id, value] of Object.entries(parsed)) {
+            const color = normalizeRowColor(value)
+            if (color !== null) colors.set(id, color)
+          }
+        } catch { /* not a colour map, not a failure */ }
+        return colors
+      }
+
+      /** Replace the cache with what storage holds at this instant. */
+      const adoptRowColors = () => {
+        rowColors.clear()
+        for (const [id, color] of readRowColors()) rowColors.set(id, color)
+      }
+
+      /**
+       * Fill the cache once, for the first paint.
+       *
+       * Deliberately read-once: a reconcile repaints every row, so re-reading
+       * storage per row per reconcile would turn an ordinary redraw into a
+       * storage read storm. Freshness is re-established at the two points that
+       * actually matter instead — a settled write, and another window's
+       * `storage` event.
+       */
+      const loadRowColors = () => {
+        if (rowColorsLoaded) return
+        rowColorsLoaded = true
+        adoptRowColors()
+      }
+
+      /**
+       * Persist the whole map, under this plugin's key only.
+       *
+       * Reports whether the write actually LANDED. A browser that refuses
+       * storage (private mode, disabled site data, quota) is a normal state and
+       * the colour still shows — but "shows until reload" is not the promise the
+       * dialog makes, so the caller is told rather than left to guess.
+       * @returns {boolean} true when the map is now in storage.
+       */
+      const writeRowColors = () => {
+        try {
+          const store = globalThis.localStorage
+          if (store === undefined || store === null || typeof store.setItem !== 'function') return false
+          store.setItem(ROW_COLORS_STORAGE_KEY, JSON.stringify(Object.fromEntries(rowColors)))
+          return true
+        } catch {
+          return false
+        }
+      }
+
+      /**
+       * Settle a colour for one session and persist it.
+       *
+       * The merge is the whole point. This used to put the in-memory map back
+       * verbatim, so two windows on one origin — each holding the map it loaded
+       * at mount — meant the second write erased the first one's colour. That
+       * is the ordinary case of the same preference open twice, not a rare
+       * race. So the latest validated map is read from storage AGAIN here, only
+       * THIS id is changed on it, and that is what gets written; the in-memory
+       * copy is refreshed from the result rather than from the gesture.
+       *
+       * What this does NOT do is pretend localStorage has a transaction. Two
+       * contexts that write the same key in the same instant are still
+       * last-writer-wins and nothing at this level can change that; what is
+       * fixed here is the far more common case of a map that was ALREADY stale
+       * when the gesture began.
+       *
+       * @param {string} id - the session.
+       * @param {unknown} value - the chosen colour, or anything invalid.
+       */
+      const commitRowColor = (id, value) => {
+        const next = readRowColors()
+        const color = normalizeRowColor(value)
+        // A clear deletes THIS id and nothing else, so no session's colour is
+        // ever thrown away because another one was cleared.
+        if (color === null) next.delete(id)
+        else next.set(id, color)
+        rowColors.clear()
+        for (const [entryId, entryColor] of next) rowColors.set(entryId, entryColor)
+        return writeRowColors()
+      }
+
+      /**
+       * Record a colour (or the absence of one) for one session and repaint it.
+       *
+       * Every caller is a SETTLED gesture — the picker's `change`, a
+       * Shift-click, a Delete. A drag still in progress goes through
+       * `previewRowColor` instead and never reaches storage.
+       * @param {Element} row - the row that owns the control.
+       * @param {string} id - the session.
+       * @param {unknown} value - the chosen colour, or anything invalid.
+       */
+      const setRowColor = (row, id, value) => {
+        previewRowColors.delete(id)
+        commitRowColor(id, value)
+        paintRowColor(row, id)
+        // The same colour also belongs on the HOST's row for this session, which
+        // is where an unpinned session actually lives.
+        reconcileHostRowColors(currentFlavor(Date.now()))
+      }
+
+      /**
+       * Show the colour the user is still choosing. Nothing is persisted.
+       * @param {Element} row - the row that owns the control.
+       * @param {string} id - the session.
+       * @param {unknown} value - the colour under the pointer right now.
+       */
+      const previewRowColor = (row, id, value) => {
+        const color = normalizeRowColor(value)
+        if (color === null) previewRowColors.delete(id)
+        else previewRowColors.set(id, color)
+        paintRowColor(row, id)
+      }
+
+      /**
+       * Another window on this origin changed our colours. Repaint.
+       *
+       * Without this the two windows only ever agree on a reload, which is not
+       * agreement — the user picks a colour in one, watches the other keep the
+       * old one, and picks again.
+       *
+       * Three things it deliberately does NOT do:
+       *
+       *   - answer with a write. Handling a foreign write by writing is how a
+       *     `storage` listener becomes an echo, and an echo storm between two
+       *     windows is worse than being one reconcile stale.
+       *   - touch a row whose picker is open. That row is showing a colour
+       *     nobody has committed yet; overwriting it mid-drag takes the colour
+       *     out from under the pointer. Its session's stored value is still
+       *     read, so the write that ends the drag merges correctly.
+       *   - care about any other key. Another plugin's preferences, the host's,
+       *     this host's own storage — none of them are ours to interpret, and
+       *     none of them are ours to write to.
+       *
+       * @param {StorageEvent} event - the foreign write.
+       */
+      const onRowColorsStorage = (event) => {
+        if (!alive()) return
+        if (event?.key !== ROW_COLORS_STORAGE_KEY) return
+        adoptRowColors()
+        for (const [id, row] of renderedRows) {
+          if (previewRowColors.has(id)) continue
+          paintRowColor(row, id)
+        }
+        reconcileHostRowColors(currentFlavor(Date.now()))
+      }
+
+      /**
+       * Put a session's colour onto its row, in place.
+       *
+       * The value travels as a custom property the stylesheet mixes, and the
+       * presence attribute selects the coloured rules — no string is ever
+       * interpolated into CSS. Every write is guarded: an assignment that does
+       * not change the value is still a mutation this plugin's observer sees.
+       *
+       * @param {Element} row - the row node.
+       * @param {string} id - the session.
+       */
+      const paintRowColor = (row, id) => {
+        // A drag in progress wins over the stored value: it is what the user is
+        // looking at right now, and it is not committed yet.
+        const color = previewRowColors.has(id)
+          ? previewRowColors.get(id)
+          : (rowColors.get(id) ?? null)
+        try {
+          const wanted = color ?? EMPTY_SWATCH_HEX
+          if ((row.style?.getPropertyValue?.('--stp-row-color') ?? '').trim() !== wanted) {
+            row.style.setProperty('--stp-row-color', wanted)
+          }
+        } catch { /* a renderer that refuses the property still gets the attribute */ }
+        if (color === null) {
+          if (row.hasAttribute(ROW_COLOR_ATTR)) row.removeAttribute(ROW_COLOR_ATTR)
+        } else if (row.getAttribute(ROW_COLOR_ATTR) !== color) {
+          row.setAttribute(ROW_COLOR_ATTR, color)
+        }
+        const swatch = row.querySelector?.('[data-stp-row-color]')
+        if (swatch === null || swatch === undefined) return
+        if (color === null) {
+          if (swatch.hasAttribute(SWATCH_SET_ATTR)) swatch.removeAttribute(SWATCH_SET_ATTR)
+        } else if (swatch.hasAttribute(SWATCH_SET_ATTR) !== true) {
+          swatch.setAttribute(SWATCH_SET_ATTR, '')
+        }
+        // The native input is the picker: it must open on what the row actually
+        // carries, or a reload hands the user a stale or blank swatch.
+        const input = swatch.querySelector?.('[data-stp-color-input]')
+        if (input !== null && input !== undefined) {
+          const wanted = color ?? EMPTY_SWATCH_HEX
+          if (input.value !== wanted) input.value = wanted
+        }
+        // A plain click always PICKS, so the name says that in both states; the
+        // way back to the default is named too.
+        const label = color === null
+          ? '设置背景颜色（Shift+点击或按 Delete 恢复默认）'
+          : `设置背景颜色，当前 ${color}（Shift+点击或按 Delete 恢复默认）`
+        if (swatch.getAttribute('aria-label') !== label) swatch.setAttribute('aria-label', label)
+      }
+
+      /**
+       * Host rows this mount has painted, so every mark can be handed back — on a
+       * colour that was cleared, on a row the host unmounted, and on teardown.
+       * @type {Set<Element>}
+       */
+      const hostPaintedRows = new Set()
+
+      /** The dialog this mount has open, or null. At most one, ever. */
+      let colorDialog = null
+
+      /** @returns {string} the dialog's own name. */
+      const COLOR_DIALOG_LABEL = () => translate('color.dialog', '自定义行背景颜色')
+      /** @returns {string} the hex field's own name. */
+      const COLOR_HEX_LABEL = () => translate('color.hex', '六位十六进制颜色，例如 #1a2b3c')
+
+      /**
+       * Put a session's colour on the HOST's own row, or take it off.
+       *
+       * The same `rowColors` map, the same attribute, the same custom property
+       * and therefore the same stylesheet rule as a pinned row's — the only
+       * difference is which element carries them. Nothing is written for a row
+       * that has no colour, so an idle sidebar is left exactly as the host drew
+       * it, and every write is compare-and-set so a repeated pass is silent.
+       *
+       * @param {Element} row - a host session row.
+       * @param {string} id - the session.
+       */
+      const paintHostRowColor = (row, id) => {
+        const color = rowColors.get(id) ?? null
+        try {
+          const current = (row.style?.getPropertyValue?.('--stp-row-color') ?? '').trim()
+          if (color === null) {
+            if (current !== '') row.style.removeProperty('--stp-row-color')
+          } else if (current !== color) {
+            row.style.setProperty('--stp-row-color', color)
+          }
+        } catch { /* the attribute alone still selects the coloured rules */ }
+        try {
+          if (color === null) {
+            if (row.hasAttribute?.(ROW_COLOR_ATTR) === true) row.removeAttribute(ROW_COLOR_ATTR)
+          } else if (row.getAttribute?.(ROW_COLOR_ATTR) !== color) {
+            row.setAttribute(ROW_COLOR_ATTR, color)
+            hostPaintedRows.add(row)
+          }
+        } catch { /* a row that refuses attributes keeps the host's own look */ }
+        if (color === null) hostPaintedRows.delete(row)
+      }
+
+      /** Hand one host row back, in place, whatever it had of ours. */
+      const unpaintHostRow = (row) => {
+        try {
+          if (row.getAttribute?.(ROW_COLOR_ATTR) !== null) row.removeAttribute(ROW_COLOR_ATTR)
+          if ((row.style?.getPropertyValue?.('--stp-row-color') ?? '') !== '') {
+            row.style.removeProperty('--stp-row-color')
+          }
+        } catch { /* nothing of ours is left on it */ }
+        hostPaintedRows.delete(row)
+      }
+
+      /** Take every host-row mark back. Called on dispose and on no-proof paths. */
+      const clearHostRowColors = () => {
+        for (const row of [...hostPaintedRows]) unpaintHostRow(row)
+        hostPaintedRows.clear()
+      }
+
+      /**
+       * Repaint every host session row of the current sidebar from the map.
+       *
+       * Scoped twice, exactly like every other host rule in this plugin: the
+       * rows are looked up with the DETECTED flavor's own selector and then
+       * under the ONE tree `findTree` proved, so a search tree, a file tree or
+       * any third-party list that happens to share the shape is never touched.
+       * No colour is written for a row that has none.
+       *
+       * @param {object | null} flavor - the detected sidebar, or null.
+       */
+      const reconcileHostRowColors = (flavor) => {
+        if (flavor === null) {
+          clearHostRowColors()
+          return
+        }
+        const tree = findTree(flavor)
+        if (tree === null) {
+          clearHostRowColors()
+          return
+        }
+        let rows = null
+        try {
+          rows = tree.querySelectorAll(flavor.sessionSelector)
+        } catch (error) {
+          warn(`host session rows unreadable: ${describeError(error)}`)
+          return
+        }
+        loadRowColors()
+        const live = new Set()
+        for (const row of rows) {
+          let id = null
+          try { id = flavor.sessionIdOf(row) } catch { continue }
+          if (id === undefined) continue
+          live.add(row)
+          paintHostRowColor(row, id)
+        }
+        for (const row of [...hostPaintedRows]) {
+          if (live.has(row) !== true) unpaintHostRow(row)
+        }
+      }
+
+      /**
+       * Repaint one session's colour everywhere it is on screen — its pinned row
+       * and the host's own row for the same session. Used by the menu paths,
+       * which name a session and may not have a row of ours in hand at all.
+       * @param {string} id - the session.
+       */
+      const paintSessionColor = (id) => {
+        loadRowColors()
+        const own = renderedRows.get(id)
+        if (own !== undefined) paintRowColor(own, id)
+        reconcileHostRowColors(currentFlavor(Date.now()))
+      }
+
+      /**
+       * The plugin's own colour dialog: one element, one session, opened from the
+       * row's colour point OR from any menu entry that names a session id.
+       *
+       * WHY IT EXISTS. `input[type=color].click()` is a gesture, not an interface:
+       * it cannot be driven from a menu, it cannot be typed into, and it gives a
+       * person no way to see or correct a value. So the six-digit hex box is the
+       * control and the native swatch is the helper, and both commit through the
+       * SAME `commitRowColor` the old path used — one data source, one validation,
+       * one merge.
+       *
+       * NOTHING IS STORED UNTIL 应用 OR 恢复默认. Typing moves the helper swatch
+       * only; Escape, 取消 and clicking away all store nothing at all.
+       *
+       * A refused storage is NOT swallowed here: the colour is painted, the
+       * dialog closes, and the user is told it will not survive a reload. A
+       * silent "applied" that forgets itself is the one outcome this plugin's own
+       * degradation contract exists to avoid.
+       *
+       * @param {string} sessionId - the session being coloured.
+       * @param {Element | null} [opener] - what gets focus back on close.
+       * @returns {Element | null} the dialog element, or null when it could not open.
+       */
+      const openColorDialog = (sessionId, opener = null) => {
+        if (!alive()) return null
+        if (typeof sessionId !== 'string' || sessionId.length === 0) return null
+        closeColorDialog()
+        loadRowColors()
+        const initial = rowColors.get(sessionId) ?? EMPTY_SWATCH_HEX
+
+        const el = document.createElement('div')
+        el.setAttribute(COLOR_DIALOG_ATTR, '')
+        el.setAttribute('role', 'dialog')
+        el.setAttribute('aria-modal', 'false')
+        el.setAttribute('aria-label', COLOR_DIALOG_LABEL())
+        // `data-plugin` is what the plugin's own observer filter recognises, so
+        // building this surface cannot schedule a reconcile of its own.
+        el.setAttribute('data-plugin', PLUGIN_ID)
+        el.setAttribute('data-stp-session', sessionId)
+
+        const title = document.createElement('div')
+        title.setAttribute('data-stp-color-dialog-title', '')
+        title.textContent = COLOR_DIALOG_LABEL()
+        el.appendChild(title)
+
+        const field = document.createElement('div')
+        field.setAttribute('data-stp-color-dialog-field', '')
+        const hex = document.createElement('input')
+        hex.setAttribute(COLOR_HEX_ATTR, '')
+        hex.setAttribute('type', 'text')
+        hex.setAttribute('inputmode', 'text')
+        hex.setAttribute('autocomplete', 'off')
+        hex.setAttribute('spellcheck', 'false')
+        hex.setAttribute('aria-label', COLOR_HEX_LABEL())
+        hex.value = initial
+        const native = document.createElement('input')
+        native.setAttribute(COLOR_NATIVE_ATTR, '')
+        native.setAttribute('type', 'color')
+        native.setAttribute('aria-hidden', 'true')
+        native.setAttribute('tabindex', '-1')
+        try { native.value = initial } catch { /* the helper is optional by design */ }
+        field.appendChild(hex)
+        field.appendChild(native)
+        el.appendChild(field)
+
+        const error = document.createElement('div')
+        error.setAttribute(COLOR_ERROR_ATTR, '')
+        error.setAttribute('role', 'status')
+        error.setAttribute('hidden', '')
+        el.appendChild(error)
+
+        /** Say what is wrong, in the field itself, without closing anything. */
+        const showError = (message) => {
+          if (error.textContent !== message) error.textContent = message
+          try {
+            if (message === '') error.setAttribute('hidden', '')
+            else error.removeAttribute('hidden')
+          } catch { /* the message is still readable either way */ }
+          hex.setAttribute('aria-invalid', message === '' ? 'false' : 'true')
+        }
+
+        const actions = document.createElement('div')
+        actions.setAttribute('data-stp-color-dialog-actions', '')
+        const button = (attr, label) => {
+          const node = document.createElement('button')
+          node.setAttribute(COLOR_BUTTON_ATTR, '')
+          node.setAttribute(attr, '')
+          node.setAttribute('type', 'button')
+          node.setAttribute('data-plugin', PLUGIN_ID)
+          node.textContent = label
+          return node
+        }
+        const applyBtn = button(COLOR_APPLY_ATTR, translate('color.apply', '应用'))
+        const cancelBtn = button(COLOR_CANCEL_ATTR, translate('color.cancel', '取消'))
+        const resetBtn = button(COLOR_RESET_ATTR, translate('color.reset', '恢复默认'))
+        actions.appendChild(resetBtn)
+        actions.appendChild(cancelBtn)
+        actions.appendChild(applyBtn)
+        el.appendChild(actions)
+
+        // The one settle path every button, Escape and Enter goes through.
+        const commit = (value) => {
+          // A dialog that outlived its mount must not write: `closeColorDialog`
+          // removed the node, and nothing on this page is listening any more.
+          if (!alive()) return
+          const color = normalizeRowColor(value)
+          if (color === null && value !== null) {
+            showError(translate('color.invalid', '请输入六位十六进制颜色，例如 #1a2b3c'))
+            return
+          }
+          const stored = commitRowColor(sessionId, color)
+          previewRowColors.delete(sessionId)
+          paintSessionColor(sessionId)
+          closeColorDialog()
+          if (!alive()) return
+          if (stored !== true) {
+            surfaceError(translate(
+              'color.unavailable',
+              '本机浏览器拒绝写入本地存储，颜色只在本次生效',
+            ), 'unavailable')
+          }
+        }
+
+        applyBtn.addEventListener('click', (event) => {
+          event.preventDefault()
+          event.stopPropagation()
+          commit(hex.value)
+        })
+        resetBtn.addEventListener('click', (event) => {
+          event.preventDefault()
+          event.stopPropagation()
+          commit(null)
+        })
+        cancelBtn.addEventListener('click', (event) => {
+          event.preventDefault()
+          event.stopPropagation()
+          closeColorDialog()
+        })
+        // The native swatch is a helper for the same value: it drives the box,
+        // never storage.
+        native.addEventListener('input', (event) => {
+          event.stopPropagation()
+          hex.value = native.value
+          showError('')
+        })
+        native.addEventListener('change', (event) => {
+          event.stopPropagation()
+          hex.value = native.value
+          showError('')
+        })
+        el.addEventListener('keydown', (event) => {
+          // This surface is outside the sidebar's own key handling, and the host
+          // listens in the capture phase, so nothing here can be relied on to
+          // stop at this node: only stopping it ourselves closes the question.
+          event.stopPropagation()
+          if (event.key === 'Escape') {
+            event.preventDefault()
+            closeColorDialog()
+            return
+          }
+          if (event.key === 'Enter') {
+            // ONLY from the hex field or the native swatch. The dialog has three
+            // buttons, and Enter on 取消 or 恢复默认 is the keyboard way to press
+            // THAT button — swallowing it and committing the colour instead made
+            // the keyboard cancel and reset silently save. A focused button keeps
+            // its own native activation, which is what Enter already does.
+            const target = event.target
+            const tag = target?.tagName
+            if (tag !== undefined && tag !== null && String(tag).toUpperCase() === 'BUTTON') return
+            event.preventDefault()
+            commit(hex.value)
+          }
+        })
+        // The dialog is appended to `body`, never to a row, but a click inside
+        // it must never reach the sidebar's own row handlers either.
+        el.addEventListener('click', (event) => { event.stopPropagation() })
+
+        try {
+          document.body?.appendChild(el)
+        } catch (error) {
+          warn(`could not open the colour dialog: ${describeError(error)}`)
+          return null
+        }
+        placeDialog(el)
+        colorDialog = { el, opener: opener ?? null }
+        try { hex.focus?.() } catch { /* focus is a nicety, not a contract */ }
+        return el
+      }
+
+      /**
+       * Close the dialog, if one is open, and hand focus back to its opener.
+       * Safe from anywhere and any number of times.
+       */
+      const closeColorDialog = () => {
+        const open = colorDialog
+        if (open === null) return
+        colorDialog = null
+        try { open.el.remove() } catch { /* already gone with the document */ }
+        const opener = open.opener
+        // Only a focus that is still in the document can be given back; a row the
+        // host re-rendered is not a target.
+        if (opener === null || opener === undefined) return
+        if (opener.isConnected === false) return
+        try { opener.focus?.() } catch { /* focus is a nicety, not a contract */ }
+      }
+
+      /**
+       * Put the dialog in the middle of the viewport.
+       *
+       * Percentages are avoided deliberately: the menu's own placement is a
+       * measured pixel nudge for the same reason, and a dialog placed by
+       * transform cannot be measured by anything that is not a browser.
+       * @param {Element} surface - the dialog element.
+       */
+      const placeDialog = (surface) => {
+        try {
+          const style = surface.style
+          if (style === undefined || style === null) return
+          const width = surface.offsetWidth ?? 0
+          const height = surface.offsetHeight ?? 0
+          const viewportWidth = globalThis.innerWidth ?? 0
+          const viewportHeight = globalThis.innerHeight ?? 0
+          const left = viewportWidth > 0 ? Math.max(0, Math.round((viewportWidth - width) / 2)) : 80
+          const top = viewportHeight > 0 ? Math.max(0, Math.round((viewportHeight - height) / 2)) : 80
+          style.setProperty('left', `${left}px`)
+          style.setProperty('top', `${top}px`)
+        } catch (error) {
+          warn(`could not place the colour dialog: ${describeError(error)}`)
+        }
+      }
+
+      /**
+       * The colour point at a row's trailing edge, and the native control
+       * behind it.
+       *
+       * A `span[role="button"]`, never a `<button>`: the shared owner recognises
+       * a session row by a `button[aria-label]` descendant, so a real button
+       * here would make it resolve the CURRENT session instead of the clicked
+       * one. The input is `aria-hidden` and off the tab order, so the accessible
+       * control is the swatch and there is exactly one.
+       *
+       * @param {Element} row - the row the swatch belongs to.
+       * @param {string} id - the session this row is for.
+       * @returns {Element} the swatch.
+       */
+      const makeColorSwatch = (row, id) => {
+        const swatch = document.createElement('span')
+        swatch.setAttribute(SWATCH_ATTR, '')
+        swatch.setAttribute('role', 'button')
+        swatch.setAttribute('tabindex', '0')
+        swatch.setAttribute('title', '背景颜色：点击选择，Shift+点击或按 Delete 恢复默认')
+
+        const input = document.createElement('input')
+        input.setAttribute('data-stp-color-input', '')
+        input.setAttribute('type', 'color')
+        input.setAttribute('aria-hidden', 'true')
+        input.setAttribute('tabindex', '-1')
+        input.setAttribute('value', EMPTY_SWATCH_HEX)
+        try { input.value = EMPTY_SWATCH_HEX } catch { /* the attribute carries it */ }
+        swatch.appendChild(input)
+
+        /** Open the plugin's own colour dialog for this session. */
+        const pick = () => { openColorDialog(id, swatch) }
+        swatch.addEventListener('click', (event) => {
+          event.preventDefault()
+          event.stopPropagation()
+          if (event.shiftKey === true) setRowColor(row, id, null)
+          else pick()
+        })
+        swatch.addEventListener('keydown', (event) => {
+          if (event.key !== 'Enter' && event.key !== ' ' && event.key !== 'Delete' && event.key !== 'Backspace') return
+          event.preventDefault()
+          event.stopPropagation()
+          if (event.shiftKey === true) setRowColor(row, id, null)
+          else if (event.key === 'Delete' || event.key === 'Backspace') setRowColor(row, id, null)
+          else pick()
+        })
+        // The input lives INSIDE the row, so every event it produces has to be
+        // stopped on the way out or it opens the session behind the picker.
+        input.addEventListener('click', (event) => { event.stopPropagation() })
+        input.addEventListener('keydown', (event) => { event.stopPropagation() })
+        // `input` fires once per pixel of a drag: paint it, remember nothing.
+        // `change` is the gesture that ends, and it is the one that persists.
+        input.addEventListener('input', (event) => {
+          event.stopPropagation()
+          previewRowColor(row, id, input.value)
+        })
+        input.addEventListener('change', (event) => {
+          event.stopPropagation()
+          setRowColor(row, id, input.value)
+        })
+        return swatch
+      }
+
+      /**
        * Build one plugin-owned row node.
        *
        * Deliberately carries NO flavor marker. A `data-row-key="session:…"` or
@@ -1480,6 +3346,9 @@ window.__ModuleLoader__.load({
           openSession(ctx, id)
         })
         row.addEventListener('keydown', (event) => {
+          // A key aimed at a control INSIDE the row belongs to that control;
+          // without this, a Delete on the colour swatch opens the session.
+          if (event.target !== row) return
           if (event.key !== 'Enter' && event.key !== ' ') return
           event.preventDefault()
           event.stopPropagation()
@@ -1505,6 +3374,11 @@ window.__ModuleLoader__.load({
           cell.textContent = time
           row.appendChild(cell)
         }
+        // The colour point is last, and painted from storage on the FIRST
+        // render: a colour chosen in a previous session is on screen at once.
+        loadRowColors()
+        row.appendChild(makeColorSwatch(row, id))
+        paintRowColor(row, id)
         return row
       }
 
@@ -1543,6 +3417,54 @@ window.__ModuleLoader__.load({
       let regionHeaderLabelEl = null
 
       /**
+       * The remembered fold for this mount, or `null` until a header exists.
+       *
+       * Read once, then the user's. It is deliberately NOT in
+       * `regionSignature`: a fold is a preference, and a reconcile that
+       * re-applied the default would slam the region shut on them.
+       */
+      let regionCollapsed = null
+
+      /** Push the fold onto the region and its control. Idempotent. */
+      const applyRegionFold = () => {
+        if (regionEl === null || regionHeaderEl === null) return
+        const collapsed = regionCollapsed === true
+        if (regionEl.getAttribute(REGION_COLLAPSED_ATTR) !== String(collapsed)) {
+          regionEl.setAttribute(REGION_COLLAPSED_ATTR, String(collapsed))
+        }
+        if (regionHeaderEl.getAttribute('aria-expanded') !== String(!collapsed)) {
+          regionHeaderEl.setAttribute('aria-expanded', String(!collapsed))
+        }
+        const caret = regionHeaderEl.querySelector('[data-stp-region-caret]')
+        const glyph = collapsed === true ? '▸' : '▾'
+        if (caret !== null && caret.textContent !== glyph) caret.textContent = glyph
+      }
+
+      /**
+       * The user's fold. Stopped on the way out: this gesture belongs to this
+       * control alone and can never open a session or touch the pin set.
+       * @param {Event} event - the activating event.
+       */
+      function onRegionHeaderActivate(event) {
+        if (!alive() || regionHeaderEl === null) return
+        event.preventDefault()
+        event.stopPropagation()
+        regionCollapsed = regionCollapsed !== true
+        writeRegionCollapsed(regionCollapsed)
+        applyRegionFold()
+      }
+
+      /**
+       * Enter and Space on the header. It is a `role="button"`, not a native
+       * `<button>`, so nothing synthesizes these clicks for us.
+       * @param {Event} event - the key event.
+       */
+      function onRegionHeaderKey(event) {
+        if (event.key !== 'Enter' && event.key !== ' ') return
+        onRegionHeaderActivate(event)
+      }
+
+      /**
        * Write a row's time cell, creating or removing it only as needed.
        *
        * Split out of `updateRow` because the label is also refreshed on its own
@@ -1564,7 +3486,10 @@ window.__ModuleLoader__.load({
           cell.setAttribute('data-stp-row-time', '')
           cell.setAttribute('aria-hidden', 'true')
           cell.textContent = time
-          row.appendChild(cell)
+          // Ahead of the trailing colour point, exactly where a first render
+          // puts it: appending here would land the time AFTER it on the rows
+          // whose summary arrived without a timestamp.
+          row.insertBefore(cell, row.querySelector(`[${SWATCH_ATTR}]`) ?? null)
           return
         }
         if (cell.textContent !== time) cell.textContent = time
@@ -1583,7 +3508,8 @@ window.__ModuleLoader__.load({
        * @param {boolean} selected - whether this is the retained session.
        */
       const updateRow = (row, summary, selected) => {
-        const title = rowFields(row.getAttribute('data-stp-session'), summary).title
+        const id = row.getAttribute('data-stp-session')
+        const title = rowFields(id, summary).title
         const label = row.querySelector('[data-stp-row-title]')
         if (label !== null) {
           if (label.textContent !== title) label.textContent = title
@@ -1595,6 +3521,10 @@ window.__ModuleLoader__.load({
         } else if (row.hasAttribute('aria-current')) {
           row.removeAttribute('aria-current')
         }
+        // Repainted from the map, never from a stale DOM read, so an update
+        // can neither lose a colour nor invent one. Writes are guarded inside.
+        loadRowColors()
+        paintRowColor(row, id)
       }
 
       // ---------------------------------------------- relative-time refresh
@@ -1778,6 +3708,11 @@ window.__ModuleLoader__.load({
         for (const [id, row] of [...renderedRows]) {
           if (wanted.has(id)) continue
           renderedRows.delete(id)
+          // An uncommitted picker drag belongs to the ROW, and the row is going
+          // away. Left behind it would resurface on the next render of this
+          // session as a colour the user never committed — a preview outliving
+          // the thing it was previewing.
+          previewRowColors.delete(id)
           renderedOrder.splice(renderedOrder.indexOf(id), 1)
           row.remove()
         }
@@ -1788,10 +3723,22 @@ window.__ModuleLoader__.load({
         }
 
         if (regionHeaderEl === null) {
+          if (regionCollapsed === null) regionCollapsed = readRegionCollapsed()
           regionHeaderEl = document.createElement('div')
           regionHeaderEl.setAttribute('data-stp-region-header', '')
-          regionHeaderEl.setAttribute('aria-hidden', 'true')
+          // A control, not a label: the user folds this region by hand, so it
+          // must be focusable, operable from the keyboard and self-describing.
+          // NOT `<button>`, which would synthesize a click for Enter/Space on
+          // top of the key handling below.
+          regionHeaderEl.setAttribute('role', 'button')
+          regionHeaderEl.setAttribute('tabindex', '0')
+          regionHeaderEl.setAttribute('aria-label', PINNED_LABEL())
+          const caret = document.createElement('span')
+          caret.setAttribute('data-stp-region-caret', '')
+          caret.setAttribute('aria-hidden', 'true')
+          regionHeaderEl.appendChild(caret)
           const headIcon = document.createElement('span')
+          headIcon.setAttribute('aria-hidden', 'true')
           headIcon.textContent = PIN_GLYPH_FILLED
           regionHeaderLabelEl = document.createElement('span')
           const headCount = document.createElement('span')
@@ -1799,16 +3746,19 @@ window.__ModuleLoader__.load({
           regionHeaderEl.appendChild(headIcon)
           regionHeaderEl.appendChild(regionHeaderLabelEl)
           regionHeaderEl.appendChild(headCount)
-          // The header is aria-hidden (it is a visual label), so the GROUP is
-          // what carries the name. `role="group"` rather than a tree role on
-          // purpose: the region sits outside the sidebar's `[role="tree"]` and
-          // its rows are `role="button"` (see `makeRow`).
+          regionHeaderEl.addEventListener('click', onRegionHeaderActivate)
+          regionHeaderEl.addEventListener('keydown', onRegionHeaderKey)
+          // The GROUP still carries the name for the rows, and stays a group
+          // rather than a tree: the region is outside the sidebar's
+          // `[role="tree"]` and its rows are `role="button"` (see `makeRow`).
           regionEl.setAttribute('role', 'group')
           regionEl.appendChild(regionHeaderEl)
         }
         const label = PINNED_LABEL()
         if (regionEl.getAttribute('aria-label') !== label) regionEl.setAttribute('aria-label', label)
+        if (regionHeaderEl.getAttribute('aria-label') !== label) regionHeaderEl.setAttribute('aria-label', label)
         if (regionHeaderLabelEl.textContent !== label) regionHeaderLabelEl.textContent = label
+        applyRegionFold()
         const count = regionHeaderEl.querySelector('[data-stp-region-count]')
         if (count.textContent !== String(pinned.length)) count.textContent = String(pinned.length)
         // `children` is an HTMLCollection in a real document, so the header's
@@ -1844,10 +3794,26 @@ window.__ModuleLoader__.load({
        * toggled twice: one header replacement was enough to look like "a new
        * widget, a new intent". See `reconcileGroups`.
        *
+       * `initial` is the one-time "this directory has not been closed yet"
+       * initialization, which is a question of its OWN and not the pin rule
+       * wearing a hat. While it is set the target is CLOSED whatever the pin
+       * set says, so the default fold can never be followed — one reconcile
+       * later, after it has landed — by the pin rule's "no pin means expand".
+       * `tried` records that the initialization has actually asked for it, so a
+       * group the USER opens afterwards is handed over rather than re-closed.
+       *
+       * An intent carries the signature it was ISSUED against, because the
+       * signature can move while the click is in flight and the reading the
+       * click lands on has to be booked against the question that was asked —
+       * not against the one that arrived in the meantime.
+       *
        * @type {Map<string, {
        *   confirmed: string | null,
+       *   initial: boolean,
+       *   tried: boolean,
        *   intent: null | {
        *     wantExpanded: boolean,
+       *     signature: string,
        *     before: string | null,
        *     attempts: number,
        *     undelivered: number,
@@ -1995,6 +3961,571 @@ window.__ModuleLoader__.load({
         }
       }
 
+      // ------------------------------------------------------ panels region
+
+      /**
+       * The panels region this mount currently owns, and the state it is in.
+       *
+       * `nav` / `toggle` are the live nodes (they change when the sidebar
+       * re-mounts); `addedId` records whether the id on the nav is OURS, so
+       * teardown removes exactly what it added and never a host id it found.
+       */
+      const panels = { nav: null, toggle: null, addedId: false, collapsed: null }
+
+      /**
+       * The panels region this plugin may fold: the host's panel-list nav that
+       * sits in the SAME sidebar column as the session list it has already
+       * positively identified.
+       *
+       * "Same column" is decided by the nearest common ancestor carrying the
+       * host root's own class (`css.root`, hashed but readable) — NOT by merely
+       * sharing an ancestor, which every node on the page does with `body` and
+       * would adopt an unrelated nav.
+       */
+      const panelsNavFor = (tree) => {
+        if (tree == null) return null
+        let candidates = null
+        try {
+          candidates = document.querySelectorAll(PANELS_NAV_SELECTOR)
+        } catch (error) {
+          warn(`panel navigation unreadable: ${describeError(error)}`)
+          return null
+        }
+        for (const nav of candidates) {
+          // A session list is never a panel region, and folding one hides rows.
+          if (nav.closest('[role="tree"]') !== null) continue
+          const root = sidebarRootSharedWith(nav, tree)
+          if (root === null) continue
+          if (sidebarRailIn(root)) continue
+          return nav
+        }
+        return null
+      }
+
+      /**
+       * The nearest ancestor both nodes hang from, when it is the sidebar root.
+       * @returns {Element | null} the sidebar root, or null when they are not
+       *   in one sidebar (or the shared ancestor is only the document).
+       */
+      const sidebarRootSharedWith = (nav, tree) => {
+        const above = new Set()
+        for (let node = tree; node != null; node = node.parentElement) above.add(node)
+        for (let node = nav.parentElement; node != null; node = node.parentElement) {
+          if (!above.has(node)) continue
+          if (node === document.body || node === document.documentElement) return null
+          return hasSidebarRootClass(node) === true ? node : null
+        }
+        return null
+      }
+
+      /** Does this element carry the host sidebar root's own class? */
+      const hasSidebarRootClass = (element) =>
+        typeof element.className === 'string'
+        && element.className.split(/\s+/).some(token => token.includes('root'))
+
+      /** Build (or adopt) the control, and put it directly above the nav. */
+      const ensurePanelsToggle = (nav) => {
+        const existing = document.querySelector(`[${PANELS_TOGGLE_ATTR}]`)
+        const toggle = existing instanceof Element ? existing : document.createElement('button')
+        toggle.setAttribute(PANELS_TOGGLE_ATTR, '')
+        toggle.setAttribute('type', 'button')
+        // `data-plugin` marks it ours, which keeps its own insertion from
+        // coming back through the observer as host news.
+        toggle.setAttribute('data-plugin', PLUGIN_ID)
+        toggle.setAttribute('aria-label', PANELS_TOGGLE_LABEL)
+        // Built ONCE. An idle pass that rebuilt the children would mutate the
+        // sidebar on every notification and feed its own observer.
+        if (toggle.children.length === 0) {
+          const caret = document.createElement('span')
+          caret.setAttribute('data-stp-panels-caret', '')
+          caret.setAttribute('aria-hidden', 'true')
+          caret.textContent = '▸'
+          toggle.appendChild(caret)
+          const label = document.createElement('span')
+          label.setAttribute('data-stp-panels-label', '')
+          label.textContent = PANELS_TOGGLE_LABEL
+          toggle.appendChild(label)
+        }
+        const parent = nav.parentElement
+        if (parent !== null && toggle.nextElementSibling !== nav) parent.insertBefore(toggle, nav)
+        // Bound once per ELEMENT, not once per pass: a reconcile that re-ran
+        // this would otherwise stack a listener per pass on the same node.
+        if (toggle.hasAttribute('data-stp-panels-bound') !== true) {
+          toggle.setAttribute('data-stp-panels-bound', '')
+          toggle.addEventListener('click', onPanelsToggle)
+        }
+        return toggle
+      }
+
+      /** The user's click: flip the state, remember it, and repaint the sheet. */
+      function onPanelsToggle() {
+        if (!alive()) return
+        if (panels.collapsed === null) panels.collapsed = readPanelsPreference()
+        panels.collapsed = panels.collapsed !== true
+        writePanelsPreference(panels.collapsed)
+        // Painted immediately, not on the next pass: the label says one thing
+        // and the region does another for 60ms is a visible stutter on a
+        // control whose whole job is to be immediate.
+        applyPanelsState()
+        writeDynamicSheet()
+      }
+
+      /** Push the current state onto the nav and the control. */
+      const applyPanelsState = () => {
+        const { nav, toggle } = panels
+        if (nav == null || toggle == null) return
+        const collapsed = panels.collapsed === true
+        nav.setAttribute(PANELS_STATE_ATTR, collapsed === true ? 'collapsed' : 'expanded')
+        toggle.setAttribute('aria-expanded', collapsed === true ? 'false' : 'true')
+        const caret = toggle.querySelector('[data-stp-panels-caret]')
+        const glyph = collapsed === true ? '▸' : '▾'
+        if (caret != null && caret.textContent !== glyph) caret.textContent = glyph
+      }
+
+      /**
+       * Fold the panels region, or hand it back.
+       *
+       * Called from every reconcile and therefore deliberately IDEMPOTENT: it
+       * applies the state this mount is in and never re-reads the default over
+       * the user's choice. The preference is consulted exactly once, when a nav
+       * is first seen.
+       *
+       * @param {object | null} flavor - the detected sidebar.
+       * @param {Element | null} tree - the identified session list.
+       */
+      const reconcilePanels = (flavor, tree) => {
+        const nav = flavor === FLAVOR_OFFICIAL ? panelsNavFor(tree) : null
+        if (nav === null) {
+          clearPanels()
+          return
+        }
+        if (panels.collapsed === null) panels.collapsed = readPanelsPreference()
+        // A different nav means the sidebar re-mounted: give the old one back
+        // before adopting the new one, or the previous column keeps a control
+        // and a fold attribute it has no owner for.
+        if (panels.nav !== null && panels.nav !== nav) releasePanels()
+        const toggle = ensurePanelsToggle(nav)
+        if (panels.nav !== nav) {
+          // Lend the nav an id ONLY if it has none, and remember whether that
+          // one is ours — a host id is left alone on the way out.
+          panels.addedId = nav.getAttribute('id') === null
+          if (panels.addedId === true) nav.setAttribute('id', PANELS_ID)
+        }
+        if (toggle.getAttribute('aria-controls') !== nav.getAttribute('id')) {
+          toggle.setAttribute('aria-controls', nav.getAttribute('id') ?? '')
+        }
+        panels.nav = nav
+        panels.toggle = toggle
+        applyPanelsState()
+      }
+
+      /**
+       * Write the one dynamic stylesheet: the pin rules and the panels fold.
+       *
+       * Single writer, so the two can never disagree about what is in force.
+       * @param {object | null} [flavor] - an already-probed flavor, if the caller has one.
+       */
+      const writeDynamicSheet = (flavor = currentFlavor(Date.now())) => {
+        applyPinRules(dynamicSheet, flavor, flavor === null ? [] : [...pinSet()],
+          panels.collapsed === true, directory.collapsed === true)
+      }
+
+      /** Undo exactly what `reconcilePanels` did to the DOM. */
+      const clearPanels = () => {
+        releasePanels()
+        panels.collapsed = null
+      }
+
+      const releasePanels = () => {
+        const { nav, toggle } = panels
+        if (nav != null) {
+          if (panels.addedId === true && nav.getAttribute('id') === PANELS_ID) nav.removeAttribute('id')
+          nav.removeAttribute(PANELS_STATE_ATTR)
+        }
+        if (toggle != null && toggle.isConnected !== false) toggle.remove()
+        panels.nav = null
+        panels.toggle = null
+        panels.addedId = false
+      }
+
+      // ------------------------------------------- workspace-directory region
+
+      /**
+       * The workspace-directory region this mount currently owns.
+       * Same shape and same reasons as `panels`.
+       */
+      const directory = { body: null, toggle: null, addedId: false, collapsed: null }
+
+      /**
+       * The ONE body this plugin may fold, reached from the PROVEN tree instead
+       * of searched for by name.
+       *
+       * `tree.parentElement` is the seat the host renders the directory headers
+       * AND their sessions into (`WorkspaceBrowser.tsx:669`), and it is already
+       * the element `findTreeHost` climbs past to seat the pinned region above
+       * it. Reaching it from the identified tree is what keeps the fold honest:
+       * a selector on the host's hashed `treeBody` class would be a global
+       * sweep, and a look-alike seat rendered anywhere else on the page would be
+       * hidden with it.
+       *
+       * Two things are required before it is adopted, both about honesty rather
+       * than caution:
+       *
+       *   - it actually holds a `workspace:` header, so "the workspace
+       *     directories" is what would be hidden. The stock sidebar's FLAT view
+       *     renders no directories at all, and a control labelled 工作区目录 over
+       *     a plain session list would be a claim this build cannot make.
+       *   - the sidebar is not in the host's narrow rail, which is a whole-column
+       *     state the host renders correctly on its own.
+       *
+       * codex-ui gets no answer here on purpose: it renders one
+       * `.dcu-wb-project` per workspace with no single seat holding them all, so
+       * there is no provable seam to fold. Its per-DIRECTORY default fold needs
+       * no such seam and still runs.
+       *
+       * @param {object | null} flavor - the detected sidebar.
+       * @param {Element | null} tree - the identified session list.
+       * @returns {Element | null} the body, or null when there is nothing proven.
+       */
+      const directoryBodyFor = (flavor, tree) => {
+        if (flavor !== FLAVOR_OFFICIAL || tree == null) return null
+        const body = tree.parentElement
+        if (body == null) return null
+        if (sidebarRailIn(body)) return null
+        if (body.querySelector(`[${ROW_KEY_ATTR}^="${WORKSPACE_ROW_PREFIX}"]`) === null) return null
+        return body
+      }
+
+      /** Build (or adopt) the control, and put it directly above the body. */
+      const ensureDirectoryToggle = (body) => {
+        const existing = document.querySelector(`[${GROUPS_TOGGLE_ATTR}]`)
+        const toggle = existing instanceof Element ? existing : document.createElement('button')
+        toggle.setAttribute(GROUPS_TOGGLE_ATTR, '')
+        toggle.setAttribute('type', 'button')
+        toggle.setAttribute('data-plugin', PLUGIN_ID)
+        toggle.setAttribute('aria-label', GROUPS_TOGGLE_LABEL)
+        // Built ONCE, for the same reason the panels control is: an idle pass
+        // that rebuilt the children would mutate the sidebar on every
+        // notification and feed its own observer.
+        if (toggle.children.length === 0) {
+          const caret = document.createElement('span')
+          caret.setAttribute('data-stp-groups-caret', '')
+          caret.setAttribute('aria-hidden', 'true')
+          caret.textContent = '▸'
+          toggle.appendChild(caret)
+          const label = document.createElement('span')
+          label.setAttribute('data-stp-groups-label', '')
+          label.textContent = GROUPS_TOGGLE_LABEL
+          toggle.appendChild(label)
+        }
+        // ABOVE the body it folds, never inside it: a control inside the body
+        // disappears with the very fold it controls.
+        const parent = body.parentElement
+        if (parent !== null && toggle.nextElementSibling !== body) parent.insertBefore(toggle, body)
+        // Bound once per ELEMENT, not once per pass.
+        if (toggle.hasAttribute('data-stp-groups-bound') !== true) {
+          toggle.setAttribute('data-stp-groups-bound', '')
+          toggle.addEventListener('click', onDirectoryToggle)
+        }
+        return toggle
+      }
+
+      /** The user's click: flip the state, remember it, and repaint the sheet. */
+      function onDirectoryToggle() {
+        if (!alive()) return
+        if (directory.collapsed === null) directory.collapsed = readGroupsPreference()
+        directory.collapsed = directory.collapsed !== true
+        writeGroupsPreference(directory.collapsed)
+        // Painted immediately: a control whose label and region disagree for
+        // 60ms reads as a control that dropped the click.
+        applyDirectoryState()
+        writeDynamicSheet()
+      }
+
+      /** Push the current state onto the body and the control. */
+      const applyDirectoryState = () => {
+        const { body, toggle } = directory
+        if (body == null || toggle == null) return
+        const collapsed = directory.collapsed === true
+        const next = collapsed === true ? 'collapsed' : 'expanded'
+        if (body.getAttribute(GROUPS_STATE_ATTR) !== next) body.setAttribute(GROUPS_STATE_ATTR, next)
+        const expanded = collapsed === true ? 'false' : 'true'
+        if (toggle.getAttribute('aria-expanded') !== expanded) toggle.setAttribute('aria-expanded', expanded)
+        const caret = toggle.querySelector('[data-stp-groups-caret]')
+        const glyph = collapsed === true ? '▸' : '▾'
+        if (caret != null && caret.textContent !== glyph) caret.textContent = glyph
+      }
+
+      /**
+       * Fold the directory region, or hand it back.
+       *
+       * Idempotent by construction, exactly like `reconcilePanels`: it applies
+       * the state this mount is in and never re-reads the default over the
+       * user's choice. The preference is consulted exactly once, when a body is
+       * first seen. Nothing here removes or re-parents a host node — the fold is
+       * one stylesheet rule, so every group's own expansion is exactly where the
+       * user left it when the region comes back.
+       *
+       * @param {object | null} flavor - the detected sidebar.
+       * @param {Element | null} tree - the identified session list.
+       */
+      const reconcileDirectoryRegion = (flavor, tree) => {
+        const body = directoryBodyFor(flavor, tree)
+        if (body === null) {
+          clearDirectoryRegion()
+          return
+        }
+        if (directory.collapsed === null) directory.collapsed = readGroupsPreference()
+        // A different body means the sidebar re-mounted: give the old one back
+        // before adopting the new one.
+        if (directory.body !== null && directory.body !== body) releaseDirectoryRegion()
+        const toggle = ensureDirectoryToggle(body)
+        if (directory.body !== body) {
+          directory.addedId = body.getAttribute('id') === null
+          if (directory.addedId === true) body.setAttribute('id', GROUPS_ID)
+        }
+        if (toggle.getAttribute('aria-controls') !== body.getAttribute('id')) {
+          toggle.setAttribute('aria-controls', body.getAttribute('id') ?? '')
+        }
+        directory.body = body
+        directory.toggle = toggle
+        if (body.getAttribute(GROUPS_BODY_ATTR) === null) body.setAttribute(GROUPS_BODY_ATTR, '')
+        applyDirectoryState()
+      }
+
+      /** Undo exactly what `reconcileDirectoryRegion` did to the DOM. */
+      const clearDirectoryRegion = () => {
+        releaseDirectoryRegion()
+        directory.collapsed = null
+      }
+
+      const releaseDirectoryRegion = () => {
+        const { body, toggle } = directory
+        if (body != null) {
+          if (directory.addedId === true && body.getAttribute('id') === GROUPS_ID) body.removeAttribute('id')
+          body.removeAttribute(GROUPS_STATE_ATTR)
+          body.removeAttribute(GROUPS_BODY_ATTR)
+        }
+        if (toggle != null && toggle.isConnected !== false) toggle.remove()
+        directory.body = null
+        directory.toggle = null
+        directory.addedId = false
+      }
+
+      // --------------------------------------------------------- sidebar footer
+
+      /**
+       * The sidebar column this plugin will look for the footer surfaces in.
+       *
+       * Derived from the TREE, not from a class name: walk up from the proven
+       * session list and take the FIRST ancestor that actually contains one of
+       * the footer surfaces. That is a positive proof on both ends — the tree
+       * says which column this is, and the anchor says the footer is here — and
+       * it needs no guess about what the host calls its own wrapper.
+       *
+       * The earlier version asked for an ancestor whose class token contained
+       * "root", which is a GUESS about the host's markup, and on the shipped
+       * page it simply never matched: `root` came back null, every footer mark
+       * was skipped, and the whole footer compaction silently did nothing while
+       * every test stayed green, because the fixture agreed with the guess.
+       *
+       * `<body>` is refused for the same reason it always was — "everything is
+       * under body" is not a column — so the walk can never become a page-wide
+       * sweep; it stops at the first ancestor that holds the footer.
+       *
+       * @param {Element | null} tree - the identified session list.
+       * @returns {Element | null} the column, or null when there is none.
+       */
+      const footerScopeFor = (tree) => {
+        if (tree == null) return null
+        for (let node = tree.parentElement; node != null; node = node.parentElement) {
+          if (node === document.body || node === document.documentElement) return null
+          try {
+            if (node.querySelector(`[role="region"][aria-label="${BALANCE_REGION_LABEL}"]`) !== null) return node
+          } catch {
+            return null
+          }
+        }
+        return null
+      }
+
+      /**
+       * The same walk, keyed on the account menu's own `aria-label`.
+       *
+       * The account trigger lives in its OWN root, which the live page proved is
+       * NOT the footer's: looking for it only inside the footer scope found
+       * nothing and the account row stayed 44px. Reached the same bounded way —
+       * up from the proven tree, never above `<body>` — so a sidebar that does
+       * not render one simply gets no mark.
+       *
+       * @param {Element | null} tree - the identified session list.
+       * @returns {Element | null} the account trigger, or null.
+       */
+      const accountMenuFor = (tree) => {
+        if (tree == null) return null
+        for (let node = tree.parentElement; node != null; node = node.parentElement) {
+          if (node === document.body || node === document.documentElement) return null
+          try {
+            const found = node.querySelector(`[aria-label="${ACCOUNT_MENU_LABEL}"]`)
+            if (found !== null) return found
+          } catch {
+            return null
+          }
+        }
+        return null
+      }
+
+      /**
+       * The nearest common ancestor of two elements, or null.
+       *
+       * `document` itself is refused: "everything is under <body>" is not a host,
+       * and marking it would put the compaction rules on the whole page.
+       *
+       * @param {Element | null} a - one element.
+       * @param {Element | null} b - the other.
+       * @returns {Element | null} the shared ancestor.
+       */
+      const closestCommonAncestor = (a, b) => {
+        if (a == null || b == null) return null
+        const above = new Set()
+        for (let node = a; node != null; node = node.parentElement) above.add(node)
+        for (let node = b; node != null; node = node.parentElement) {
+          if (!above.has(node)) continue
+          if (node === document.body || node === document.documentElement) return null
+          return node
+        }
+        return null
+      }
+
+      /**
+       * The pinned-count entry inside the already-proven footer host.
+       *
+       * By its own stable `aria-label` first, then by the visible text as a
+       * fallback. The label is the stronger of the two anchors and the text is
+       * what the old version used alone — and on the live page the text alone
+       * matched nothing, because the entry's own label is 已置顶的会话 and the
+       * text sits on a child. Text is kept only as the second try so a host that
+       * ships the shorter label still compacts; neither path can reach outside
+       * the one footer host derived from two proven regions.
+       *
+       * @param {Element} root - the proven footer host.
+       * @returns {Element | null} the entry, or null when there is none.
+       */
+      const pinnedFooterEntryFor = (root) => {
+        try {
+          const labelled = root.querySelector(`[aria-label="${FOOTER_PIN_LABEL}"]`)
+          if (labelled !== null) return labelled
+        } catch {
+          return null
+        }
+        return deepestTextMatch(root, FOOTER_PIN_TEXT)
+      }
+
+      /**
+       * The DEEPEST element under `root` whose own text starts with `text`.
+       *
+       * Deepest is the load-bearing half: both the wrapper and the control
+       * inside it carry the label, and only the control is the row. Bounded to
+       * the ONE footer host already derived from two proven regions.
+       *
+       * @param {Element} root - the container to search.
+       * @param {string} text - the label the entry starts with.
+       * @returns {Element | null} the element, or null when nothing matches.
+       */
+      const deepestTextMatch = (root, text) => {
+        let found = null
+        try {
+          for (const node of root.querySelectorAll('*')) {
+            const own = typeof node.textContent === 'string' ? node.textContent.trim() : ''
+            if (own === '' || (own !== text && own.startsWith(text) === false)) continue
+            found = node
+          }
+        } catch (error) {
+          warn(`footer entry unreadable: ${describeError(error)}`)
+          return null
+        }
+        return found
+      }
+
+      /**
+       * The footer surfaces this mount currently marks, so a pass that changes
+       * nothing writes nothing.
+       */
+      const footerMarks = {
+        host: null, balance: null, importer: null, pinned: null, account: null,
+      }
+
+      /**
+       * Mark the four footer surfaces the compaction rules may reach — or give
+       * them all back.
+       *
+       * Identification is POSITIVE and derived, never searched for by guessing:
+       *
+       *   1. the balance region and the import control are found by their own
+       *      stable `aria-label`s, INSIDE the sidebar root this plugin already
+       *      proved from the session list;
+       *   2. the footer host is their nearest common ancestor — so it is a host,
+       *      not a candidate, and a sidebar whose footer renders nothing simply
+       *      has no common ancestor to claim;
+       *   3. the pinned-count entry is the deepest text match inside that host;
+       *   4. the account menu is found by its own `aria-label` in the same root.
+       *
+       * The rail is left to the host, exactly as the panels and directory regions
+       * are. Nothing is hidden and no business handler is touched: these markers
+       * exist only to give the stylesheet four proven anchors.
+       *
+       * @param {object | null} flavor - the detected sidebar.
+       * @param {Element | null} tree - the identified session list.
+       */
+      const reconcileFooter = (flavor, tree) => {
+        let next = { host: null, balance: null, importer: null, pinned: null, account: null }
+        const root = flavor === FLAVOR_OFFICIAL ? footerScopeFor(tree) : null
+        if (root !== null && sidebarRailIn(root) === false) {
+          let balance = null
+          let importer = null
+          let account = null
+          try {
+            balance = root.querySelector(`[role="region"][aria-label="${BALANCE_REGION_LABEL}"]`)
+            importer = root.querySelector(`[aria-label="${IMPORT_CONTROL_LABEL}"]`)
+            account = accountMenuFor(tree)
+          } catch (error) {
+            warn(`footer surfaces unreadable: ${describeError(error)}`)
+          }
+          const host = closestCommonAncestor(balance, importer)
+          if (host !== null) {
+            next.host = host
+            next.balance = balance
+            next.importer = importer
+            next.pinned = pinnedFooterEntryFor(host)
+            next.account = account
+          }
+        }
+        const same = footerMarks.host === next.host
+          && footerMarks.balance === next.balance
+          && footerMarks.importer === next.importer
+          && footerMarks.pinned === next.pinned
+          && footerMarks.account === next.account
+        if (same) return
+        clearHostMarks()
+        markHost(next.host, FOOTER_ATTR)
+        markHost(next.balance, FOOTER_BALANCE_ATTR)
+        markHost(next.importer, FOOTER_IMPORT_ATTR)
+        markHost(next.pinned, FOOTER_PIN_ATTR)
+        markHost(next.account, ACCOUNT_ATTR)
+        Object.assign(footerMarks, next)
+      }
+
+      /** Hand every footer mark back, whatever it was on. Idempotent. */
+      const clearFooter = () => {
+        if (footerMarks.host === null
+          && footerMarks.balance === null
+          && footerMarks.importer === null
+          && footerMarks.pinned === null
+          && footerMarks.account === null) return
+        clearHostMarks()
+        Object.assign(footerMarks, { host: null, balance: null, importer: null, pinned: null, account: null })
+      }
+
       // ------------------------------------------------------ reconciliation
 
       let scheduled = false
@@ -2032,6 +4563,9 @@ window.__ModuleLoader__.load({
             // No recognized sidebar: collapse the plugin's contribution and
             // forget every cached header, so a sidebar swap starts clean.
             detachRegion()
+            // Same contract for the typography marker: nothing is proven, so
+            // nothing stays marked.
+            markTypography(null)
             // The memo AND the row index describe DOM that no longer exists, so
             // they MUST go with the nodes they described. Left in place they
             // described an empty region: the next sidebar to appear found an
@@ -2040,6 +4574,10 @@ window.__ModuleLoader__.load({
             // user had pinned, with its header and rows, simply never came back.
             clearRegion()
             renderedRegionSignature = null
+            clearPanels()
+            clearDirectoryRegion()
+            clearFooter()
+            clearHostRowColors()
             applyPinRules(dynamicSheet, null, [])
             headCache.clear()
             foldSignature.clear()
@@ -2047,8 +4585,19 @@ window.__ModuleLoader__.load({
           }
           const pinned = [...pinSet()]
           ensureHosts()
-          applyPinRules(dynamicSheet, flavor, pinned)
+          // The tree is proven and its host is mounted, so it — and only it —
+          // is the one element the host-typography rules are allowed to reach.
+          markTypography(tree)
+          // Before the sheet is written: the panels fold lives in it, and this
+          // is where the user's remembered state is read (once).
+          reconcilePanels(flavor, tree)
+          reconcileDirectoryRegion(flavor, tree)
+          reconcileFooter(flavor, tree)
+          applyPinRules(dynamicSheet, flavor, pinned, panels.collapsed === true, directory.collapsed === true)
           renderRegion()
+          // After the region is placed, so a colour chosen for a PINNED session
+          // lands on the host row it is hiding and on ours at the same pass.
+          reconcileHostRowColors(flavor)
           if (pinned.length > 0 && regionEl !== null && regionEl.parentElement !== host) {
             host.insertBefore(regionEl, host.firstChild)
           } else if (pinned.length === 0) {
@@ -2062,11 +4611,12 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * Behavior 3/4's fold rule: a group holding a pinned session folds (the
-       * spec's "原工作区分组默认折叠"), and expands again once its last pin is
-       * gone so the returning session is visible where it went.
+       * Behavior 3/4's fold rule: a foldable directory is CLOSED once when it is
+       * first seen (the spec's "原工作区目录默认折叠"), a group holding a pinned
+       * session folds on every pin change, and a group that has lost its last pin
+       * expands again so the returning session is visible where it went.
        *
-       * Three rules make that rule survivable, each of which was a separate
+       * Four rules make that rule survivable, each of which was a separate
        * measured failure:
        *
        *  1. THE SIGNATURE IS THE SET OF PINNED MEMBERS. The previous signature
@@ -2075,11 +4625,19 @@ window.__ModuleLoader__.load({
        *     read as a pin change and re-folded a group the user had opened by
        *     hand (`GROUP_ORDER_ONLY_CHANGE`). A sorted member set is invariant
        *     under exactly those operations and nothing else.
-       *  2. FIRST SIGHT WITH NO PIN TOUCHES NOTHING. Such a group is the user's
-       *     alone: the plugin has never folded it and has no state to restore,
-       *     so expanding it was taking something over (`GROUP_ZERO_PINS_INITIAL`
-       *     turned a long-standing `false` into `true`).
-       *  3. NOTHING IS BOOKED BEFORE IT HAPPENED. The previous code recorded the
+       *  2. FIRST SIGHT IS AN INITIALIZATION, NOT A PIN DECISION. It is its own
+       *     state (`initial`), it targets CLOSED whatever the pin set says, and
+       *     it ends the moment the group is read closed — a target that flipped
+       *     to "expand" the pass after the click was issued would wait for the
+       *     fold to land and then open the group right behind it.
+       *  3. AFTERWARDS THE GROUP IS THE USER'S. A group the user opens by hand
+       *     is booked as reached and no notification, title change, reorder or
+       *     unrelated pin re-closes it. That is the defect the withdrawn
+       *     "first sight with no pin touches nothing" rule was protecting
+       *     (`GROUP_ZERO_PINS_INITIAL` turned a long-standing `false` into
+       *     `true`), and it survives the new default by becoming a handover
+       *     rather than a first-sight exemption.
+       *  4. NOTHING IS BOOKED BEFORE IT HAPPENED. The previous code recorded the
        *     signature BEFORE looking for the header and clicking it, so a header
        *     that had not rendered yet, a click the host ignored and a click that
        *     threw were all remembered as done and never retried
@@ -2162,17 +4720,14 @@ window.__ModuleLoader__.load({
           const signature = pinnedMembers(workspace.sessionIds, pinned)
           let state = foldSignature.get(key)
           if (state === undefined) {
-            state = {
-              // `null` = "this group still has to reach the wanted state";
-              // `''` = "nothing to do, the user's own expansion stands".
-              confirmed: signature === '' ? signature : null,
-              intent: null,
-            }
+            state = { confirmed: null, initial: true, tried: false, intent: null }
             foldSignature.set(key, state)
-            if (signature === '') continue
           }
-          if (state.confirmed === signature) continue
-          const wantExpanded = signature === ''
+          // The one-time initialization targets CLOSED whatever the pin set
+          // says. Only once that has been read back does the pin rule below
+          // take over the group.
+          let wantExpanded = state.initial ? false : signature === ''
+          if (state.initial !== true && state.confirmed === signature) continue
           const header = groupHeader(flavor, key)
           // Not rendered (yet). Nothing is booked, so the next notification
           // tries again.
@@ -2212,15 +4767,45 @@ window.__ModuleLoader__.load({
           } else {
             // Nothing is in flight, or the reading moved: whatever click was out
             // has landed (or somebody else acted), so the intent is spent.
+            const spent = state.intent
             state.intent = null
-            if ((now === 'true') === wantExpanded) {
-              // Reached. Book it, and let go of the intent: from here on an
-              // ordinary notification for the SAME signature must not re-issue
-              // it.
+            const expandedNow = now === 'true'
+            // HANDOVER. The initialization has been asked for, and the group is
+            // EXPANDED with no pin: the user's own opening is now the state to
+            // respect. Clicking here would re-close a group the user opened,
+            // on every notification, for the rest of the session.
+            if (state.initial === true && state.tried === true
+              && expandedNow === true && signature === '') {
+              state.initial = false
               state.confirmed = signature
               continue
             }
-            state.intent = { wantExpanded, before: now, attempts: 1, undelivered: 0 }
+            if (expandedNow === wantExpanded) {
+              // Reached. Book it, and let go of the intent: from here on an
+              // ordinary notification for the SAME signature must not re-issue
+              // it. Reading the group closed ends the initialization too — from
+              // now on only a pin change may move it.
+              //
+              // Booked against the signature the click was ISSUED against: a pin
+              // that came and went while it was in flight is still unanswered,
+              // and booking the later one would leave the group where the click
+              // put it with no record that anything was owed.
+              state.confirmed = spent === null ? signature : spent.signature
+              state.initial = false
+              if (state.confirmed === signature) continue
+              // The pin set really did move. Ask that question NOW: deferring it
+              // to the next notification would leave the group folded until
+              // something unrelated happened to arrive.
+              wantExpanded = signature === ''
+              if (expandedNow === wantExpanded) {
+                state.confirmed = signature
+                continue
+              }
+            }
+            if (state.intent === null) {
+              if (state.initial === true) state.tried = true
+              state.intent = { wantExpanded, signature, before: now, attempts: 1, undelivered: 0 }
+            }
           }
           if (toggleGroupHeader(header, key)) {
             scheduleConfirmPass()
@@ -2248,7 +4833,7 @@ window.__ModuleLoader__.load({
         if (!(node instanceof Element)) return false
         if (node === regionEl || node === anchorEl) return true
         if (node.getAttribute?.('data-plugin') === PLUGIN_ID) return true
-        return node.closest?.('[data-stp-region], [data-stp-anchor], [data-stp-notice]') != null
+        return node.closest?.('[data-stp-region], [data-stp-anchor], [data-stp-notice], [data-stp-color-dialog]') != null
       }
 
       /**
@@ -2258,6 +4843,15 @@ window.__ModuleLoader__.load({
        */
       const isOwnMutation = (record) => {
         if (record === undefined || record === null) return false
+        // The attributes this plugin writes onto host nodes. Without these the
+        // plugin's own `data-stp-panels` / `id` writes would come back through
+        // the observer as host news and schedule a pass that writes them again.
+        if (record.type === 'attributes'
+          && (record.attributeName === PANELS_STATE_ATTR
+            || record.attributeName === GROUPS_STATE_ATTR
+            || record.attributeName === GROUPS_BODY_ATTR
+            || record.attributeName === 'id')
+          && record.target instanceof Element) return true
         if (isOwnNode(record.target)) return true
         for (const node of record.addedNodes ?? []) if (isOwnNode(node)) return true
         for (const node of record.removedNodes ?? []) if (isOwnNode(node)) return true
@@ -2308,6 +4902,7 @@ window.__ModuleLoader__.load({
       const CTX_MENU_KEY = Symbol.for('dsh.session-context-menu.extensions')
       const PIN_ENTRY_ID = 'dsh-session-top.pin'
       const UNPIN_ENTRY_ID = 'dsh-session-top.unpin'
+      const COLOR_ENTRY_ID = 'dsh-session-top.row-color'
       /** Order within the owner's extension list; the owner appends us after its own items. */
       const ENTRY_ORDER = 50
 
@@ -2335,7 +4930,7 @@ window.__ModuleLoader__.load({
         if (api === undefined) return false
         try {
           const ids = new Set(api.list().map(entry => entry?.id))
-          return ids.has(PIN_ENTRY_ID) && ids.has(UNPIN_ENTRY_ID)
+          return ids.has(PIN_ENTRY_ID) && ids.has(UNPIN_ENTRY_ID) && ids.has(COLOR_ENTRY_ID)
         } catch {
           return false
         }
@@ -2418,6 +5013,57 @@ window.__ModuleLoader__.load({
         run: ({ session, close } = {}) => { runSharedAction(session, false, close) },
       })
 
+      /**
+       * Run the colour action from a menu: close that menu FIRST, then open the
+       * dialog one tick later.
+       *
+       * The order is not cosmetic. Every menu this plugin can be reached from
+       * gives focus back to the row that opened it as part of closing, so a
+       * dialog that focused its own field a tick earlier would have that focus
+       * taken back out from under the user — and the whole surface is unusable
+       * from the keyboard. Deferring past the close is the same rule the
+       * right-click hand-off already uses, for the same reason.
+       *
+       * @param {unknown} session - the resolved session.
+       * @param {(() => void) | undefined} close - the menu's own closer.
+       */
+      const runColorAction = (session, close) => {
+        if (!alive()) return
+        const id = sessionIdOfEntry(session)
+        if (id === undefined) return
+        try {
+          close?.()
+        } catch (error) {
+          warn(`closing the shared menu failed: ${describeError(error)}`)
+        }
+        afterDispatch(() => {
+          if (!alive()) return
+          openColorDialog(id, openerFor(id))
+        })
+      }
+
+      /**
+       * The row-colour entry this plugin contributes to the owner's menu.
+       *
+       * Visible for EVERY session, pinned or not: a colour is a local preference
+       * keyed by session id, so it is meaningless only for a session the owner
+       * could not resolve — and for those the entry simply hides, as every other
+       * entry here does.
+       */
+      const colorEntry = () => ({
+        id: COLOR_ENTRY_ID,
+        order: ENTRY_ORDER + 2,
+        label: translate('menu.color', '自定义行背景颜色…'),
+        visible: ({ session } = {}) => {
+          try {
+            return sessionIdOfEntry(session) !== undefined
+          } catch {
+            return false
+          }
+        },
+        run: ({ session, close } = {}) => { runColorAction(session, close) },
+      })
+
       /** Undo a partial registration: a rejected second entry must not leave the first behind. */
       let releaseSharedMenu = null
 
@@ -2446,6 +5092,7 @@ window.__ModuleLoader__.load({
         try {
           releases.push(api.register(pinEntry()))
           releases.push(api.register(unpinEntry()))
+          releases.push(api.register(colorEntry()))
         } catch (error) {
           for (const release of releases) {
             try {
@@ -2465,7 +5112,7 @@ window.__ModuleLoader__.load({
             }
           }
         }
-        console.info('[dsh-session-top] pin/unpin published into the shared session context menu')
+        console.info('[dsh-session-top] pin/unpin/row colour published into the shared session context menu')
         return true
       }
 
@@ -2581,6 +5228,30 @@ window.__ModuleLoader__.load({
         })
 
         surface.appendChild(item)
+
+        // The colour item, on the SAME dialog the row's colour point opens. This
+        // menu is the fallback for a row with nothing to borrow, so a session
+        // whose colour can only be reached from here would otherwise be the one
+        // session whose colour cannot be set at all.
+        const colorItem = document.createElement('button')
+        colorItem.type = 'button'
+        colorItem.setAttribute('role', 'menuitem')
+        colorItem.setAttribute('data-stp-color-item', '')
+        colorItem.textContent = translate('menu.color', '自定义行背景颜色…')
+        colorItem.addEventListener('click', (event) => {
+          event.preventDefault()
+          event.stopPropagation()
+          closeMenu()
+          if (!alive()) return
+          // Deferred for the same reason as the shared entry: this menu hands
+          // focus back to the row it was opened from.
+          afterDispatch(() => {
+            if (!alive()) return
+            openColorDialog(sessionId, anchorEl)
+          })
+        })
+        surface.appendChild(colorItem)
+
         anchorEl.appendChild(surface)
         positionMenu(surface, x, y)
         try {
@@ -2719,10 +5390,7 @@ window.__ModuleLoader__.load({
         // says nothing about ownership.
         publishSharedMenu()
 
-        // (4) A real host session row of a recognized sidebar. Both renderings
-        // are supported: the stock sidebar has no context menu of its own, and
-        // codex-ui's is served by the shared owner, so reaching here with the
-        // owner loaded means the dispatch finished unhandled.
+        // (4) A real host session row of a recognized sidebar.
         const x = event.clientX
         const y = event.clientY
         afterDispatch(() => {
@@ -2732,7 +5400,15 @@ window.__ModuleLoader__.load({
           // unmount must not claim the gesture and open a menu afterwards.
           if (!alive()) return
           if (event.defaultPrevented === true) return
+          // codex-ui serves its own session menu on right-click, with its own
+          // actions in it. That menu is the host's and stays the host's: the
+          // gesture is left alone rather than covered by a plugin menu that
+          // could only ever hold this plugin's own entry.
+          if (flavor.nativeContextMenu === true) return
           event.preventDefault()
+          // The host's own "…" control, when the row has one. The plugin's
+          // single-item menu is the fallback for a row that has none.
+          if (openOfficialRowMenu(flavor, id, x, y, found.row) === true) return
           openMenu(id, x, y)
         })
       }
@@ -2797,13 +5473,18 @@ window.__ModuleLoader__.load({
        * `cancelable: true` matters: the owner's `preventDefault()` is how the
        * claim becomes observable, both to us and to anything downstream.
        *
+       * DELIVERY IS NOT A CLAIM, which is why the dispatched event itself is
+       * returned rather than a success flag: the only evidence that anybody took
+       * the gesture is that it comes back `defaultPrevented`.
+       *
        * @param {Element} target - the element to dispatch on.
        * @param {number} x - viewport x.
        * @param {number} y - viewport y.
-       * @returns {boolean} true when the event was constructed and dispatched.
+       * @returns {MouseEvent | null} the dispatched event, or null when it
+       *   could not be constructed or delivered at all.
        */
       const redispatchContextMenu = (target, x, y) => {
-        if (typeof MouseEvent !== 'function') return false
+        if (typeof MouseEvent !== 'function') return null
         try {
           const event = new MouseEvent('contextmenu', {
             bubbles: true,
@@ -2816,10 +5497,10 @@ window.__ModuleLoader__.load({
             buttons: 2,
           })
           target.dispatchEvent(event)
-          return true
+          return event
         } catch (error) {
           warn(`could not re-deliver the gesture to the host row: ${describeError(error)}`)
-          return false
+          return null
         }
       }
 
@@ -2834,12 +5515,418 @@ window.__ModuleLoader__.load({
        * it — instead of a plugin-owned menu holding one item.
        *
        * The plugin-owned menu is the FALLBACK, and it is reached only when
-       * there is nothing to hand the gesture to: no host row mounted, or no
-       * `MouseEvent` to build the re-delivery with. If the owner is simply
-       * absent, this function's dispatch is still enough — our own
-       * `onContextMenu` sees the re-delivered event on a host row, finds it
-       * unhandled after the dispatch, and opens the fallback itself under the
-       * same ownership rule every other gesture uses.
+       * nothing CLAIMED the gesture: no owner, no host row, and no host menu
+       * of its own to serve it. That claim is read off the re-delivered event
+       * one microtask later, after the whole dispatch — whoever handled it
+       * (the shared owner, or codex-ui's own session-row handler,
+       * lib/client.js:4617) has already called `preventDefault()`, and a gesture
+       * nobody prevented is one this plugin is still free to serve.
+       *
+       * Note what is NOT consulted: that a host row exists. It says the plugin
+       * could deliver the gesture, nothing about whether anybody took it, and
+       * reading it as a claim is what made every unclaimed right-click on a
+       * pinned row silently do nothing.
+       *
+       * @param {Element} row - a `[data-stp-row]` element.
+       * @param {number} x - viewport x.
+       * @param {number} y - viewport y.
+       */
+      // ------------------------------------------------- the host's row menu
+
+      /**
+       * The stock sidebar's session menu is a BUTTON menu, not a `contextmenu`
+       * surface: every row carries the host's own `…` control
+       * (`Rows.tsx:667-690`, shipped at
+       * `ui-workspace/lib/client.js:2328-2350`) whose `onClick` flips the row's
+       * `menuOpen` state and renders the host's own items — 置顶/取消置顶、重命名、
+       * 分叉会话、归档会话、复制 Session ID — from the
+       * `sidebar.workspaces.session.menu.item` slot, into a portalled list
+       * positioned from the anchor's rect. The hand-off is therefore a CLICK on
+       * that control; nothing is re-implemented, grafted or replaced. The
+       * container is located by `rowActions`, the readable segment its hashed
+       * CSS-module class keeps.
+       */
+      const ROW_ACTIONS_SELECTOR = '[class*="rowActions"]'
+
+      /** How often the open host menu is checked so the anchor can be handed back. */
+      const OFFICIAL_MENU_POLL_MS = 150
+      /** A menu nobody closed must not keep one row styled forever. */
+      const OFFICIAL_MENU_MAX_MS = 60000
+      /** How long a folded group is given to render the row the hand-off needs. */
+      const GROUP_EXPAND_TIMEOUT_MS = 1200
+      const GROUP_EXPAND_POLL_MS = 50
+      /** How far outside a row the pointer may be before the anchor is moved. */
+      const ANCHOR_SLOP_PX = 48
+
+      /**
+       * The host's own "…" control for a row, or null when the row carries none.
+       * @param {Element | null} row - a host session row.
+       * @returns {Element | null} the button.
+       */
+      const officialRowMenuControl = (row) => {
+        if (row == null) return null
+        let actions = null
+        try {
+          actions = row.querySelector(ROW_ACTIONS_SELECTOR)
+        } catch { return null }
+        if (actions == null) return null
+        const button = actions.querySelector('button[aria-label]') ?? actions.querySelector('button')
+        return button instanceof Element ? { actions, button } : null
+      }
+
+      /** The host row's own "…" control, or null when the row carries none. */
+      const officialRowMenuButton = (row) => officialRowMenuControl(row)?.button ?? null
+
+      /**
+       * Is the host's menu open on this row right now?
+       *
+       * `Rows.tsx` puts its own `menuOpen` class on the row while the menu is
+       * open (and the stylesheet reveals `rowActions` on exactly that class), so
+       * this is the observable outcome of our click — and the signal the anchor
+       * transaction watches for, instead of a guess about how long a menu lives.
+       * @param {Element} row - a host session row.
+       * @returns {boolean} true when the row reports an open menu.
+       */
+      const officialMenuOpenOn = (row) =>
+        typeof row?.className === 'string' && row.className.includes('menuOpen')
+
+      /**
+       * Did the gesture arrive at some OTHER row than the one it landed on?
+       *
+       * A real right-click always lands on the row whose menu is about to open.
+       * A re-delivered one — this plugin's own row handing the gesture to the
+       * host's row for the same session — lands on a row somewhere else in the
+       * sidebar entirely, and the host would then open its menu hundreds of
+       * pixels from the pointer. Comparing the pointer with the row's own box
+       * tells the two apart without either path having to announce itself.
+       * @param {Element} row - the row the gesture landed on.
+       * @param {number} x - viewport x of the gesture.
+       * @param {number} y - viewport y of the gesture.
+       * @returns {boolean} true when the pointer is nowhere near the row.
+       */
+      const pointerOutsideRow = (row, x, y) => {
+        let rect = null
+        try {
+          rect = row.getBoundingClientRect?.() ?? null
+        } catch { return false }
+        if (rect == null || typeof rect.left !== 'number') return false
+        return x < rect.left - ANCHOR_SLOP_PX
+          || x > rect.right + ANCHOR_SLOP_PX
+          || y < rect.top - ANCHOR_SLOP_PX
+          || y > rect.bottom + ANCHOR_SLOP_PX
+      }
+
+      /**
+       * Park one row under the pointer, invisibly, and return the undo.
+       *
+       * The host measures the anchor's rect, so a menu opened for a row that is
+       * `display:none` (which is exactly what the pin rule does to a pinned
+       * session's own row) or that sits in a folded group lands at (0,0) or far
+       * off from the click. Both are fixed on THIS row only, and only while its
+       * menu is open:
+       *
+       *   - laid out (`display`) so its button has a real rect, and invisible
+       *     (`opacity`) so nothing is drawn where the user is looking;
+       *   - `pointer-events: none` so the invisible row cannot swallow the next
+       *     click — a click that would otherwise open the session behind the
+       *     menu;
+       *   - `transform` moves that box onto the pointer, which is what the host
+       *     then measures. It does not affect layout, so nothing around it
+       *     shifts.
+       *
+       * The undo restores the four properties to the values they held BEFORE,
+       * and only those four. A caller that wants the row left exactly as it was
+       * found gets exactly that.
+       *
+       * @param {Element} row - the host row to move.
+       * @param {Element} button - the anchor inside it.
+       * @param {number} x - viewport x of the gesture.
+       * @param {number} y - viewport y of the gesture.
+       * @returns {() => void} the undo.
+       */
+      const anchorRowAtPointer = (row, actions, button, x, y) => {
+        const style = row.style
+        if (style == null) return () => {}
+        const PROPS = ['display', 'opacity', 'pointer-events', 'transform']
+        const prior = new Map()
+        const applied = new Map()
+        for (const prop of PROPS) {
+          prior.set(prop, [style.getPropertyValue?.(prop) ?? '', style.getPropertyPriority?.(prop) ?? ''])
+        }
+        const set = (prop, value) => {
+          try {
+            style.setProperty(prop, value, 'important')
+            applied.set(prop, value)
+          } catch { /* nothing was written, so nothing has to be undone */ }
+        }
+        // Laid out so the button has a real box, invisible so nothing is drawn
+        // where the user is looking, and inert so it cannot swallow the next
+        // click. The transform moves that box onto the pointer — which is what
+        // the host measures — without affecting layout.
+        set('display', 'flex')
+        set('opacity', '0')
+        set('pointer-events', 'none')
+        // THE ORDERING THAT MAKES THIS WORK. `.rowActions` is `display: none`
+        // until the row is hovered or its menu is open (Rows.module.css:256-269),
+        // so the button's box is 0×0 at this point and measuring it would place
+        // the row at the pointer's coordinates OFFSET FROM THE ORIGIN — a menu
+        // that opens at the bottom of the screen. The container is put on screen
+        // first, and only then measured; the host's own `menuOpen` class takes
+        // over keeping it visible until the row is handed back.
+        //
+        // `actionsPrior` is captured here rather than with the row's own props
+        // because this is the HOST's element: its `display` is given back by the
+        // same compare-and-restore rule, not by an unconditional remove.
+        let actionsPrior = null
+        try {
+          if (actions?.style != null) {
+            actionsPrior = [
+              actions.style.getPropertyValue?.('display') ?? '',
+              actions.style.getPropertyPriority?.('display') ?? '',
+            ]
+            actions.style.setProperty('display', 'inline-flex', 'important')
+          }
+        } catch { /* the measurement below falls back to the row's own box */ }
+        let rect = null
+        try {
+          rect = button.getBoundingClientRect()
+        } catch { rect = null }
+        if (rect != null && typeof rect.left === 'number' && (rect.width > 0 || rect.height > 0)) {
+          const dx = Math.round(x - (rect.left + rect.width / 2))
+          const dy = Math.round(y - (rect.top + rect.height / 2))
+          set('transform', `translate(${dx}px, ${dy}px)`)
+        }
+        return () => {
+          for (const prop of PROPS) {
+            // Only undo a property that still carries OUR value. Someone who
+            // wrote this inline style in the meantime owns it now.
+            let current = null
+            try {
+              current = style.getPropertyValue?.(prop) ?? ''
+            } catch { continue }
+            if (current !== applied.get(prop)) continue
+            const [value, priority] = prior.get(prop)
+            try {
+              if (value === '') style.removeProperty(prop)
+              else style.setProperty(prop, value, priority)
+            } catch (error) {
+              warn(`could not hand the anchor style ${prop} back: ${describeError(error)}`)
+            }
+          }
+          const container = actions?.style
+          if (container != null && actionsPrior !== null) {
+            try {
+              if ((container.getPropertyValue?.('display') ?? '') === 'inline-flex') {
+                if (actionsPrior[0] === '') container.removeProperty('display')
+                else container.setProperty('display', actionsPrior[0], actionsPrior[1])
+              }
+            } catch (error) {
+              warn(`could not hand the anchor container's display back: ${describeError(error)}`)
+            }
+          }
+        }
+      }
+
+      /**
+       * The ONE temporary-anchor transaction.
+       *
+       * A second right-click, the menu closing, an unmount and teardown all
+       * release through this single holder, so there is never more than one
+       * styled row and never a second timer set to restore it. Its timers go
+       * through `ownTimer`, so teardown's drain covers them even if a release
+       * is missed.
+       * @type {{row: Element, restore: (() => void) | null, refold: (() => void) | null, watch: unknown, settle: unknown} | null}
+       */
+      let officialAnchor = null
+
+      /** Release the transaction, if any. Safe to call from anywhere, repeatedly. */
+      const restoreOfficialAnchor = () => {
+        const tx = officialAnchor
+        if (tx === null) return
+        officialAnchor = null
+        releaseTimer(tx.watch)
+        releaseTimer(tx.settle)
+        tx.watch = null
+        tx.settle = null
+        try {
+          tx.restore?.()
+        } catch (error) {
+          warn(`could not hand the anchor row back: ${describeError(error)}`)
+        }
+        try {
+          tx.refold?.()
+        } catch (error) {
+          warn(`could not re-fold the expanded group: ${describeError(error)}`)
+        }
+      }
+
+      /** Watch for the host menu closing, then hand the row back. */
+      const watchOfficialMenu = (tx) => {
+        const poll = () => {
+          if (!alive() || officialAnchor !== tx) return
+          const closed = tx.row.isConnected !== true || officialMenuOpenOn(tx.row) !== true
+          if (closed === true || Date.now() - tx.openedAt >= OFFICIAL_MENU_MAX_MS) {
+            restoreOfficialAnchor()
+            return
+          }
+          tx.watch = ownTimer(setTimeout(poll, OFFICIAL_MENU_POLL_MS))
+        }
+        tx.watch = ownTimer(setTimeout(poll, OFFICIAL_MENU_POLL_MS))
+      }
+
+      /**
+       * Re-check the anchor shortly after a gesture that would close the host
+       * menu (a pointerdown, Escape, blur, resize). The host's own close lands
+       * inside the same dispatch, so the check is armed after it — restoring
+       * first would move the anchor out from under a menu that is still open,
+       * and the host re-measures its position every frame while it is.
+       */
+      const scheduleOfficialSettle = () => {
+        const tx = officialAnchor
+        if (tx === null || tx.settle !== null) return
+        const check = () => {
+          tx.settle = null
+          if (!alive() || officialAnchor !== tx) return
+          if (tx.row.isConnected !== true || officialMenuOpenOn(tx.row) !== true) restoreOfficialAnchor()
+        }
+        tx.settle = ownTimer(setTimeout(check, 0))
+      }
+
+      /**
+       * Open the HOST's own menu for a session, wherever its row lives.
+       *
+       * `hostRow` is passed when the caller already has the row. When there is
+       * none, the owning group is expanded through its own header toggle — the
+       * same path the pin fold uses — and this returns having CLAIMED the
+       * gesture; the row arrives a moment later.
+       *
+       * @param {object | null} flavor - the detected sidebar.
+       * @param {string} id - the session.
+       * @param {number} x - viewport x of the gesture.
+       * @param {number} y - viewport y of the gesture.
+       * @param {Element | null} hostRow - the row, when it is already mounted.
+       * @returns {boolean} true when the gesture is claimed (the host menu is
+       *   opening, or is about to); false when the caller should fall back.
+       */
+      const openOfficialRowMenu = (flavor, id, x, y, hostRow) => {
+        if (!alive()) return false
+        if (flavor !== FLAVOR_OFFICIAL) return false
+        const row = hostRow ?? hostRowFor(flavor, id)
+        if (row === null) return expandGroupForSession(flavor, id, x, y)
+        const control = officialRowMenuControl(row)
+        if (control === null) return false
+
+        // One transaction at a time: a second gesture releases the first, and a
+        // release puts back both the styled row and any group opened for it.
+        restoreOfficialAnchor()
+        const tx = { row, restore: null, refold: null, watch: null, settle: null, openedAt: Date.now() }
+        if (pointerOutsideRow(row, x, y) === true) {
+          tx.restore = anchorRowAtPointer(row, control.actions, control.button, x, y)
+        }
+        officialAnchor = tx
+        try {
+          control.button.click()
+        } catch (error) {
+          warn(`could not open the host's session menu: ${describeError(error)}`)
+          restoreOfficialAnchor()
+          return false
+        }
+        watchOfficialMenu(tx)
+        return true
+      }
+
+      /**
+       * The workspace a session belongs to, or null when the store does not say.
+       * @param {string} id - the session.
+       * @returns {string | null} the workspace key.
+       */
+      const groupKeyForSession = (id) => {
+        for (const item of workspaceItems()) {
+          if (item.sessionIds.includes(id) === true) return item.workspaceId
+        }
+        return null
+      }
+
+      /**
+       * Make a row exist for a session whose group is folded.
+       *
+       * The host renders NO session rows for a folded group
+       * (`WorkspaceBrowser.tsx:484`), so for a PINNED session — whose group the
+       * pin rule folds — the row a right-click must borrow is usually not in the
+       * document. Expansion goes through the group's own header click, once, for
+       * that group alone, and only when it is actually folded.
+       *
+       * The WAIT is part of the same transaction as the anchor: it is what holds
+       * the group open, so teardown and a second right-click release it through
+       * `restoreOfficialAnchor` and the group goes back exactly as it was found.
+       * A group this did not open is never closed.
+       *
+       * @returns {boolean} true — the gesture is claimed; false when the caller
+       *   should fall back to the plugin's own menu.
+       */
+      const expandGroupForSession = (flavor, id, x, y) => {
+        if (!alive()) return false
+        const key = groupKeyForSession(id)
+        if (key === null) return false
+        const header = groupHeader(flavor, key)
+        if (header === null) return false
+        if (header.getAttribute('aria-expanded') === 'true') return false
+
+        restoreOfficialAnchor()
+        const openedByUs = toggleGroupHeader(header, key)
+        const tx = { row: header, restore: null, refold: null, watch: null, settle: null, openedAt: Date.now() }
+        if (openedByUs === true) {
+          tx.refold = () => {
+            if (header.isConnected !== true) return
+            if (header.getAttribute('aria-expanded') !== 'true') return
+            toggleGroupHeader(header, key)
+          }
+        }
+        officialAnchor = tx
+
+        const deadline = Date.now() + GROUP_EXPAND_TIMEOUT_MS
+        const wait = () => {
+          tx.watch = null
+          if (!alive() || officialAnchor !== tx) return
+          const row = hostRowFor(flavor, id)
+          if (row !== null) {
+            const refold = tx.refold
+            officialAnchor = null
+            if (openOfficialRowMenu(flavor, id, x, y, row) === true) {
+              officialAnchor.refold = refold
+            } else {
+              refold?.()
+              openMenu(id, x, y)
+            }
+            return
+          }
+          if (Date.now() >= deadline) {
+            // No row, no menu: put the group back and leave the user the pin
+            // fallback rather than an expansion with nothing in it.
+            restoreOfficialAnchor()
+            openMenu(id, x, y)
+            return
+          }
+          tx.watch = ownTimer(setTimeout(wait, GROUP_EXPAND_POLL_MS))
+        }
+        tx.watch = ownTimer(setTimeout(wait, GROUP_EXPAND_POLL_MS))
+        return true
+      }
+
+      /**
+       * Open the menu for one of the plugin's own region rows.
+       *
+       * The pin actions are the owner's, not ours: the gesture is re-delivered
+       * to the host's own row for this session, so a shared owner builds its
+       * full menu there — and so our own handler, which sees the same
+       * re-delivered gesture, turns it into the host's own row menu when no
+       * owner claimed it. That is what makes a pinned row offer exactly what an
+       * ordinary host row offers, with the same session behind it.
+       *
+       * The plugin-owned menu is the FALLBACK, reached only when there is
+       * nothing to borrow: no host row mounted even after expanding its group,
+       * no host "…" control on it, or no `MouseEvent` to build the re-delivery
+       * with.
        *
        * @param {Element} row - a `[data-stp-row]` element.
        * @param {number} x - viewport x.
@@ -2851,10 +5938,32 @@ window.__ModuleLoader__.load({
         const flavor = currentFlavor(Date.now())
         const hostRow = hostRowFor(flavor, id)
         if (hostRow !== null) {
-          // Registration only; it says nothing about who owns the gesture.
           publishSharedMenu()
-          if (redispatchContextMenu(hostRow, x, y)) return
+          const forwarded = redispatchContextMenu(hostRow, x, y)
+          if (forwarded !== null) {
+            // codex only. The stock sidebar's own "…" menu is served by our
+            // ordinary handler, which sees this same re-delivered event and
+            // decides about it one microtask later; giving it a second path to
+            // open a menu would put two of them on one gesture. What codex
+            // leaves open is whether its OWN session-row handler claimed the
+            // gesture — lib/client.js:4617, a synchronous `preventDefault` — and
+            // the whole dispatch has finished by the time this reads that.
+            if (flavor.nativeContextMenu === true) {
+              afterDispatch(() => {
+                if (!alive()) return
+                if (forwarded.defaultPrevented === true) return
+                openMenu(id, x, y)
+              })
+            }
+            return
+          }
         }
+        // No re-delivery at all: no `MouseEvent` to build one with, or the host
+        // row refused it. Nothing was served and nothing could be, so there is
+        // no host menu to leave alone and no reason to drop the gesture — the
+        // upstream suppression has already taken the browser's own menu out of
+        // it. The host's "…" menu is tried first, exactly as on any other row.
+        if (openOfficialRowMenu(flavor, id, x, y, hostRow) === true) return
         openMenu(id, x, y)
       }
 
@@ -2883,6 +5992,14 @@ window.__ModuleLoader__.load({
         // trying on a bounded timer while it has not taken: which of the two
         // plugins applies first is not something this bundle can know.
         if (!registerSharedMenu()) scheduleSharedMenu()
+
+        // And the stock sidebar's own session-row menu, for the same reason and
+        // at the same time. It is called HERE, not next to the code that defines
+        // it, for the only reason that matters: registering an entry can make the
+        // host render it synchronously, and a render that reaches
+        // `openColorDialog` before this mount's own `const` bindings exist is a
+        // TDZ ReferenceError inside somebody else's render.
+        registerOfficialColorMenu()
 
         // Re-run on every list/broadcast change: the pin set, the group
         // membership and the session summaries all drive the projection.
@@ -2913,6 +6030,9 @@ window.__ModuleLoader__.load({
 
         // Dismiss the context menu on any outside interaction.
         onDismiss = (event) => {
+          // The host's own menu closes on exactly these gestures, so they are
+          // also when the borrowed anchor row must be handed back.
+          scheduleOfficialSettle()
           if (menuState === null) return
           if (event.type === 'keydown' && event.key !== 'Escape') return
           const target = event.target
@@ -2924,6 +6044,11 @@ window.__ModuleLoader__.load({
         document.addEventListener('keydown', onDismiss, true)
         window.addEventListener('blur', onDismiss)
         window.addEventListener('resize', closeMenu)
+        // Paired through the SAME disposer list the subscriptions use, so
+        // teardown cannot leave a `storage` listener behind that keeps
+        // repainting rows for a generation that no longer exists.
+        window.addEventListener('storage', onRowColorsStorage)
+        disposers.push(() => { window.removeEventListener('storage', onRowColorsStorage) })
 
         scheduleReconcile()
 
@@ -2950,7 +6075,7 @@ window.__ModuleLoader__.load({
       const summary = () => `flavor ${flavorId()}`
         + `, list ${phaseOf()}`
         + `, pin ${pinSession === undefined ? 'unavailable' : 'ok'}`
-        + `, sessions ${sessions === undefined ? 'absent' : 'ok'}`
+        + `, sessions ${sessionsService() === undefined ? 'absent' : 'ok'}`
         + `, uiWorkspace ${uiWorkspace === undefined ? 'absent' : 'ok'}`
         + `, menu ${sharedMenuRegistered(sharedMenuApi()) ? 'shared' : 'own'}`
         + `, pinned ${pinSet().size}`
