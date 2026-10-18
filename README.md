@@ -105,22 +105,28 @@ entry 各注册一条低一档 priority 的影子，复用原 component 和原 i
 
 ## 两种侧栏（重要）
 
-用户机器上真正的侧栏是 **`@michengai/dsh-codex-ui` 1.1.35**，它的
-`cordis.patch.yml` 禁用了官方 `ui-sidebar`。第一版只写官方选择器，在那台机器上
-一个都匹配不上 —— 症状是「boot 0 错误但界面零效果」，因为「什么都没渲染」和
-「功能被禁用」看起来一模一样。
+用户机器上真正的侧栏是 **`@michengai/dsh-codex-ui`**（实测装的是 1.1.42），它
+以 `cordis.patch.yml` 插进组合，并以 `priority: -1` 抢下 `sidebar.workspaces`
+这个 `single` slot——官方那个 `WorkspaceBrowser` 因此**从不挂载**。第一版只写
+官方选择器，在那台机器上一个都匹配不上 —— 症状是「boot 0 错误但界面零效果」，
+因为「什么都没渲染」和「功能被禁用」看起来一模一样。
 
-现在按**属性存在性**探测，不做类名全文匹配：
+现在按**属性存在性**探测，不做类名全文匹配。**官方标记优先**：官方行
+（`data-row-key^="session:"`）一旦在页面上就以官方为准，因为 codex 的 dcu 属性是
+**叠加**上去的，官方树一旦挂上（profile 同时装了官方浏览器，或官方树比 codex-ui
+活得久）就该认它。官方侧的搜索结果树不会误判——它的 `SearchResultItem` 行根本不带
+`data-row-key`（`rows/WorkspaceBrowser.tsx:850-857`）。每一轮 reconcile 都重新
+探测，实测 codex → official → codex 两头都能纠正回来。
 
-| 行为 | codex-ui（真机） | 官方 ui-sidebar 0.2.0-rc.2 |
+| 行为 | codex-ui（真机） | 官方 ui-workspace |
 |---|---|---|
 | 会话行选择器 | `[data-dcu-session]` | `[data-row-key^="session:"]` |
 | 从行取 session id | `getAttribute('data-dcu-session')`（**原始 id**，形如 `session-<uuid>`） | `getAttribute('data-row-key').slice(8)` |
 | 分组表头 | `.dcu-wb-project-head[aria-expanded]`（无 id 属性，靠 `.dcu-wb-project` 的**祖先链**定位，结果缓存） | `[data-row-key^="workspace:"]`（自带 workspace key） |
-| 会话列表容器 | `[role="tree"]` | `[role="tree"][aria-label]` |
+| 会话列表容器 | `[role="tree"]`（`.dcu-wb-tree`，**无** aria-label） | `[role="tree"][aria-label]`（label = `t('section.sessions')`） |
 | 置顶隐藏规则 | `[role='tree'] [data-dcu-session="<id>"]` | `[role='tree'] [data-row-key='session:<id>']` |
 | 主题 token | `--dcu-sidebar-*` | `--dsh-*` |
-| 右键菜单 | 发布进**共享扩展表**，由 `@baihejiangnan/dsh-session-context-menu` 渲染 | 同左（两种侧栏共用同一条接缝） |
+| 右键菜单 | 宿主自己的 `sessionMenuItems()`，**没有**置顶项，也加不进去 | `sidebar.workspaces.session.menu.item`，有官方 `pin` 行；本插件在旁边加 `dsh-session-top.row-color`（order 500） |
 
 ### 侧栏上另外几件实际行为
 
@@ -201,8 +207,29 @@ sessionId），不是「什么都不做」；**取消和 Esc 一点都不写**�
 仍保持"`input` 只预览、`change` 才保存"，那是另一条路径的行为，不是新对话框的默认交互。
 
 **行标题字号分两档，作用域很窄。** 只有被 `data-stp-typography` 标记的那棵树里、
-工作区与会话行的 `_title`（以及同位的改名输入框）降到 12px/400/16；置顶区自己那几行
-保持 14px/500/20。
+工作区与会话行的标题（以及同位的改名输入框）降到 12px/400/16；置顶区自己那几行
+保持 14px/500/20。官方侧栏的标题用 `[class*='_title']`（CSS module 哈希类里的
+可读片段），codex 侧栏没有哈希类可匹配，直接点名它自己的
+`.dcu-wb-session-title` / `.dcu-wb-project-title` / `.dcu-wb-collection-label`，
+改名输入框是 `.dcu-wb-rename-input`。
+
+**紧凑化必须覆盖 codex 自己的行，否则等于没做。** 行高和字号两段规则原来只写
+`data-row-key`，而 codex 的行是 `data-dcu-session` + `.dcu-wb-session`，**一个
+`data-row-key` 都没有**：标记照样落在 `.dcu-wb-tree` 上，下面每条规则却一条都匹配
+不到，界面看起来完全没生效。现在两种侧栏的行都进规则——codex 的会话行
+`[data-dcu-session]`、目录头 `.dcu-wb-project-head`、分组头
+`.dcu-wb-collection-head` / `.dcu-wb-section-head`——统一收到 26px 行高 / 24px
+最小命中区，作用域仍然全部挂在 `data-stp-typography` 之下。
+`test/sidebar-dom.mjs` 里有一条专门的断言就是钉这个的：规则在，且必须仍然挂在
+标记之下。
+
+**分组头要连它自己的标题一起收，否则收出一个溢出。** codex-ui 把标题的尺寸和头
+是分开定的：`.dcu-wb-collection-label` 是 `min-height:32px` + 4px padding，
+`.dcu-wb-section-label` 是 `min-height:24px` + 2px padding。只把头压到 26px、
+标题不动，就是把一个 32px 以上的子元素 `align-items:center` 地塞进 26px 的盒子里
+——上下各溢出几像素，点击区也跑到它所属的分组头外面去了。所以这两个 label 和
+它们的头在同一条规则里收，并且显式 `border-box`：否则它们自己的 padding 会加在
+声明的高度之外，这正是官方侧栏那条规则早就写在 `box-sizing` 上的同一个原因。
 
 **紧凑化：真实页面上量到的值。** 下面每个数字都是在真实官方侧栏上量到的 before → after，
 不是设计意图：
@@ -330,6 +357,12 @@ ctx.inject(['workspaces'], (child) => mount(child, warn))
 - 列表真正 ready 后再补一行 `workspace list ready — … pinned 2`：`pinnedSessionIds`
   在 `phase: pending/loading` 期间本来就是空的，挂载那一刻打出来的 `pinned 0`
   说明不了任何置顶状态
+- **host 半边**那行 `active (activity …, N pinned, …)` 只在 `workspaceRegistry`
+  已经 publish 时才报数字；没 publish 就写成
+  `pinned count unavailable (no workspaceRegistry yet)`，而不是一个会被人当成事实的
+  `0`。`inject` 保持 `[]` 就是为了在没有 `workspaceRegistry` 的宿主上照常跑，
+  这个代价必须如实标出来而不是藏起来。实时数字看
+  `GET /api/dsh-session-top/status`（loopback only）
 - 20s 还没等到 → `console.warn('[dsh-session-top] workspace controller still unpublished after 20s; …')`
 - 任何降级路径各自 `console.warn`，写明原因
 
@@ -353,13 +386,51 @@ ctx.inject(['workspaces'], (child) => mount(child, warn))
 `test/core.test.js` 里有一条静态拦截：源码里出现 `insertRule` / `deleteRule` /
 `cssRules` 就失败。
 
-## 右键：codex-ui 分支只观察，不碰事件
+## 右键：codex-ui 的宿主菜单不能借——但装了共享 owner 时借得更值
+
+codex-ui 的行菜单是 `SessionRow` 的一个 **prop**，由它自己的 `sessionMenuItems()`
+现场拼出来（`@michengai/dsh-codex-ui` lib/client.js:1757-1836），**不是**
+`sidebar.workspaces.session.menu.item` 那张 slot 表。条目是重命名 / 标记为未读 /
+归档 / 分叉 / 在资源管理器中打开 / 项目 / 复制会话 ID / 复制会话标题 /
+复制工作目录（注册表允许时还有删除）——**没有取消置顶，也没有自定义行背景颜色**，
+而且加不进去：codex-ui 自己以 `priority: -1` 抢占了 `sidebar.workspaces` 这个
+`single` slot（`ui-slots/src/index.ts` 的 `entriesOfSlot`：每个 cell 只返回第一个
+存活条目），官方那个**声明了 `session.menu.item` 并注册 `pin` 行**的
+`WorkspaceBrowser` 因此从不挂载，那张列表没有任何渲染者；本插件注册进同一张
+列表的颜色项也同样注册成功、没人画。
+
+**所以「有没有共享 owner 在场」决定走哪条路，这是承重的，不是可有可无的：**
+
+- **owner 不在场** → 自有置顶行的右键**不转发**宿主行，直接 `openMenu` 开自己的
+  菜单（取消置顶 + 自定义行背景颜色…）。转发在这个宿主上买到的是一条**缺了这两项**
+  的菜单，而自己的菜单正好只有这两项。
+- **owner 在场** → **仍然转发**，因为共享 owner
+  （`@baihejiangnan/dsh-session-context-menu`）**根本不用那张 slot 表**：它自己
+  从零拼一个 `.dshcm-menu`，并从
+  `Symbol.for('dsh.session-context-menu.extensions')` 里读本插件注册进去的条目。
+  于是在**同一个 codex 宿主**上，它的菜单同时有宿主动作（重命名 / 归档…）
+  **和**取消置顶**和**行颜色——比上面两个选项都多。此时短路转发只会白白拿走这些。
+  判据用 `sharedMenuRegistered(sharedMenuApi())`，读 owner 自己的 `list()`，
+  不是记住注册时的状态，所以 owner 卸载后自动退回「不转发」那一支。
+
+普通未置顶的宿主行在两种情况下都仍然只观察、不抢——那条菜单有八九项能用的动作，
+本插件替换不了。官方侧栏（`nativeContextMenu: false`）不受影响，仍然转发，菜单里
+同时有官方 `pin` 行和本插件的颜色项。
+
+这两个半边都有断言：`test/sidebar-dom.mjs` 钉「owner 不在场」，
+`test/owner-menu-real.mjs` 拿**真实 owner 产物**钉「owner 在场」（它断言的正是
+自有菜单**不得**出现、必须由 owner 建出完整菜单）。只钉一半，就是上一版把
+owner 集成改坏的那条路。
+
+仍然**不向宿主菜单 DOM 嫁接节点**，也不重新实现宿主的重命名 / 归档 / 分叉。
+
+## 右键：宿主行那一支只观察，不碰事件
 
 真机上 codex-ui 的行菜单**不再打开**（`[role=menu]` count=0）。React 是把监听
 挂在 **root 容器**上的（委托），所以只要事件在 document 捕获阶段被打断
 （`stopPropagation` 之类），React 根本收不到，菜单永远不开。
 
-现在 codex 分支在 `return` 之前**完全不碰 `event`** —— 不 preventDefault、
+现在宿主行的分支在 `return` 之前**完全不碰 `event`** —— 不 preventDefault、
 不 stopPropagation、不 stopImmediatePropagation，事件原样放行，插件只是观察。
 
 追加逻辑也收紧了：只碰**右键之后才出现**的菜单面。右键之前就已经开着的菜单
@@ -398,19 +469,29 @@ ctx.inject(['workspaces'], (child) => mount(child, warn))
 | # | 条件 | 行为 | 是否碰 event |
 |---|---|---|---|
 | 1 | 事件到达时 `defaultPrevented` 已为 true | **只观察**（owner 或别人已经接手） | 否 |
-| 2 | `closest('[data-stp-row]')` 命中 | 立即开自己的菜单 | **是**（自有行，没有宿主菜单竞争） |
+| 2 | `closest('[data-stp-row]')` 命中 | 转发宿主行（官方侧栏，或 codex 宿主且共享 owner 在场）/ 立即开自己的菜单（其余情况） | **是**（自有行，没有宿主菜单竞争） |
 | 3 | `flavor === null` | **只观察** | 否 |
 | 4 | 解析出宿主的 session 行，且 dispatch 结束时仍无人处理 | 延后一个微任务开自己的兜底菜单 | **是**（dispatch 之后） |
 
-区域行的重投递是第 2 条的内部动作，判据同第 1、4 条但作用在**转发出去的**那个
-事件上：谁 `preventDefault()` 就是谁认领，无人认领才落到置顶/取消置顶兜底菜单，
-连事件都发不出去也落到兜底。"宿主行存在"不是认领。
+第 2 条里的「转发」在两种宿主上会发生，各有各的理由：
+
+- **官方侧栏**：宿主菜单由 `sidebar.workspaces.session.menu.item` 渲染，`pin` 行
+  就在里面，本插件再把 `pinSession`/`unpinSession` 两个回调换成颜色对话框，于是同
+  一条菜单里既有官方的置顶/取消置顶、也有本插件的 `自定义行背景颜色…`。
+- **codex 宿主，且共享 owner 在场**：owner 自己建菜单、且从共享表读到本插件的
+  两个条目，比宿主那条多得多，理由见上一节。
+
+codex 宿主**没有 owner 时**不走转发：它的菜单里既没有这两项、也加不进去，
+转发只会买到一条更差的菜单。
+
+在**转发**这条路上，判据同第 1、4 条但作用在**转发出去的**那个事件上：谁
+`preventDefault()` 就是谁认领，无人认领才落到置顶/取消置顶兜底菜单，连事件都发
+不出去也落到兜底。"宿主行存在"不是认领。
 
 React 把监听挂在 **root 容器**上，所以捕获阶段任何中断都会让宿主菜单永远
 打不开 —— codex-ui 的行菜单因此死过两次。现在「不认识 = 只观察」，不做任何
 事件修改、不开自己的菜单。owner 在场时它自己 `preventDefault`，第 4 条就永远
-不触发；owner 不在场（或卸载后条目还留在它的表里）时第 4 条接管。两种侧栏走的是
-同一条接缝，不存在「codex 追加 / 官方接管」的分支。
+不触发；owner 不在场（或卸载后条目还留在它的表里）时第 4 条接管。
 
 `test/sidebar-dom.mjs` 用挂在 tree 上的哨兵监听器模拟 React root，断言事件
 仍然能到达；另有行为测试：flavor none 完全不干预、区域行不带宿主标记、

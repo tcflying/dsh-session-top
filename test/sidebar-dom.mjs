@@ -4115,42 +4115,72 @@ function rightClickAt(run, target, x, y) {
   console.log('✔ codex pinned row with no host row: the pin fallback, not a dead right-click')
 }
 
-// --- 2j: with the host row MOUNTED, codex still owns the gesture. The fallback
-//     above is for the case where there is nothing to serve it — not a licence
-//     to cover a menu codex is about to open.
+// --- 2j: on a codex host with NO shared owner, the hand-off is NOT taken, even
+//     with the host row MOUNTED. This assertion was inverted when the codex-ui
+//     runtime was measured for real, and the measurement is the reason.
 //
-//     What "codex serves it" means here is the ROW'S OWN handler claiming the
-//     re-delivered event (lib/client.js:4617), so this case asserts the claim
-//     itself: that the handler really received the gesture, before it asserts
-//     that the plugin stood down for it. A mounted row is not a claim.
+//     `@michengai/dsh-codex-ui` builds its row menu inline in
+//     `sessionMenuItems()` (lib/client.js:1757-1836) and hands it to
+//     `SessionRow` as a prop. It is not the `sidebar.workspaces.session.menu.item`
+//     slot: codex-ui claims that `single` slot itself at `priority: -1`, so the
+//     stock `WorkspaceBrowser` — the entry that DECLARES the menu.item list and
+//     registers the stock `pin` row — never mounts and never renders it. The
+//     plugin's own colour item, registered into that same list, is in the same
+//     position: present in the registry, drawn by nobody.
+//
+//     So the menu codex really opens is CODEX_SESSION_MENU: rename / unread /
+//     archive / fork / openPath / moveWorkspace / copyId / copyTitle / copyPath,
+//     none of them Unpin, none of them a row colour. Forwarding the gesture
+//     therefore handed the user a menu with nothing in it that a PINNED row
+//     needs, while the plugin's own menu holds exactly those two actions.
+//
+//     "NO SHARED OWNER" IS LOAD-BEARING IN THIS CASE, not decoration. The owner
+//     (`@baihejiangnan/dsh-session-context-menu`) does not use that slot either:
+//     it builds its own `.dshcm-menu` and reads our entries out of
+//     `Symbol.for('dsh.session-context-menu.extensions')`, so on this very host
+//     its menu carries the host actions AND Unpin AND the row colour. When it
+//     is installed, forwarding is the better answer and this short-circuit must
+//     NOT fire. `test/owner-menu-real.mjs` drives exactly that pair against the
+//     REAL artifact: with the owner, its full menu wins; without it, this case
+//     applies. Asserting only one half of that pair is how the previous
+//     revision shipped a regression.
+//
+//     codex's own rows are untouched either way: this never claims a host row,
+//     only a row this plugin drew.
 {
   const sc = codexScaffold()
   const run = await runBundle(sc, { pinned: [S1] })
   const own = sc.body.querySelector('[data-stp-row]')
   assert.ok(sc.body.querySelector('[data-dcu-session]') !== null, 'precondition: the host row is there')
-  rightClickAt(run, own, 140, 96)
+  assert.equal(
+    globalThis[Symbol.for('dsh.session-context-menu.extensions')], undefined,
+    'precondition: no shared owner is installed — this case is the no-owner half',
+  )
+  const event = rightClickAt(run, own, 140, 96)
   await settle()
   assert.deepEqual(
-    sc.nativeClaims.map(claim => claim.id), [S1],
-    'codex\'s own row handler must really have received the forwarded gesture, exactly once',
+    sc.nativeClaims, [],
+    'the host\'s own row handler must NOT be handed a pinned row\'s gesture — its menu has no Unpin and no colour',
   )
-  assert.deepEqual(
-    [sc.nativeClaims[0].x, sc.nativeClaims[0].y], [140, 96],
-    'and at the pointer the user actually used',
+  const menu = sc.body.querySelector('[data-stp-menu]')
+  assert.ok(menu !== null, 'the plugin-owned menu opens on the pinned row instead')
+  assert.match(
+    menu.querySelector('[data-stp-pin-item]').textContent, /取消置顶/,
+    'and the first thing in it is the Unpin a pinned row exists for',
   )
-  const hostMenu = sc.body.querySelector('.dcu-host-menu')
-  assert.ok(hostMenu !== null, 'codex\'s own session menu is the one that opened')
-  assert.deepEqual(
-    [...hostMenu.children].map(item => item.textContent), CODEX_SESSION_MENU,
-    'with its own actions — nothing added, nothing removed',
+  assert.match(
+    menu.querySelector('[data-stp-color-item]').textContent, /自定义行背景颜色/,
+    'and the row colour the host menu could not carry',
   )
-  assert.equal(
-    sc.body.querySelector('[data-stp-menu]'), null,
-    'a gesture codex claimed must never be covered by the plugin\'s one-item menu',
-  )
+  assert.equal(sc.body.querySelector('.dcu-host-menu'), null, 'no host menu is opened behind it')
+  assert.equal(event.defaultPrevented, true, 'and never the browser default')
   run.dispose()
-  console.log('✔ codex pinned row with its host row: the host\'s own handler claims it, and we stand down')
+  console.log('✔ codex pinned row, no owner: its own menu (Unpin + colour), not the host\'s menu without them')
 }
+
+// (The host's OWN rows stay observe-only — that is case 2c above, which holds
+//  for a pinned session's host row too: the plugin claims only rows it drew,
+//  never a `[data-dcu-session]` the host rendered.)
 
 // =====================================================================
 // REQUIREMENT 3 — the Pinned region's OWN header folds its rows away.
@@ -5454,7 +5484,7 @@ function makeRowMenuSlots() {
     'a NEW namespaced id, added beside the host entry — never a shadow of it',
   )
   const ours = slots.entries.find(e => e.options.id === OFFICIAL_COLOR_ID)
-  assert.equal(ours.options.order, 450, 'and it reads after the host\'s own Pin item')
+  assert.equal(ours.options.order, 500, 'and it reads after EVERY one of the host\'s own items (pin 100, rename 200, fork 300, archive 400), so it never wins a tie')
   assert.equal(ours.options.locale, 'dsh-ui-sidebar', 'the host\'s locale namespace is kept, so its other keys still translate')
   assert.equal(slots.entries[0].options.order, 100, 'the host\'s own Pin entry is untouched')
   assert.equal(slots.entries[0].registrant, 'ui-sidebar')
@@ -6048,6 +6078,149 @@ function importantOf(css, selector) {
   )
   run.dispose()
   console.log('✔ typography: an unproven sidebar is left entirely alone')
+}
+
+// --- THE COMPACTION HAS TO REACH THE SIDEBAR THAT IS ACTUALLY ON SCREEN.
+//
+//     This is the assertion the previous revision was missing, and it is the
+//     one that matters on a codex-ui profile. The stock sidebar's rows carry
+//     `data-row-key`; codex-ui's carry `data-dcu-session` and a
+//     `dcu-wb-session` class and NO `data-row-key` at all. So a stylesheet
+//     whose row selectors only spoke `data-row-key` was fully applied and
+//     matched nothing: the marker went onto `.dcu-wb-tree` and every rule
+//     below it hung in the sheet inert. Nothing failed, nothing warned — the
+//     sidebar simply stayed at the host's 30px.
+//
+//     The selectors are asserted against the REAL artifact's class names
+//     (`@michengai/dsh-codex-ui@1.1.42` lib/client.js: GroupHead at 1996-2017,
+//     SessionRow at 1926-1931, and the CSS table at 3671-3675), and each is
+//     required to hang off the marker like every other host rule, so the scope
+//     guarantee is not traded away to buy the reach.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [] })
+  const css = withoutComments(staticCss(sc))
+  const hostRules = rulesOf(css).filter(r => r.selector.includes(TYPOGRAPHY_ANCHOR))
+  const selectorsOf = (needle) => hostRules
+    .filter(r => r.selector.includes(needle))
+    .map(r => r.selector)
+
+  for (const needle of ['[data-dcu-session]', '.dcu-wb-project-head']) {
+    assert.ok(
+      selectorsOf(needle).length > 0,
+      `codex-ui's own row vocabulary is absent from the compaction: nothing matches ${needle}`,
+    )
+  }
+  // Reach AND scope, in one check: every rule that names a codex class still
+  // hangs off the proved tree, so a stray .dcu-wb-session elsewhere on the
+  // page cannot be restyled by it.
+  for (const rule of hostRules) {
+    assert.ok(
+      rule.selector.startsWith(TYPOGRAPHY_ANCHOR),
+      `a rule naming a host row escapes the marker: ${rule.selector}`,
+    )
+  }
+  // The row box, not just the text: a compacted line-height inside a 30px row
+  // leaves the row at 30px, which is the half that was actually wrong on screen.
+  const codexRhythm = hostRules.find(r =>
+    r.selector.includes('[data-dcu-session]') && declsOf(css, r.selector)['min-height'] !== undefined)
+  assert.ok(codexRhythm !== undefined, 'codex-ui rows need their own row-rhythm rule, not only a font-size one')
+  const rhythmDecls = declsOf(css, codexRhythm.selector)
+  assert.equal(rhythmDecls['height'], '26px', 'the 30px row is taken back to the compact 26px')
+  assert.equal(rhythmDecls['min-height'], '24px', 'and never below the 24px hit area')
+  assert.equal(rhythmDecls['box-sizing'], 'border-box', 'otherwise the padding adds outside the row')
+  // The same 12px/16px title the stock sidebar gets, so both hosts compact
+  // identically instead of the pinned region reading larger on one of them.
+  const codexTitle = hostRules.find(r => r.selector.includes('.dcu-wb-session-title'))
+  assert.ok(codexTitle !== undefined, "codex-ui's own title class must be addressed by name")
+  assert.equal(declsOf(css, codexTitle.selector)['font-size'], '12px')
+  assert.equal(declsOf(css, codexTitle.selector)['line-height'], '16px')
+  // And its inline rename field, which sits at 14px/20px in the host's own CSS
+  // table — left alone it visibly reflows the 26px row it lives in.
+  const codexInput = hostRules.find(r => r.selector.includes('.dcu-wb-rename-input'))
+  assert.ok(codexInput !== undefined, "codex-ui's rename input needs the same 12px as the stock sidebar's inline input")
+  // The two GROUP HEADS are compacted, so their own labels must be too.
+  // codex-ui sizes those independently (`.dcu-wb-collection-label`
+  // min-height:32px + 4px padding; `.dcu-wb-section-label` min-height:24px + 2px
+  // padding — lib/client.js CSS table at 3671-3674 and 3729-3733). A head forced
+  // to 26px while its label still needs 32+ centres a too-tall child that
+  // overflows both edges and drags its click area outside the header.
+  for (const label of ['.dcu-wb-collection-label', '.dcu-wb-section-label']) {
+    const rule = hostRules.find(r => r.selector.includes(label) && declsOf(css, r.selector)['min-height'] !== undefined)
+    assert.ok(
+      rule !== undefined,
+      `${label} is not compacted, so it overflows the 26px head it is centred in`,
+    )
+    assert.equal(declsOf(css, rule.selector)['box-sizing'], 'border-box', `${label}: otherwise its own padding adds outside the stated height`)
+    assert.equal(declsOf(css, rule.selector)['min-height'], '24px', `${label}: and it must come down to the compact box, not stay at the host's 32px`)
+  }
+  console.log('✔ compaction reaches codex-ui\'s own rows, under the marker, at the compact values')
+}
+
+// --- THE FLAVOR IS RE-PROBED, AND OFFICIAL WINS WHEN BOTH ARE ON THE PAGE.
+//
+//     codex-ui is loaded alongside the stock web app on a real profile
+//     (`D:/DSH-Next/data/home/profiles/desktop` bundles both) and wins the
+//     `sidebar.workspaces` slot at priority -1, so its rows are the ones in
+//     front of the user. Its dcu attributes are ADDITIVE though: the moment a
+//     stock row is on the page too — a profile that also loads the stock
+//     browser, or the window in which a stock tree outlives codex-ui — a
+//     codex-first probe addresses rows the user cannot see.
+//
+//     The observable is the marker itself, not a log line: the plugin writes
+//     `data-stp-typography` onto exactly the tree it proved, so "which tree
+//     carries the marker" IS "which flavor was chosen". A console line would
+//     only say that the two agree on a quiet machine.
+{
+  const sc = codexScaffold()
+  // A second list in the stock shape — the same listArea > treeBody > tree the
+  // stock sidebar really renders, with the label its AnimatedRows puts on the
+  // tree (t('section.sessions')) — and deliberately EMPTY. Empty is the point:
+  // a labelled tree with no host marker in it is exactly the shape findTree()
+  // accepts as a candidate and detectFlavor() must refuse, so it proves nothing
+  // here and the codex tree stands alone.
+  const stock = makeTree()
+  stock.tree.setAttribute('aria-label', '会话')
+  sc.body.appendChild(stock.listArea)
+  const stockTree = stock.tree
+
+  const run = await runBundle(sc, { pinned: [] })
+  assert.equal(
+    sc.tree.getAttribute('data-stp-typography'), '',
+    'with only codex-ui proven on the page, its tree is the one to address',
+  )
+  assert.equal(
+    stockTree.getAttribute('data-stp-typography'), null,
+    'and a labelled tree with no host marker in it is not one to address',
+  )
+
+  // A stock SESSION row appears — the positive marker, not the folded fallback.
+  const stockRow = new El('div')
+  stockRow.setAttribute('data-row-key', 'session:s1')
+  stockRow.setAttribute('role', 'treeitem')
+  stockTree.appendChild(stockRow)
+  await settle()
+  assert.equal(
+    stockTree.getAttribute('data-stp-typography'), '',
+    'the official positive marker outranks codex-ui\'s additive attributes',
+  )
+  assert.equal(
+    sc.tree.getAttribute('data-stp-typography'), null,
+    'and the marker is taken back off the tree it no longer belongs to',
+  )
+
+  // ...and it is corrected again the moment the stock row goes away. A decision
+  // frozen at mount is what made the plugin permanently blind to a sidebar that
+  // renders after it does.
+  stockRow.remove()
+  await settle()
+  assert.equal(
+    sc.tree.getAttribute('data-stp-typography'), '',
+    'codex → official → codex, each corrected on the pass that observes it',
+  )
+  assert.equal(stockTree.getAttribute('data-stp-typography'), null)
+  run.dispose()
+  console.log('✔ flavor: the official positive marker outranks codex, and the correction reaches both ways')
 }
 
 console.log('\nALL SIDEBAR-FLAVOR DOM CHECKS PASSED')

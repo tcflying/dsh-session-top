@@ -1833,11 +1833,25 @@ function applyImpl(ctx, config = {}) {
       } else {
         warnedRegistryMissing = false
       }
-      const pinned = registryProjection().pinned.length
+      // The count is read HERE, once, at apply — and `inject` is deliberately
+      // empty so this plugin still runs on a host with no workspaceRegistry at
+      // all (see the export above). That trade has a visible cost: on a host
+      // that publishes the registry a little after apply, an unguarded read
+      // returns an empty projection and the greeting announces "0 pinned"
+      // while the client half is already reading five. A bare 0 there is a
+      // false claim about the host, not a fact about the pin set.
+      //
+      // So the number is stated only when there was a registry to read, and
+      // its ABSENCE is stated otherwise. Nothing waits for the registry and
+      // nothing re-prints: this is a startup greeting, and a late second line
+      // would only be read by someone already looking at the first one. The
+      // live count is served by GET /api/dsh-session-top/status.
+      const pinned = registry === undefined ? null : registryProjection().pinned.length
+      const pinnedText = pinned === null ? 'pinned count unavailable (no workspaceRegistry yet)' : `${pinned} pinned`
       // The summary says where fallback times COME FROM rather than how many
       // there happen to be: a count here would invite reading it as "current
       // activity", which it has never been.
-      const summary = `dsh-session-top: active (activity ${activity}, debounce ${debounceMs}ms, ${pinned} pinned, `
+      const summary = `dsh-session-top: active (activity ${activity}, debounce ${debounceMs}ms, ${pinnedText}, `
         + `fallback times load on resync, state in ${pluginHome()})`
       info(summary)
       void logLine({ at: new Date().toISOString(), kind: 'start', summary })

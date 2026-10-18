@@ -898,36 +898,48 @@ function menuItem(document, label) {
   t.dispose(); t.disposeOwner()
 }
 
-// --- NO owner, but codex-ui's OWN session menu is there and claims the
-//     re-delivered gesture (lib/client.js:4617: preventDefault +
-//     stopPropagation + its own session menu). The plugin must observe the
-//     claim and stand down. "A host row exists" is NOT that claim — the only
-//     evidence of it is the re-delivered event coming back defaultPrevented.
+// --- NO owner, on a codex-ui host. The gesture is NOT handed to codex's own
+//     handler, and the plugin's own menu is what opens.
+//
+//     This case used to assert the opposite, and the real artifact is what
+//     turned it around. `HOST_MENU` is transcribed from codex-ui's own
+//     `sessionMenuItems()` (@michengai/dsh-codex-ui lib/client.js:1757-1833) —
+//     it is pinned here precisely so this suite can name what that menu does
+//     and does not contain. It contains no Unpin and no row colour, and it
+//     cannot be given them: the menu is a PROP of `SessionRow`, not the
+//     `sidebar.workspaces.session.menu.item` list, because codex-ui claims that
+//     `single` slot itself at priority -1 and the stock entry that declares the
+//     list never mounts to render it.
+//
+//     So forwarding bought the user a pinned row's menu with nothing in it that
+//     a pinned row needs, while the plugin's own menu holds exactly those two
+//     actions. The plugin's own row is served here; codex's own rows are
+//     untouched.
 {
   const t = await run({ pinned: [S1], withOwner: false, native: true })
   const ownRow = t.document.body.querySelector('[data-stp-row]')
   await rightClick(t.docListeners, ownRow.querySelector('[data-stp-row-title]'))
   assert.deepEqual(
-    t.nativeClaims.map(claim => claim.id), [S1],
-    'codex-ui\'s own handler must really have received the forwarded gesture, exactly once',
+    t.nativeClaims, [],
+    'codex-ui\'s own handler must NOT be handed a pinned row\'s gesture — its menu has no Unpin and no colour',
   )
-  assert.deepEqual(
-    [t.nativeClaims[0].x, t.nativeClaims[0].y], [120, 240],
-    'and at the pointer the user actually used',
-  )
-  const native = t.document.body.querySelector('.dcu-host-menu')
-  assert.ok(native !== null, 'codex-ui\'s own session menu must be the one that is open')
-  assert.deepEqual(
-    [...native.children].map(item => item.textContent), HOST_MENU,
-    'codex-ui\'s own menu, with its own actions, nothing added and nothing removed',
+  assert.equal(
+    t.document.body.querySelector('.dcu-host-menu'), null,
+    'no host menu is opened behind the plugin\'s',
   )
   assert.equal(t.document.body.querySelector('.dshcm-menu'), null, 'no owner means no owner menu')
-  assert.equal(
-    t.document.body.querySelector('[data-stp-menu]'), null,
-    'a gesture codex-ui claimed must never be covered by the plugin\'s one-item fallback',
+  const own = t.document.body.querySelector('[data-stp-menu]')
+  assert.ok(own !== null, 'the plugin\'s own menu opens on its own row')
+  assert.match(
+    own.textContent, /取消置顶/,
+    'and the first thing in it is the Unpin this pinned row exists for',
+  )
+  assert.match(
+    own.textContent, /自定义行背景颜色/,
+    'and the row colour the host menu could not carry',
   )
   t.dispose()
-  console.log('✔ no owner but codex-ui\'s own handler claims it: its menu stands, no fallback')
+  console.log('✔ no owner on a codex host: the pinned row is served by the plugin\'s own menu')
 }
 
 // --- NO owner and NO native claimer, with the host row still mounted. Nothing

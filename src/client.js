@@ -229,10 +229,30 @@ window.__ModuleLoader__.load({
     const detectFlavor = () => {
       // (1) A host SESSION row: the most specific thing either rendering puts
       // on the page, and specific about WHICH sidebar this is.
-      if (document.querySelector(FLAVOR_CODEX.sessionSelector) !== null) return FLAVOR_CODEX
+      //
+      // OFFICIAL FIRST, AND THE ORDER IS LOAD-BEARING.
+      //
+      // Both renderings can be mounted at once. `@michengai/dsh-codex-ui`
+      // registers its own `sidebar.workspaces` entry at `priority: -1`, so it
+      // WINS that `single` slot against the stock `WorkspaceBrowser` (whose
+      // entry sits at the default 0) — `entriesOfSlot` renders only the first
+      // live entry per cell (`ui-slots/src/index.ts:1346-1375`). The official
+      // browser therefore never mounts, and with it neither its
+      // `data-row-key="session:…"` rows nor the tree that carries them.
+      //
+      // Probing codex first made that the wrong way round for the moment a
+      // dcu element survives a codex-ui unload, or a profile mounts the
+      // official tree next to a leftover one: the plugin then targets rows the
+      // user cannot see and stops addressing the sidebar in front of them.
+      // The stock sidebar's own search-results tree cannot cause a false
+      // positive here — it renders `SearchResultItem` rows
+      // (`WorkspaceBrowser.tsx:792`), and those carry `role="treeitem"` and a
+      // hashed class but no `data-row-key` at all (`rows/Rows.tsx:482-500`),
+      // so `data-row-key^="session:"` is only ever the official session list.
       if (document.querySelector(FLAVOR_OFFICIAL.sessionSelector) !== null) return FLAVOR_OFFICIAL
+      if (document.querySelector(FLAVOR_CODEX.sessionSelector) !== null) return FLAVOR_CODEX
       // (2) The folded-state markers. A lone labelled tree satisfies neither.
-      for (const flavor of [FLAVOR_CODEX, FLAVOR_OFFICIAL]) {
+      for (const flavor of [FLAVOR_OFFICIAL, FLAVOR_CODEX]) {
         for (const selector of flavor.foldedIdentitySelectors) {
           if (document.querySelector(selector) !== null) return flavor
         }
@@ -874,13 +894,22 @@ window.__ModuleLoader__.load({
       so a file tree, a search tree or another plugin's list can never match —
       the selector cannot reach them even though they carry the same shape.
    2. The two data-row-key prefixes are the stock sidebar's own vocabulary
-      (restated from src/core.js), so only the two real row kinds inside that
-      one tree are addressed.
+      (restated from src/core.js), and the dcu-wb-* classes are codex-ui's
+      own (@michengai/dsh-codex-ui lib/client.js). Both are addressed, because
+      both hosts render a session list and the marker decides which one is
+      actually on screen. When this block shipped with the data-row-key
+      selectors alone, every rule here was dead on a codex-ui profile: its rows
+      carry data-dcu-session and a dcu-wb-session class, never
+      data-row-key, so the marker was written onto .dcu-wb-tree and not one
+      of the rules below could match a row inside it.
    3. [class*="_title"] is Rows.module.css's exported _title, whose hashed
       build class keeps the readable _title segment (measured on the running
       app: qCniVq_title). It is matched only UNDER a marked tree, and a
       session row's own siblings (rowActions, iconButton) do not contain
-      that segment, so the trailing controls are not restyled.
+      that segment, so the trailing controls are not restyled. codex-ui's
+      equivalents are named outright — .dcu-wb-session-title,
+      .dcu-wb-project-title, .dcu-wb-collection-label — because it ships
+      no hashed build class to match on a readable segment.
 
    What it DOES set is deliberately bounded: the glyph size, the line box, and
    — in the ROW RHYTHM block below — the vertical padding, margin and a 24px
@@ -891,7 +920,10 @@ window.__ModuleLoader__.load({
    which is the whole point of the complaint this section answers.
    --------------------------------------------------------------------------- */
 [data-stp-typography] [data-row-key^='workspace:'] [class*='_title'],
-[data-stp-typography] [data-row-key^='session:'] [class*='_title'] {
+[data-stp-typography] [data-row-key^='session:'] [class*='_title'],
+[data-stp-typography] .dcu-wb-project-title,
+[data-stp-typography] .dcu-wb-collection-label,
+[data-stp-typography] .dcu-wb-session-title {
   font-size: 12px; font-weight: 400; line-height: 16px;
 }
 /* The inline rename input sits where the title was and must stay readable at
@@ -914,10 +946,31 @@ window.__ModuleLoader__.load({
    back. 26px keeps the row a comfortable click target and is still the compact
    value the acceptance asked for. border-box keeps the padding inside it. */
 [data-stp-typography] [data-row-key^='workspace:'],
-[data-stp-typography] [data-row-key^='session:'] {
+[data-stp-typography] [data-row-key^='session:'],
+[data-stp-typography] [data-dcu-session],
+[data-stp-typography] .dcu-wb-project-head,
+[data-stp-typography] .dcu-wb-collection-head,
+[data-stp-typography] .dcu-wb-section-head,
+/* ...and the LABELS those two heads hold. codex-ui sizes them independently of
+   the head (.dcu-wb-collection-label min-height:32px + 4px padding;
+   .dcu-wb-section-label min-height:24px + 2px padding, lib/client.js CSS
+   table), so compacting only the head leaves a 32-40px child centred in a 26px
+   box — it overflows both edges and drags its click area outside the header it
+   belongs to. border-box makes the stated height the total, so the padding can
+   no longer add to it. */
+[data-stp-typography] .dcu-wb-collection-label,
+[data-stp-typography] .dcu-wb-section-label {
   height: 26px; min-height: 24px; box-sizing: border-box;
   margin-top: 0; margin-bottom: 0;
   padding-top: 1px; padding-bottom: 1px;
+}
+/* codex-ui's own rename field sits where the session title was, at 14px/20px
+   (.dcu-wb-rename-input, lib/client.js CSS table). Leaving it at 14px while
+   its row collapses to 26px is the same visible reflow the stock sidebar's
+   inline input rule above exists to prevent. */
+[data-stp-typography] .dcu-wb-rename-input {
+  font-family: var(--stp-token-font, inherit);
+  font-size: 12px; font-weight: 400; line-height: 16px;
 }
 /* A colour chosen for a session the HOST renders in its own group. Same map,
    same attribute and the same mix as a pinned row's; only the address changes,
@@ -2067,8 +2120,15 @@ window.__ModuleLoader__.load({
        */
       const OFFICIAL_ROW_MENU_SLOT = 'sidebar.workspaces.session.menu.item'
       const OFFICIAL_COLOR_ENTRY_ID = 'dsh-session-top.row-color'
-      /** Well after the host's own Pin item (order 100), so it reads last. */
-      const OFFICIAL_COLOR_ORDER = 450
+      /** Well after the host's own items, so it reads last.
+       The stock sidebar ships four of them — pin 100, rename 200, fork 300,
+       archive 400 (`ui-workspace/src/client/index.ts:286-289`, stepping by 100
+       precisely "so a plugin entry can land between them"). 450 would have been
+       past all four; 500 is the value the slot contract's own registration
+       example uses (`contract/slots.ts:153`), which leaves room for a host item
+       the contract already shows how to add at 450 without this entry having to
+       win a tie on registration order. */
+      const OFFICIAL_COLOR_ORDER = 500
       const OFFICIAL_COLOR_REGISTRANT = 'dsh-session-top: official row colour'
 
       /** @returns {string} this plugin's colour item label. */
@@ -5341,11 +5401,12 @@ window.__ModuleLoader__.load({
        *
        * Preconditions for each outcome:
        *   1. already handled           → observe only (whoever built a menu, wins)
-       *   2. our own region row        → hand the gesture to the HOST'S OWN row
-       *                                    for this session, at this pointer
-       *                                    (`openOwnRowMenu`)
-       *   3. flavor === null           → observe only
-       *   4. a positively identified host session row, still unhandled → own menu
+       *   2. our own region row        → serve the gesture here
+       *                                    (`openOwnRowMenu`, which borrows a
+       *                                    host menu only when that host's own
+       *                                    menu is richer than ours)
+      *   3. flavor === null           → observe only
+      *   4. a positively identified host session row, still unhandled → own menu
        *
        * @param {MouseEvent} event - the contextmenu event.
        */
@@ -5362,9 +5423,8 @@ window.__ModuleLoader__.load({
         // `role="treeitem"`, no `aria-selected`, no action button), so the
         // shared owner cannot mistake one for a session row no matter which of
         // our two document-capture listeners was registered first. What the
-        // claim is FOR is the hand-off — the row the user clicked is ours, and
-        // the menu that opens on it must still be the host's own, built from the
-        // host's own row for the same session.
+        // claim is FOR is the CHOICE OF MENU: this row is a pinned session, so
+        // it needs the two actions the host's own menu may not carry at all.
         const ownRow = event.target !== null && typeof event.target === 'object'
           && typeof event.target.closest === 'function'
           ? event.target.closest('[data-stp-row]')
@@ -5916,17 +5976,47 @@ window.__ModuleLoader__.load({
       /**
        * Open the menu for one of the plugin's own region rows.
        *
-       * The pin actions are the owner's, not ours: the gesture is re-delivered
-       * to the host's own row for this session, so a shared owner builds its
-       * full menu there — and so our own handler, which sees the same
-       * re-delivered gesture, turns it into the host's own row menu when no
-       * owner claimed it. That is what makes a pinned row offer exactly what an
-       * ordinary host row offers, with the same session behind it.
+       * THE HAND-OFF IS TAKEN UNLESS SOMETHING STRONGER IS SERVING.
        *
-       * The plugin-owned menu is the FALLBACK, reached only when there is
-       * nothing to borrow: no host row mounted even after expanding its group,
-       * no host "…" control on it, or no `MouseEvent` to build the re-delivery
-       * with.
+       * Borrowing the host's menu is only worth doing when the host's menu
+       * actually offers what this row has to offer. On the stock sidebar it
+       * does — its row menu IS the `sidebar.workspaces.session.menu.item` list,
+       * which carries the host's own `pin` row with this plugin's colour item
+       * registered beside it. On codex-ui it does not, and the reason is worth
+       * stating exactly because it is NOT the whole answer:
+       *
+       *   - codex-ui registers its own `sidebar.workspaces` entry at
+       *     `priority: -1` and therefore WINS that `single` slot against the
+       *     stock `WorkspaceBrowser` (`entriesOfSlot` returns only the first
+       *     live entry per cell). The stock browser never mounts, so the stock
+       *     `sidebar.workspaces.session.menu.item` list — and the colour item
+       *     this plugin registers into that same list — has no renderer at all.
+       *   - codex-ui's own row menu is built inline by `sessionMenuItems()`
+       *     (lib/client.js:1757-1836) and handed to `SessionRow` as a prop. It
+       *     reaches no extension table, no `Symbol.for` key and no slot, and it
+       *     carries rename / unread / archive / fork / openPath / moveWorkspace
+       *     / copyId / copyTitle / copyPath — and, where the registry allows it,
+       *     delete. No pin, no unpin, no row colour, and no supported way in.
+       *
+       * So with nothing else listening, forwarding on that host buys a menu
+       * with nothing in it that a PINNED row needs, while this plugin's own
+       * menu holds exactly Unpin and the row colour. That is the case the
+       * short-circuit below is for.
+       *
+       * IT IS NOT THE CASE WHEN THE SHARED OWNER IS INSTALLED, which is the
+       * case that made the previous revision wrong. That owner
+       * (`@baihejiangnan/dsh-session-context-menu`) does not use the slot list
+       * at all: it builds its own `.dshcm-menu` from scratch and reads our
+       * entries out of `Symbol.for('dsh.session-context-menu.extensions')`. Its
+       * menu therefore carries the host actions codex's inline menu does have
+       * AND the Unpin and colour rows this plugin registers into it — strictly
+       * more than either of the two alternatives, on the same host. Short-
+       * circuiting while it is there would take all of that away from a pinned
+       * row, which is why the guard also asks whether the owner is present.
+       *
+       * The host's own ordinary rows are untouched either way: they keep their
+       * native menu, observed but never claimed, because claiming one would
+       * take away eight working actions this plugin cannot replace.
        *
        * @param {Element} row - a `[data-stp-row]` element.
        * @param {number} x - viewport x.
@@ -5936,6 +6026,17 @@ window.__ModuleLoader__.load({
         const id = ownRowId(row)
         if (id === undefined) return
         const flavor = currentFlavor(Date.now())
+        // A codex host's own row menu provably cannot carry Unpin or a row
+        // colour, so on that flavor our own menu beats it — but ONLY while
+        // nobody richer is going to build one. The shared owner builds its own
+        // menu outside this flavor's slot and carries our two actions plus the
+        // host's, so its presence is exactly the condition that makes
+        // forwarding the better answer again.
+        const ownerPresent = sharedMenuRegistered(sharedMenuApi())
+        if (flavor !== null && flavor.nativeContextMenu === true && ownerPresent === false) {
+          openMenu(id, x, y)
+          return
+        }
         const hostRow = hostRowFor(flavor, id)
         if (hostRow !== null) {
           publishSharedMenu()
@@ -5946,8 +6047,8 @@ window.__ModuleLoader__.load({
             // decides about it one microtask later; giving it a second path to
             // open a menu would put two of them on one gesture. What codex
             // leaves open is whether its OWN session-row handler claimed the
-            // gesture — lib/client.js:4617, a synchronous `preventDefault` — and
-            // the whole dispatch has finished by the time this reads that.
+            // gesture — lib/client.js:4617, a synchronous `preventDefault` —
+            // and the whole dispatch has finished by the time this reads that.
             if (flavor.nativeContextMenu === true) {
               afterDispatch(() => {
                 if (!alive()) return
