@@ -1064,6 +1064,13 @@ window.__ModuleLoader__.load({
 [data-stp-typography] [data-dcu-session][data-stp-color]:hover {
   background: color-mix(in srgb, var(--stp-row-color, transparent) 34%, var(--stp-token-hover, rgba(127,127,127,.10)));
 }
+/* Selection stays blue above personal and execution backgrounds. */
+[data-stp-typography] [data-row-key^='session:'][aria-selected='true'],
+[data-stp-typography] [data-dcu-session][aria-selected='true'],
+[data-stp-row][aria-current='true'] {
+  background: rgba(59,130,246,.25) !important;
+  background: color-mix(in srgb, #3b82f6 28%, var(--stp-token-background, transparent)) !important;
+}
 /* ---------------------------------------------------------------------------
    THE PLUGIN'S OWN COLOUR DIALOG. Needed because a hidden
    <input type="color"> is not something a person can drive: the six-digit hex

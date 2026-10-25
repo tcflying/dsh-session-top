@@ -6551,14 +6551,17 @@ function importantOf(css, selector) {
       assert.ok(MUST_WIN.includes(prop), `${selector} declares !important on ${prop}, which is not a layout property that has to win`);
     }
   }
-  // Execution backgrounds must beat personal row colors; only that property
-  // may use the flag. Fold rules still need it to override host visibility.
-  const RUNTIME_RULES = ["[data-stp-runtime='running']", "[data-stp-runtime='children']"]
-  for (const selector of RUNTIME_RULES) {
+  // Execution and selection backgrounds must beat personal row colors; only that
+  // property may use the flag. Fold rules still need it to override host visibility.
+  const BACKGROUND_RULES = ["[data-stp-runtime='running']", "[data-stp-runtime='children']",
+    "[data-stp-typography] [data-row-key^='session:'][aria-selected='true'], "
+    + "[data-stp-typography] [data-dcu-session][aria-selected='true'], "
+    + "[data-stp-row][aria-current='true']"]
+  for (const selector of BACKGROUND_RULES) {
     assert.deepEqual([...new Set(importantOf(css, selector))], ['background'],
-      `${selector} must override only the execution background`)
+      `${selector} must override only the row background`)
   }
-  const ALWAYS_ALLOWED = ['[data-stp-region][hidden]', "[data-stp-region][data-stp-collapsed='true'] > [data-stp-row]", ...RUNTIME_RULES]
+  const ALWAYS_ALLOWED = ['[data-stp-region][hidden]', "[data-stp-region][data-stp-collapsed='true'] > [data-stp-row]", ...BACKGROUND_RULES]
   const flaggedElsewhere = rulesOf(css).filter(r => /!important/.test(r.body))
     .filter(r => !IMPORTANT_RULES.includes(r.selector)
       && !r.selector.startsWith('[data-stp-footer-balance]')
