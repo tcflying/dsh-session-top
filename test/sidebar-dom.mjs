@@ -367,6 +367,11 @@ class El {
     this.isConnected = false
   }
 
+  contains(node) {
+    for (let up = node; up != null; up = up.parentElement) if (up === this) return true
+    return false
+  }
+
   descendants() {
     const out = []
     const walk = (n) => { for (const c of n.children) { out.push(c); walk(c) } }
@@ -680,6 +685,7 @@ function officialUiScaffold({ rail = false, folded = false, hostRowMenu = true, 
     }
     root.appendChild(panelNav)
   }
+  s.listArea.className = 'IQEYQa_regionArea'
   root.appendChild(s.listArea)
 
   const footerParts = footer ? attachSidebarFooter(root) : null
@@ -6239,8 +6245,14 @@ function makeRowMenuSlots() {
 // live.)
 // =====================================================================
 
-{
+for (const flavor of ['official', 'codex']) {
   const sc = officialUiScaffold({ footer: true })
+  if (flavor === 'codex') {
+    sc.head.removeAttribute('data-row-key')
+    sc.row.removeAttribute('data-row-key')
+    sc.row.setAttribute('data-dcu-session', S1)
+    sc.tree.className = 'dcu-wb-tree'
+  }
   const run = await runBundle(sc, { pinned: [] })
   const f = sc.footerParts
   assert.equal(f.actions.getAttribute('data-stp-footer'), '', 'the common host of the balance region and the import control')
@@ -6276,6 +6288,87 @@ function makeRowMenuSlots() {
   console.log('✔ footer: four proven marks, five idle passes write nothing, dispose returns every one')
 }
 
+// --- the pin plugin's footer button does not require balance or import plugins.
+for (const flavor of ['official', 'codex']) {
+  for (const missing of ['balance', 'balance-and-import']) {
+    const sc = officialUiScaffold({ footer: true })
+    if (flavor === 'codex') {
+      sc.head.removeAttribute('data-row-key')
+      sc.row.removeAttribute('data-row-key')
+      sc.row.setAttribute('data-dcu-session', S1)
+      sc.tree.className = 'dcu-wb-tree'
+    }
+    const f = sc.footerParts
+    f.balanceWrap.remove()
+    if (missing === 'balance-and-import') f.importWrap.remove()
+    const outside = new El('button')
+    outside.className = '__dsh-session-pin-footer__'
+    sc.body.appendChild(outside)
+    const run = await runBundle(sc, { pinned: [S1] })
+    assert.equal(f.pinnedEntry.getAttribute('data-stp-footer-pin'), '', 'the dedicated pin button is marked without unrelated footer plugins')
+    assert.equal(f.actions.getAttribute('data-stp-footer'), null, 'no balance/import pair means no compaction host')
+    assert.equal(f.importer.getAttribute('data-stp-footer-import'), null, 'an unproven import control stays untouched')
+    assert.equal(outside.getAttribute('data-stp-footer-pin'), null, 'the body-level lookalike stays outside the proven sidebar')
+    assert.ok(sc.body.querySelector('[data-stp-region]') !== null, 'the top pinned list stays mounted')
+    run.dispose()
+    assert.equal(f.pinnedEntry.getAttribute('data-stp-footer-pin'), null, 'dispose restores the native button')
+  }
+}
+console.log('✔ footer: the native pin button is hidden without balance/import plugins; top pins and outside buttons remain')
+
+// --- the footer lookup never crosses the owning sidebar into a shared layout.
+for (const flavor of ['official', 'codex']) {
+  const sc = officialUiScaffold({ footer: false })
+  if (flavor === 'codex') {
+    const root = new El('aside')
+    root.className = 'dcu-root'
+    sc.body.insertBefore(root, sc.root)
+    for (const child of [...sc.root.children]) root.appendChild(child)
+    sc.root.remove()
+    sc.root = root
+    sc.head.removeAttribute('data-row-key')
+    sc.row.removeAttribute('data-row-key')
+    sc.row.setAttribute('data-dcu-session', S1)
+    sc.tree.className = 'dcu-wb-tree'
+  }
+  const layout = new El('div')
+  layout.className = 'app-root'
+  sc.body.appendChild(layout)
+  layout.appendChild(sc.root)
+  const main = new El('main')
+  layout.appendChild(main)
+  const outside = new El('button')
+  outside.className = '__dsh-session-pin-footer__'
+  main.appendChild(outside)
+  const run = await runBundle(sc, { pinned: [S1] })
+  assert.equal(outside.getAttribute('data-stp-footer-pin'), null, 'a main-area pin button is outside the owning sidebar')
+  assert.ok(sc.body.querySelector('[data-stp-region]') !== null, 'top pins stay mounted when the sidebar has no footer')
+  run.dispose()
+}
+
+// --- the shipped Codex root works in expanded mode and leaves its rail alone.
+for (const compact of [false, true]) {
+  const sc = officialUiScaffold({ footer: true })
+  const root = new El('aside')
+  root.className = compact ? 'dcu-root dcu-compact' : 'dcu-root'
+  const frame = new El('div')
+  if (compact) frame.setAttribute('data-sidebar-collapsed', 'true')
+  sc.body.appendChild(frame)
+  frame.appendChild(root)
+  for (const child of [...sc.root.children]) root.appendChild(child)
+  sc.root.remove()
+  sc.root = root
+  sc.head.removeAttribute('data-row-key')
+  sc.row.removeAttribute('data-row-key')
+  sc.row.setAttribute('data-dcu-session', S1)
+  sc.tree.className = 'dcu-wb-tree'
+  const run = await runBundle(sc, { pinned: [S1] })
+  assert.equal(sc.footerParts.pinnedEntry.getAttribute('data-stp-footer-pin'), compact ? null : '', 'only an expanded Codex footer is marked')
+  run.dispose()
+  assert.equal(sc.footerParts.pinnedEntry.getAttribute('data-stp-footer-pin'), null, 'dispose gives the Codex footer back')
+}
+console.log('✔ footer: shared layouts cannot leak main-area pins; actual Codex root and compact rail are covered')
+
 // --- a host whose footer is NOT there gets nothing at all.
 {
   const sc = officialUiScaffold({ footer: false })
@@ -6286,6 +6379,7 @@ function makeRowMenuSlots() {
   const rail = officialUiScaffold({ rail: true, footer: true })
   const railRun = await runBundle(rail, { pinned: [] })
   assert.equal(rail.body.querySelector('[data-stp-footer]'), null, 'the collapsed rail is left to the host')
+  assert.equal(rail.footerParts.pinnedEntry.getAttribute('data-stp-footer-pin'), null, 'the rail pin button stays untouched')
   railRun.dispose()
   console.log('✔ footer: no footer, no marks; the narrow rail is never touched')
 }
@@ -6295,7 +6389,9 @@ function makeRowMenuSlots() {
   const sc = makeTree()
   sc.tree.setAttribute('role', 'tree')
   sc.tree.setAttribute('aria-label', 'file explorer')
+  const footer = attachSidebarFooter(sc.listArea)
   const run = await runBundle(sc, { pinned: [] })
+  assert.equal(footer.pinnedEntry.getAttribute('data-stp-footer-pin'), null, 'an unknown sidebar keeps its pin button')
   assert.equal(sc.body.querySelector('[data-stp-account]'), null, 'an unknown sidebar is observe-only')
   run.dispose()
   console.log('✔ footer: an unproven sidebar is left entirely alone')
@@ -6493,10 +6589,9 @@ function importantOf(css, selector) {
   // (4d) THE FOOTER COMPACTION IS DECLARED, AND SCOPED TO ITS MARKERS. Every
   // value here is the one the live page needed: the host declares 42px on the
   // import control and 28px on the pinned entry, and a bare `min-height` cannot
-  // reduce either. Nothing is hidden and every target stays at or above 24px.
+  // reduce either. The retained controls stay at or above 24px.
   const FOOTER_TARGETS = [
     ['[data-stp-footer-import]', '28px'],
-    ['[data-stp-footer-pin]', '24px'],
     ['[data-stp-account]', '32px'],
   ]
   for (const [selector, want] of FOOTER_TARGETS) {
@@ -6518,10 +6613,13 @@ function importantOf(css, selector) {
       `footer rule escapes its marker: ${rule.selector}`,
     )
   }
-  // Nothing in the footer may be hidden — it is compaction, not removal.
+  // Only the redundant pinned entry is hidden; the other footer controls remain.
+  assert.equal(declsOf(css, '[data-stp-footer-pin]')['display'], 'none')
+  assert.deepEqual(importantOf(css, '[data-stp-footer-pin]'), ['display'])
   const footerRules = rulesOf(css).filter(r => r.selector.includes('[data-stp-footer'))
   for (const rule of footerRules) {
-    assert.ok(!/display\s*:\s*none/.test(rule.body), `a footer rule hides something: ${rule.selector}`)
+    if (rule.selector === '[data-stp-footer-pin]') continue
+    assert.ok(!/display\s*:\s*none/.test(rule.body), `an unrelated footer control is hidden: ${rule.selector}`)
   }
 
   // (4d-bis) !important IS REQUIRED HERE, AND ONLY HERE. Read off the live
@@ -6532,7 +6630,7 @@ function importantOf(css, selector) {
   // loses. It is also the sharpest tool in the sheet, so the set of properties
   // carrying it is pinned here rather than left to drift.
   const MUST_WIN = ['height', 'min-height', 'box-sizing', 'padding', 'margin', 'line-height', 'font-size', 'padding-top', 'padding-bottom']
-  const IMPORTANT_RULES = ['[data-stp-footer-import]', '[data-stp-footer-pin]']
+  const IMPORTANT_RULES = ['[data-stp-footer-import]']
   for (const selector of IMPORTANT_RULES) {
     const flagged = importantOf(css, selector)
     for (const want of ['height', 'min-height', 'line-height', 'padding']) {
@@ -6561,7 +6659,10 @@ function importantOf(css, selector) {
     assert.deepEqual([...new Set(importantOf(css, selector))], ['background'],
       `${selector} must override only the row background`)
   }
-  const ALWAYS_ALLOWED = ['[data-stp-region][hidden]', "[data-stp-region][data-stp-collapsed='true'] > [data-stp-row]", ...BACKGROUND_RULES]
+  const NATIVE_PIN_SECTION = '[data-stp-typography] .dcu-wb-section:is([aria-label="置顶"], [aria-label="Pinned"])'
+  assert.equal(declsOf(css, NATIVE_PIN_SECTION)['display'], 'none')
+  assert.deepEqual(importantOf(css, NATIVE_PIN_SECTION), ['display'])
+  const ALWAYS_ALLOWED = ['[data-stp-region][hidden]', "[data-stp-region][data-stp-collapsed='true'] > [data-stp-row]", '[data-stp-footer-pin]', NATIVE_PIN_SECTION, ...BACKGROUND_RULES]
   const flaggedElsewhere = rulesOf(css).filter(r => /!important/.test(r.body))
     .filter(r => !IMPORTANT_RULES.includes(r.selector)
       && !r.selector.startsWith('[data-stp-footer-balance]')

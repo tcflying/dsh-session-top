@@ -675,6 +675,7 @@ window.__ModuleLoader__.load({
       const FOOTER_PIN_TEXT = '已置顶'
       /** The pinned-count entry's own stable `aria-label`, inside the footer host. */
       const FOOTER_PIN_LABEL = '已置顶的会话'
+      const FOOTER_PIN_SELECTOR = 'button.__dsh-session-pin-footer__'
 
     /**
      * Marks this plugin has written onto host nodes, newest last.
@@ -1053,6 +1054,10 @@ window.__ModuleLoader__.load({
   font-family: var(--stp-token-font, inherit);
   font-size: 12px; font-weight: 400; line-height: 16px;
 }
+/* The top session list replaces the separate Codex pinned section. */
+[data-stp-typography] .dcu-wb-section:is([aria-label="置顶"], [aria-label="Pinned"]) {
+  display: none !important;
+}
 /* A colour chosen for a session the HOST renders in its own group. Same map,
    same attribute and the same mix as a pinned row's; only the address changes,
    and it is still the proven tree plus the host's own row vocabulary. */
@@ -1119,8 +1124,8 @@ window.__ModuleLoader__.load({
   outline: 2px solid var(--stp-token-primary, currentColor); outline-offset: 1px;
 }
 /* ---------------------------------------------------------------------------
-   THE SIDEBAR FOOTER. Compaction only — no rule here hides anything, and every
-   one hangs off a marker this plugin wrote onto an element it PROVED (see
+   THE SIDEBAR FOOTER. Compact the controls and hide the duplicate pinned entry.
+   Each rule hangs off a marker written onto an element this plugin PROVED (see
    reconcileFooter below): the common host of the balance region and the import
    control, the import control itself, the pinned-count entry inside that host,
    and the account menu. A host whose markup moves simply stops matching, which
@@ -1143,25 +1148,14 @@ window.__ModuleLoader__.load({
 [data-stp-footer-balance] [class*='cm-simple-summary'] { height: 20px !important; }
 [data-stp-footer-balance] [class*='cm-foot'] { height: 24px !important; }
 [data-stp-footer-balance] [class*='cm-peak-strip'] { height: 18px !important; padding-top: 1px !important; padding-bottom: 1px !important; }
-/* The import control measured 42px and the pinned entry 28px AFTER their markers
-   landed, so this is a CASCADE problem, not a missing rule — read off the live
-   CSSOM:
-     - import carries the host's INLINE height (42px). No stylesheet rule,
-       however specific, can beat an inline declaration without !important.
-     - the pinned entry is styled "button.__dsh-session-pin-footer__" after an
-       "all: unset", which outranks a single-attribute selector.
-   So the declarations that must win state !important. Scope is unchanged and
-   stays on this plugin's own markers, nothing else is touched, and no host
-   inline style is edited. */
+/* The import control carries an inline 42px height, and the pinned entry has a
+   button[class] rule after all: unset. !important lets these proven markers win
+   the host cascade without editing host inline styles. */
 [data-stp-footer-import] {
   height: 28px !important; min-height: 28px !important; box-sizing: border-box !important;
   padding: 0 8px !important; margin: 0 !important; line-height: 20px !important;
 }
-[data-stp-footer-pin] {
-  height: 24px !important; min-height: 24px !important; box-sizing: border-box !important;
-  padding: 0 6px !important; margin: 0 !important; line-height: 16px !important;
-  font-size: 11px !important;
-}
+[data-stp-footer-pin] { display: none !important; }
 [data-stp-account] { height: 32px; min-height: 32px; padding: 3px 8px; box-sizing: border-box; }
 [data-stp-account] > span { line-height: 18px; }
 `
@@ -4894,21 +4888,15 @@ window.__ModuleLoader__.load({
       /**
        * The sidebar column this plugin will look for the footer surfaces in.
        *
-       * Derived from the TREE, not from a class name: walk up from the proven
-       * session list and take the FIRST ancestor that actually contains one of
-       * the footer surfaces. That is a positive proof on both ends — the tree
-       * says which column this is, and the anchor says the footer is here — and
-       * it needs no guess about what the host calls its own wrapper.
+       * Start at the proven tree and stop at a shipped sidebar boundary: the
+       * Codex `dcu-root`, the Host CSS-module `_sidebarCol`, or the official
+       * `_root` whose own `_regionArea` contains this tree. Hash prefixes vary;
+       * the component suffixes and their relationship are what identify it.
        *
-       * The earlier version asked for an ancestor whose class token contained
-       * "root", which is a GUESS about the host's markup, and on the shipped
-       * page it simply never matched: `root` came back null, every footer mark
-       * was skipped, and the whole footer compaction silently did nothing while
-       * every test stayed green, because the fixture agreed with the guess.
-       *
-       * `<body>` is refused for the same reason it always was — "everything is
-       * under body" is not a column — so the walk can never become a page-wide
-       * sweep; it stops at the first ancestor that holds the footer.
+       * A footer surface alone is not a boundary: if the sidebar has no footer,
+       * walking until a pin or balance control appears can reach a sibling main
+       * area. Nor is an arbitrary class containing "root" proof. With no known
+       * column, leave the footer alone.
        *
        * @param {Element | null} tree - the identified session list.
        * @returns {Element | null} the column, or null when there is none.
@@ -4917,39 +4905,26 @@ window.__ModuleLoader__.load({
         if (tree == null) return null
         for (let node = tree.parentElement; node != null; node = node.parentElement) {
           if (node === document.body || node === document.documentElement) return null
-          try {
-            if (node.querySelector(`[role="region"][aria-label="${BALANCE_REGION_LABEL}"]`) !== null) return node
-          } catch {
-            return null
-          }
+          const tokens = typeof node.className === 'string' ? node.className.split(/\s+/) : []
+          if (tokens.includes('dcu-root') || tokens.some(token => token.endsWith('_sidebarCol'))) return node
+          if (tokens.some(token => token.endsWith('_root')) && Array.from(node.children).some(child =>
+            typeof child.className === 'string' && child.className.split(/\s+/).some(token => token.endsWith('_regionArea'))
+            && child.contains(tree))) return node
         }
         return null
       }
 
       /**
-       * The same walk, keyed on the account menu's own `aria-label`.
-       *
-       * The account trigger lives in its OWN root, which the live page proved is
-       * NOT the footer's: looking for it only inside the footer scope found
-       * nothing and the account row stayed 44px. Reached the same bounded way —
-       * up from the proven tree, never above `<body>` — so a sidebar that does
-       * not render one simply gets no mark.
+       * Find the account menu within the same owning sidebar column. Its own
+       * wrapper can be separate from the footer action row, so searching only
+       * that row misses it; searching above the column can mark main content.
        *
        * @param {Element | null} tree - the identified session list.
        * @returns {Element | null} the account trigger, or null.
        */
       const accountMenuFor = (tree) => {
-        if (tree == null) return null
-        for (let node = tree.parentElement; node != null; node = node.parentElement) {
-          if (node === document.body || node === document.documentElement) return null
-          try {
-            const found = node.querySelector(`[aria-label="${ACCOUNT_MENU_LABEL}"]`)
-            if (found !== null) return found
-          } catch {
-            return null
-          }
-        }
-        return null
+        const column = footerScopeFor(tree)
+        return column?.querySelector(`[aria-label="${ACCOUNT_MENU_LABEL}"]`) ?? null
       }
 
       /**
@@ -4982,7 +4957,7 @@ window.__ModuleLoader__.load({
        * what the old version used alone — and on the live page the text alone
        * matched nothing, because the entry's own label is 已置顶的会话 and the
        * text sits on a child. Text is kept only as the second try so a host that
-       * ships the shorter label still compacts; neither path can reach outside
+       * ships the shorter label still matches; neither path can reach outside
        * the one footer host derived from two proven regions.
        *
        * @param {Element} root - the proven footer host.
@@ -5044,20 +5019,23 @@ window.__ModuleLoader__.load({
        *   2. the footer host is their nearest common ancestor — so it is a host,
        *      not a candidate, and a sidebar whose footer renders nothing simply
        *      has no common ancestor to claim;
-       *   3. the pinned-count entry is the deepest text match inside that host;
+       *   3. the pinned-count entry uses its owning plugin's button class inside
+       *      the proven sidebar, independently of the balance/import pair; older
+       *      hosts retain the label/text fallback inside the proven footer host;
        *   4. the account menu is found by its own `aria-label` in the same root.
        *
        * The rail is left to the host, exactly as the panels and directory regions
-       * are. Nothing is hidden and no business handler is touched: these markers
-       * exist only to give the stylesheet four proven anchors.
+       * are. Only the duplicate pinned-count entry is hidden; no business handler
+       * is touched. These markers give the stylesheet its proven anchors.
        *
        * @param {object | null} flavor - the detected sidebar.
        * @param {Element | null} tree - the identified session list.
        */
       const reconcileFooter = (flavor, tree) => {
         let next = { host: null, balance: null, importer: null, pinned: null, account: null }
-        const root = flavor === FLAVOR_OFFICIAL ? footerScopeFor(tree) : null
+        const root = flavor !== null ? footerScopeFor(tree) : null
         if (root !== null && sidebarRailIn(root) === false) {
+          next.pinned = root.querySelector(FOOTER_PIN_SELECTOR)
           let balance = null
           let importer = null
           let account = null
@@ -5073,7 +5051,7 @@ window.__ModuleLoader__.load({
             next.host = host
             next.balance = balance
             next.importer = importer
-            next.pinned = pinnedFooterEntryFor(host)
+            next.pinned ??= pinnedFooterEntryFor(host)
             next.account = account
           }
         }
