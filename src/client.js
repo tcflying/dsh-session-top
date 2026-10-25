@@ -41,8 +41,8 @@
  *     in a flat "Pinned" region above the workspace groups. Its workspace group
  *     is folded through the official header toggle.
  *  4. Unpin returns it — the row reappears in its own group at its
- *     activity-sorted position and the group is expanded again so the user can
- *     see where it went.
+ *     activity-sorted position. Its group keeps the user's manual disclosure
+ *     choice; unpinning never expands it automatically.
  *  5. Durability — the pin set is the Host's registry-global
  *     `pinnedSessionIds`, written through the official `workspaces.pinSession`
  *     / `unpinSession` RPCs. Nothing here keeps a private copy, so the state
@@ -552,6 +552,52 @@ window.__ModuleLoader__.load({
       } catch { /* the fold still works, it just will not be remembered */ }
     }
 
+    // Same pure derivation as runtime.js; the shipped factory cannot import it.
+    function deriveRuntime(byId = {}, ids = Object.keys(byId ?? {})) {
+      const summaries = byId ?? {}
+      const listed = new Set(ids)
+      const sessions = new Map()
+      let runningSessions = 0
+      let runningAgents = 0
+      for (const id of listed) {
+        const summary = Object.hasOwn(summaries, id) ? summaries[id] : undefined
+        if (summary == null || summary.origin === 'subagent') continue
+        const running = summary.running === true
+        sessions.set(id, { running, runningChildren: 0 })
+        if (running) runningSessions += 1
+      }
+
+      // Cache ownership, including broken chains, so shared ancestry is walked once.
+      const roots = new Map([...sessions.keys()].map(id => [id, id]))
+      for (const id of listed) {
+        const summary = Object.hasOwn(summaries, id) ? summaries[id] : undefined
+        if (summary?.origin !== 'subagent' || summary.running !== true) continue
+        runningAgents += 1
+        const path = new Set()
+        let current = id
+        while (!roots.has(current) && !path.has(current)) {
+          path.add(current)
+          const ancestor = Object.hasOwn(summaries, current) ? summaries[current] : undefined
+          // A normal fork is its own root even when it has a parentId.
+          if (ancestor?.origin !== 'subagent' || typeof ancestor.parentId !== 'string') break
+          current = ancestor.parentId
+        }
+        const root = roots.get(current)
+        for (const member of path) roots.set(member, root)
+        if (root !== undefined) sessions.get(root).runningChildren += 1
+      }
+      return { sessions: Object.fromEntries(sessions), runningSessions, runningAgents }
+    }
+
+    // A local priority within the official durable pin set, never a second pin set.
+    const ABSOLUTE_STORAGE_KEY = 'dsh-session-top:absolute-pins'
+    function readAbsolutePins() {
+      try {
+        const value = JSON.parse(globalThis.localStorage?.getItem?.(ABSOLUTE_STORAGE_KEY) ?? '[]')
+        return new Set(Array.isArray(value) ? value.filter(id => typeof id === 'string') : [])
+      } catch { return new Set() }
+    }
+
     // ------------------------------------------------------- row colours
 
     /**
@@ -700,6 +746,41 @@ window.__ModuleLoader__.load({
      * because the substituted "inherit" is then parsed as a font-family value.
      */
     const STYLE_TEXT = `
+
+/* Execution colors take precedence over personal row colors while work runs. */
+[data-stp-runtime='running'] {
+  background: rgba(34,197,94,.20) !important;
+  background: color-mix(in srgb, #22c55e 22%, var(--stp-token-background, transparent)) !important;
+  box-shadow: inset 3px 0 #22c55e;
+}
+[data-stp-runtime='children'] {
+  background: rgba(234,179,8,.20) !important;
+  background: color-mix(in srgb, #eab308 23%, var(--stp-token-background, transparent)) !important;
+  box-shadow: inset 3px 0 #eab308;
+}
+[data-stp-runtime-label] {
+  flex: none; font-size: 10px; line-height: 16px; white-space: nowrap;
+  color: var(--stp-token-primary, inherit); padding: 0 3px; border-radius: 3px;
+}
+[data-stp-runtime-summary] {
+  padding: 5px 12px; font-size: 12px; font-variant-numeric: tabular-nums;
+  color: var(--stp-token-secondary, inherit); flex: none;
+}
+[data-stp-region] { max-height: 55vh; overflow-y: auto; flex: none; }
+[data-stp-row][data-stp-absolute] [data-stp-row-slot] { color: #eab308; }
+[data-stp-absolute-button] {
+  border: 0; padding: 2px 4px; min-height: 24px; background: transparent;
+  color: var(--stp-token-secondary, inherit); cursor: pointer; flex: none;
+  display: inline-flex; align-items: center; justify-content: center; min-width: 24px; box-sizing: border-box;
+}
+[data-stp-absolute-button]:focus-visible { outline: 2px solid currentColor; outline-offset: -2px; }
+[data-stp-absolute-button][aria-pressed='true'] { color: #eab308; }
+[data-stp-rename-input] {
+  flex: 1 1 auto; min-width: 30px; width: 50%; padding: 2px 4px;
+  border: 1px solid var(--stp-token-border, currentColor); border-radius: 4px;
+  background: var(--stp-token-background, Canvas); color: var(--stp-token-primary, CanvasText);
+  font-family: var(--stp-token-font, inherit); font-size: inherit; font-weight: inherit; line-height: inherit;
+}
 [data-stp-region] {
   display: flex; flex-direction: column; gap: 0;
   padding: 1px 6px 4px; margin: 0 0 2px;
@@ -1483,6 +1564,8 @@ window.__ModuleLoader__.load({
         torndown = true
         observer?.disconnect()
         document.removeEventListener('contextmenu', onContextMenu, true)
+        document.removeEventListener('dblclick', onDoubleClick, true)
+        closeRename()
         // The borrowed anchor row and the group this plugin may have opened for
         // it go back here, before anything else can act on a dead generation.
         restoreOfficialAnchor()
@@ -1531,6 +1614,7 @@ window.__ModuleLoader__.load({
         }
         try {
           clearHostRowColors()
+          clearRuntime()
         } catch (error) {
           console.error('[dsh-session-top] host row colour teardown failed:', error)
         }
@@ -1678,6 +1762,116 @@ window.__ModuleLoader__.load({
           releaseSessions = service.list.subscribe(() => { scheduleReconcile() })
         } catch (error) {
           warn(`session subscription failed: ${describeError(error)}`)
+        }
+      }
+
+      // Connection changes can precede the next Session snapshot. Clear execution
+      // while either signal is unavailable, and release both subscriptions together.
+      let attachedConnection = null
+      const connectionReleases = []
+      const releaseConnection = () => {
+        for (const off of connectionReleases.splice(0)) {
+          try { off() } catch { /* release the other source even if one failed */ }
+        }
+        attachedConnection = null
+      }
+      const refreshConnection = () => {
+        let next
+        try { next = ctx.get('connection') ?? null } catch { return }
+        if (next === attachedConnection) return
+        releaseConnection()
+        attachedConnection = next
+        for (const name of ['state', 'generation']) {
+          try {
+            const off = next?.[name]?.subscribe?.(() => { scheduleReconcile() })
+            if (typeof off === 'function') connectionReleases.push(off)
+          } catch { /* optional on older Hosts */ }
+        }
+      }
+      const connectionUnavailable = () => {
+        try {
+          const state = attachedConnection?.state
+          const generation = attachedConnection?.generation
+          if (typeof state?.getSnapshot !== 'function' || typeof generation?.getSnapshot !== 'function') return false
+          return state.getSnapshot() !== 'connected' || generation.getSnapshot() == null
+        } catch { return true }
+      }
+
+      // Per-entry defaults belong to the mounted Session, not to a left-sidebar
+      // flavor. Observe the host's own sources and wait for adoption/render pulses.
+      let rightSidebar = null
+      let rightTabs = null
+      let rightSession = undefined
+      let rightExpanded = false
+      let rightOpened = false
+      let rightWarned = false
+      const rightReleases = []
+      const resetRightEntry = (id) => {
+        rightSession = id
+        rightExpanded = false
+        rightOpened = false
+        rightWarned = false
+      }
+      const releaseRightSidebar = () => {
+        for (const off of rightReleases.splice(0)) {
+          try { off() } catch { /* release the remaining optional sources */ }
+        }
+        rightSidebar = null
+        rightTabs = null
+        // Service replacement is not a new Session entry. Keep completed defaults
+        // until the mounted feed itself reports a different Session or no Session.
+      }
+      const refreshRightSidebar = () => {
+        if (!alive()) return
+        let next = null
+        let tabs = null
+        try { next = ctx.get('sidebarRight') ?? null } catch { /* older Host */ }
+        try { tabs = ctx.get('sidebarRightTabs') ?? null } catch { /* optional provider */ }
+        if (next === rightSidebar && tabs === rightTabs) return
+        releaseRightSidebar()
+        rightSidebar = next
+        rightTabs = tabs
+        for (const source of [next?.mounted, next?.openTabs, tabs]) {
+          try {
+            const off = source?.subscribe?.(() => {
+              if (!alive()) return
+              // Remember even a brief Session/global-panel transition before the
+              // debounced pass, so returning to the same Session is a fresh entry.
+              if (source === rightSidebar?.mounted) {
+                const id = source.getSnapshot()
+                if (id !== rightSession) resetRightEntry(id)
+              }
+              scheduleReconcile()
+            })
+            if (typeof off === 'function') rightReleases.push(off)
+          } catch { /* optional on older Hosts */ }
+        }
+      }
+      const reconcileRightSidebar = () => {
+        refreshRightSidebar()
+        if (typeof rightSidebar?.mounted?.getSnapshot !== 'function') return
+        try {
+          const id = rightSidebar?.mounted?.getSnapshot?.()
+          if (id !== rightSession) resetRightEntry(id)
+          if (typeof id !== 'string' || id.length === 0 || rightOpened) return
+          if (typeof rightSidebar.openTab === 'function' && rightTabs?.get?.('subagent') !== undefined) {
+            // 'subagent' is dsh-better-sidebar's Task Management page. Only an
+            // empty guide may be replaced; editors and other pages stay open.
+            const active = rightSidebar.active?.()
+            rightSidebar.openTab('subagent', active?.kind === 'guide' ? { replaceTab: active.id } : {})
+            rightExpanded = true
+            rightOpened = true
+          } else if (!rightExpanded && typeof rightSidebar.isExpanded === 'function'
+            && typeof rightSidebar.toggleExpanded === 'function') {
+            if (!rightSidebar.isExpanded()) rightSidebar.toggleExpanded()
+            rightExpanded = true
+          }
+        } catch (error) {
+          // mounted publishes before React adopts the store. The host's tab
+          // inventory or the next external DOM render will retry this entry.
+          if (error?.message === 'sidebarRight: no session surface is mounted') return
+          if (!rightWarned) warn(`right sidebar default failed: ${describeError(error)}`)
+          rightWarned = true
         }
       }
 
@@ -1863,7 +2057,8 @@ window.__ModuleLoader__.load({
           return { ok: false }
         }
         try {
-          await action(id)
+          const result = await action(id)
+          if (result?.ok === false) throw new Error(result.error?.message ?? '宿主拒绝了置顶操作')
           return { ok: true }
         } catch (error) {
           if (alive()) {
@@ -2364,6 +2559,277 @@ window.__ModuleLoader__.load({
         } catch {
           return {}
         }
+      }
+
+      let renameEdit = null
+      const closeRename = () => {
+        const edit = renameEdit
+        if (edit === null) return
+        renameEdit = null
+        edit.input.remove()
+        edit.label.removeAttribute('hidden')
+        if (alive()) {
+          if (edit.row.isConnected !== false) edit.row.focus?.()
+          scheduleReconcile()
+        }
+      }
+
+      const renameHostSession = async (id, title) => {
+        const service = sessionsService()
+        const apply = async (binding) => {
+          if (typeof binding?.session?.rename !== 'function') throw new Error('宿主未提供重命名能力')
+          const result = await binding.session.rename(title)
+          if (result?.ok === false) throw new Error(result.error?.message ?? '宿主拒绝了重命名')
+        }
+        if (typeof service?.using === 'function') {
+          await service.using(id, { source: 'controllerOperation' }, async reference => {
+            await reference.ready
+            if (alive()) await apply(reference.binding)
+          })
+          return
+        }
+        const binding = service?.binding?.(id)
+        if (binding !== undefined) { await apply(binding); return }
+        if (typeof service?.retain !== 'function') throw new Error('会话服务不可用')
+        const reference = service.retain(id, { source: 'controllerOperation' })
+        try {
+          await reference.ready
+          if (alive()) await apply(reference.binding)
+        } finally { reference.release() }
+      }
+
+      const beginRename = (row, id, label) => {
+        if (!alive() || renameEdit?.busy) return
+        closeRename()
+        const input = document.createElement('input')
+        input.type = 'text'
+        input.value = sessionById()[id]?.displayTitle ?? label.textContent ?? id
+        input.setAttribute('data-stp-rename-input', '')
+        input.setAttribute('aria-label', '会话名称，Enter 保存，Escape 取消')
+        label.setAttribute('hidden', '')
+        row.insertBefore(input, label)
+        const edit = { row, id, label, input, busy: false }
+        renameEdit = edit
+        input.addEventListener('click', event => { event.stopPropagation() })
+        input.addEventListener('dblclick', event => { event.stopPropagation() })
+        input.addEventListener('keydown', event => {
+          event.stopPropagation()
+          if (event.key === 'Escape') { event.preventDefault(); if (!edit.busy) closeRename(); return }
+          if (event.key !== 'Enter' || event.isComposing) return
+          event.preventDefault()
+          if (edit.busy) return
+          const next = input.value.trim()
+          if (next.length === 0) {
+            input.setAttribute('aria-invalid', 'true')
+            surfaceError('会话名称不能为空', 'refused')
+            return
+          }
+          const current = sessionById()[id]?.displayTitle
+          if (next === current) { closeRename(); return }
+          edit.busy = true
+          input.disabled = true
+          void renameHostSession(id, next).then(() => {
+            if (!alive() || renameEdit !== edit) return
+            closeRename()
+            scheduleReconcile()
+          }, error => {
+            if (!alive() || renameEdit !== edit) return
+            edit.busy = false
+            input.disabled = false
+            input.setAttribute('aria-invalid', 'true')
+            surfaceError('重命名失败：' + describeError(error), 'refused')
+            input.focus?.()
+          })
+        })
+        input.addEventListener('blur', () => {
+          if (renameEdit === edit && !edit.busy) closeRename()
+        })
+        input.focus?.()
+        input.select?.()
+      }
+
+      const onDoubleClick = (event) => {
+        if (!alive() || !(event.target instanceof Element)) return
+        const target = event.target
+        if (target.closest('button, input, textarea, [data-stp-row-color], [data-stp-absolute-button]')) return
+        const own = target.closest('[data-stp-row]')
+        const flavor = currentFlavor(Date.now())
+        const found = own === null ? findSessionRow(target, flavor) : { row: own, id: ownRowId(own) }
+        if (found === null || typeof found.id !== 'string') return
+        if (own === null && !findTree(flavor)?.contains(found.row)) return
+        const label = found.row.querySelector(own !== null
+          ? '[data-stp-row-title]'
+          : flavor.id === 'codex' ? '.dcu-wb-session-title' : '[class*="sessionTitle"], [class*="rowTitle"], [class*="title"]')
+        if (label === null) return
+        event.preventDefault()
+        event.stopPropagation()
+        event.stopImmediatePropagation?.()
+        beginRename(found.row, found.id, label)
+      }
+
+      const absolutePins = readAbsolutePins()
+      let runtimeState = { sessions: {}, runningSessions: 0, runningAgents: 0 }
+      let runtimePhase = 'loading'
+      let summaryEl = null
+      let visibleSessions = []
+      const runtimeRows = new Set()
+      const absoluteRows = new Set()
+      const observedActivity = new Map()
+      const floatedActivity = new Map()
+      let activitySequence = 0
+
+      // Capture one coherent Host snapshot for colors, counts and list ordering.
+      const refreshRuntime = () => {
+        let state
+        try { state = sessionsService()?.list?.getSnapshot?.() } catch { /* unavailable below */ }
+        const byId = state?.byId ?? {}
+        runtimePhase = connectionUnavailable() ? 'error' : state?.phase ?? 'loading'
+        runtimeState = runtimePhase === 'ready'
+          ? deriveRuntime(byId, Array.isArray(state?.ids) ? state.ids : [])
+          : { sessions: {}, runningSessions: 0, runningAgents: 0 }
+        const roots = runtimeState.sessions
+        const changed = []
+        for (const [id, execution] of Object.entries(roots)) {
+          const summary = byId[id]
+          const previous = observedActivity.get(id)
+          const active = execution.running || execution.runningChildren > 0
+          const timestamp = Number.isFinite(summary?.updatedAt) ? summary.updatedAt : 0
+          // A legacy summary without running cannot establish a new activity fact.
+          if (typeof summary?.running === 'boolean' && (
+            (active && (previous === undefined || !previous.active || timestamp > previous.time))
+            || (previous !== undefined && timestamp > previous.time && summary.blank !== true)
+          )) changed.push([id, timestamp])
+          observedActivity.set(id, { time: timestamp, active })
+        }
+        if (changed.length > 0) {
+          activitySequence += 1
+          for (const [id, time] of changed) floatedActivity.set(id, { sequence: activitySequence, time })
+        }
+        for (const id of observedActivity.keys()) {
+          if (Object.hasOwn(roots, id)) continue
+          observedActivity.delete(id)
+          floatedActivity.delete(id)
+        }
+        const pinned = [...pinSet()]
+        const fixed = pinned.filter(id => absolutePins.has(id))
+        const active = Object.keys(roots).filter(id => roots[id].running || roots[id].runningChildren > 0)
+        // Keep a temporary row until its editor closes, even when execution ends.
+        const editing = renameEdit?.row.hasAttribute('data-stp-row') ? [renameEdit.id] : []
+        const rest = [...new Set([...pinned, ...active, ...editing])].filter(id => !fixed.includes(id))
+        rest.sort((a, b) => {
+          const left = floatedActivity.get(a)
+          const right = floatedActivity.get(b)
+          return (right?.sequence ?? 0) - (left?.sequence ?? 0)
+            || (right?.time ?? 0) - (left?.time ?? 0)
+        })
+        visibleSessions = [...fixed, ...rest]
+      }
+
+      const toggleAbsolutePin = async (id) => {
+        if (!alive()) return
+        const want = !(absolutePins.has(id) && pinSet().has(id))
+        if (want && !pinSet().has(id)) {
+          const result = await applyOfficialPin(id, true)
+          if (!result.ok || !alive()) return
+        }
+        // Merge with another window before writing this local priority.
+        const latest = readAbsolutePins()
+        if (want) latest.add(id)
+        else latest.delete(id)
+        try {
+          globalThis.localStorage?.setItem?.(ABSOLUTE_STORAGE_KEY, JSON.stringify([...latest]))
+        } catch { surfaceError('绝对置顶顺序无法保存，当前窗口仍可使用', 'refused') }
+        absolutePins.clear()
+        for (const one of latest) absolutePins.add(one)
+        scheduleReconcile()
+      }
+
+      const paintAbsoluteControl = (row, id) => {
+        let button = row.querySelector('[data-stp-absolute-button]')
+        if (button === null) {
+          // The shared menu owner treats native buttons as session anchors.
+          button = document.createElement('span')
+          button.setAttribute('role', 'button')
+          button.setAttribute('tabindex', '0')
+          button.setAttribute('data-stp-absolute-button', '')
+          button.addEventListener('click', event => {
+            event.preventDefault()
+            event.stopPropagation()
+            void toggleAbsolutePin(id)
+          })
+          button.addEventListener('dblclick', event => { event.stopPropagation() })
+          button.addEventListener('keydown', event => {
+            event.stopPropagation()
+            if (event.key !== 'Enter' && event.key !== ' ') return
+            event.preventDefault()
+            void toggleAbsolutePin(id)
+          })
+          row.insertBefore(button, row.querySelector('[data-stp-row-color]'))
+        }
+        absoluteRows.add(row)
+        const fixed = absolutePins.has(id) && pinSet().has(id)
+        const label = fixed ? '取消绝对置顶' : '绝对最顶'
+        if (button.getAttribute('aria-label') !== label) button.setAttribute('aria-label', label)
+        if (button.getAttribute('title') !== label) button.setAttribute('title', label)
+        if (button.getAttribute('aria-pressed') !== String(fixed)) button.setAttribute('aria-pressed', String(fixed))
+        const glyph = fixed ? '★' : '☆'
+        if (button.textContent !== glyph) button.textContent = glyph
+        if (fixed && !row.hasAttribute('data-stp-absolute')) row.setAttribute('data-stp-absolute', '')
+        if (!fixed && row.hasAttribute('data-stp-absolute')) row.removeAttribute('data-stp-absolute')
+      }
+
+      const paintRuntime = (row, id) => {
+        const state = runtimeState.sessions[id]
+        const mode = state?.running ? 'running' : state?.runningChildren > 0 ? 'children' : null
+        let badge = row.querySelector('[data-stp-runtime-label]')
+        if (mode === null) {
+          if (row.hasAttribute('data-stp-runtime')) row.removeAttribute('data-stp-runtime')
+          badge?.remove()
+          runtimeRows.delete(row)
+          return
+        }
+        if (row.getAttribute('data-stp-runtime') !== mode) row.setAttribute('data-stp-runtime', mode)
+        if (badge === null) {
+          badge = document.createElement('span')
+          badge.setAttribute('data-stp-runtime-label', '')
+          row.insertBefore(badge, row.querySelector('[data-stp-absolute-button], [data-stp-row-color]'))
+        }
+        const text = state.running
+          ? '运行中' + (state.runningChildren > 0 ? ' · 子代理 ' + state.runningChildren : '')
+          : '子代理运行 ' + state.runningChildren
+        if (badge.textContent !== text) badge.textContent = text
+        runtimeRows.add(row)
+      }
+
+      const clearRuntime = () => {
+        for (const row of runtimeRows) {
+          row.removeAttribute('data-stp-runtime')
+          row.querySelector('[data-stp-runtime-label]')?.remove()
+        }
+        runtimeRows.clear()
+        for (const row of absoluteRows) {
+          row.querySelector('[data-stp-absolute-button]')?.remove()
+          row.removeAttribute('data-stp-absolute')
+        }
+        absoluteRows.clear()
+        summaryEl?.remove()
+        summaryEl = null
+      }
+
+      const renderRuntimeSummary = (host) => {
+        if (summaryEl === null) {
+          summaryEl = document.createElement('div')
+          summaryEl.setAttribute('data-stp-runtime-summary', '')
+          summaryEl.setAttribute('role', 'status')
+          summaryEl.setAttribute('aria-live', 'polite')
+          summaryEl.setAttribute('aria-atomic', 'true')
+        }
+        const ready = runtimePhase === 'ready'
+        const text = ready
+          ? '运行会话 ' + runtimeState.runningSessions + ' · 子代理 ' + runtimeState.runningAgents
+          : runtimePhase === 'error' ? '运行状态暂不可用' : '运行状态加载中…'
+        if (summaryEl.textContent !== text) summaryEl.textContent = text
+        if (summaryEl.parentElement !== host || host.firstChild !== summaryEl) host.insertBefore(summaryEl, host.firstChild)
       }
 
       /**
@@ -2884,7 +3350,14 @@ window.__ModuleLoader__.load({
        */
       const onRowColorsStorage = (event) => {
         if (!alive()) return
-        if (event?.key !== ROW_COLORS_STORAGE_KEY) return
+        if (event?.key === ABSOLUTE_STORAGE_KEY || event?.key === null) {
+          const latest = readAbsolutePins()
+          absolutePins.clear()
+          for (const id of latest) absolutePins.add(id)
+          scheduleReconcile()
+          if (event.key !== null) return
+        }
+        if (event?.key !== ROW_COLORS_STORAGE_KEY && event?.key !== null) return
         adoptRowColors()
         for (const [id, row] of renderedRows) {
           if (previewRowColors.has(id)) continue
@@ -3044,6 +3517,8 @@ window.__ModuleLoader__.load({
           if (id === undefined) continue
           live.add(row)
           paintHostRowColor(row, id)
+          paintRuntime(row, id)
+          paintAbsoluteControl(row, id)
         }
         for (const row of [...hostPaintedRows]) {
           if (live.has(row) !== true) unpaintHostRow(row)
@@ -3402,6 +3877,7 @@ window.__ModuleLoader__.load({
         row.setAttribute('tabindex', '0')
         if (selected) row.setAttribute('aria-current', 'true')
         row.addEventListener('click', (event) => {
+          if (renameEdit?.row === row || event.detail > 1) return
           event.stopPropagation()
           openSession(ctx, id)
         })
@@ -3439,6 +3915,8 @@ window.__ModuleLoader__.load({
         loadRowColors()
         row.appendChild(makeColorSwatch(row, id))
         paintRowColor(row, id)
+        paintRuntime(row, id)
+        paintAbsoluteControl(row, id)
         return row
       }
 
@@ -3549,7 +4027,7 @@ window.__ModuleLoader__.load({
           // Ahead of the trailing colour point, exactly where a first render
           // puts it: appending here would land the time AFTER it on the rows
           // whose summary arrived without a timestamp.
-          row.insertBefore(cell, row.querySelector(`[${SWATCH_ATTR}]`) ?? null)
+          row.insertBefore(cell, row.querySelector('[data-stp-runtime-label], [data-stp-absolute-button], [' + SWATCH_ATTR + ']'))
           return
         }
         if (cell.textContent !== time) cell.textContent = time
@@ -3585,6 +4063,8 @@ window.__ModuleLoader__.load({
         // can neither lose a colour nor invent one. Writes are guarded inside.
         loadRowColors()
         paintRowColor(row, id)
+        paintRuntime(row, id)
+        paintAbsoluteControl(row, id)
       }
 
       // ---------------------------------------------- relative-time refresh
@@ -3712,10 +4192,21 @@ window.__ModuleLoader__.load({
         const id = row.getAttribute('data-stp-session')
         const at = renderedOrder.indexOf(id)
         if (at === index) return
-        if (at < 0) renderedOrder.push(id)
-        else renderedOrder.splice(at, 1)
-        const want = firstRowAt + index
-        regionEl.insertBefore(row, regionEl.children[want] ?? null)
+        if (renameEdit?.row === row && at >= 0) {
+          // Moving the editor itself blurs it and interrupts IME composition.
+          // Move the intervening siblings around it, keeping its subtree attached.
+          const after = row.nextElementSibling
+          for (let cursor = index; cursor < at; cursor += 1) {
+            regionEl.insertBefore(regionEl.children[firstRowAt + index], after)
+          }
+          for (let cursor = at; cursor < index; cursor += 1) {
+            regionEl.insertBefore(row.nextElementSibling, row)
+          }
+        } else {
+          const want = firstRowAt + index
+          regionEl.insertBefore(row, regionEl.children[want] ?? null)
+        }
+        if (at >= 0) renderedOrder.splice(at, 1)
         renderedOrder.splice(index, 0, id)
       }
 
@@ -3756,10 +4247,10 @@ window.__ModuleLoader__.load({
        */
       const renderRegion = () => {
         if (regionEl === null) return
-        const pinned = [...pinSet()]
+        const pinned = visibleSessions
         const byId = sessionById()
         const current = currentSessionId()
-        const signature = regionSignature(pinned, byId, current)
+        const signature = regionSignature(pinned, byId, current) + JSON.stringify([runtimeState, [...absolutePins]])
         if (signature === renderedRegionSignature) return
         renderedRegionSignature = signature
 
@@ -3814,7 +4305,7 @@ window.__ModuleLoader__.load({
           regionEl.setAttribute('role', 'group')
           regionEl.appendChild(regionHeaderEl)
         }
-        const label = PINNED_LABEL()
+        const label = PINNED_LABEL() + (pinned.some(id => !pinSet().has(id)) ? ' · ' + translate('region.active', '活跃') : '')
         if (regionEl.getAttribute('aria-label') !== label) regionEl.setAttribute('aria-label', label)
         if (regionHeaderEl.getAttribute('aria-label') !== label) regionHeaderEl.setAttribute('aria-label', label)
         if (regionHeaderLabelEl.textContent !== label) regionHeaderLabelEl.textContent = label
@@ -3843,43 +4334,10 @@ window.__ModuleLoader__.load({
 
       // ------------------------------------------------- group fold / unfold
 
-      /**
-       * Per-group fold bookkeeping: which pinned-member set is CONFIRMED in the
-       * host, and, while one is not, the single click in flight for it.
-       *
-       * The intent is keyed by WORKSPACE and by the STATE it is trying to
-       * reach — never by the header element or by the signature. Both of those
-       * are things the host is free to change while a click is in flight, and
-       * treating either as a new question is what made a delayed host get
-       * toggled twice: one header replacement was enough to look like "a new
-       * widget, a new intent". See `reconcileGroups`.
-       *
-       * `initial` is the one-time "this directory has not been closed yet"
-       * initialization, which is a question of its OWN and not the pin rule
-       * wearing a hat. While it is set the target is CLOSED whatever the pin
-       * set says, so the default fold can never be followed — one reconcile
-       * later, after it has landed — by the pin rule's "no pin means expand".
-       * `tried` records that the initialization has actually asked for it, so a
-       * group the USER opens afterwards is handed over rather than re-closed.
-       *
-       * An intent carries the signature it was ISSUED against, because the
-       * signature can move while the click is in flight and the reading the
-       * click lands on has to be booked against the question that was asked —
-       * not against the one that arrived in the meantime.
-       *
-       * @type {Map<string, {
-       *   confirmed: string | null,
-       *   initial: boolean,
-       *   tried: boolean,
-       *   intent: null | {
-       *     wantExpanded: boolean,
-       *     signature: string,
-       *     before: string | null,
-       *     attempts: number,
-       *     undelivered: number,
-       *   },
-       * }>}
-       */
+      /** Desired user disclosure and the single toggle still awaiting read-back. */
+      /** @type {Map<string | Element, { wantExpanded: boolean, intent: null | {
+       *   before: string | null, attempts: number, undelivered: number
+       * } }>} */
       const foldSignature = new Map()
 
       /**
@@ -3919,27 +4377,7 @@ window.__ModuleLoader__.load({
        */
       const CLICK_NOT_DELIVERED_RETRY_LIMIT = 1
 
-      /**
-       * The group's PINNED MEMBERS as a set, in a form that does not move when
-       * the session list does.
-       *
-       * Sorted, so `sort()` (stable, and the ids are already strings) makes the
-       * signature a function of the member set alone. Session COUNT and session
-       * ORDER are deliberately not in it: neither says anything about whether
-       * this group still holds something the plugin put there.
-       *
-       * @param {readonly string[]} sessionIds - the group's members, in host order.
-       * @param {ReadonlySet<string>} pinned - the current pin set.
-       * @returns {string} the signature; `''` when the group holds no pin.
-       */
-      const pinnedMembers = (sessionIds, pinned) => sessionIds
-        .filter(id => pinned.has(id))
-        .sort()
-        .join('\u0000')
-
-      /**
-       * Resolved group headers, cached so unpin can re-open a group whose rows
-       * are (correctly) not rendered while it is folded.
+      /** Resolved workspace headers for borrowing native context-menu rows.
        * @type {Map<string, Element>}
        */
       const headCache = new Map()
@@ -4011,13 +4449,85 @@ window.__ModuleLoader__.load({
        * @param {string} key - the group key, for the log.
        * @returns {boolean} true when the click was delivered.
        */
+      let togglingGroup = false
       const toggleGroupHeader = (header, key) => {
         try {
+          togglingGroup = true
           header.click()
           return true
         } catch (error) {
           warn(`could not deliver the toggle click for group ${key}: ${describeError(error)}`)
           return false
+        } finally {
+          togglingGroup = false
+        }
+      }
+
+      /** All host disclosures inside the identified tree; titles are never used
+       * to resolve a session. Ambiguous empty projects keep their own DOM identity. */
+      const groupDisclosures = (flavor) => {
+        const tree = flavor === null ? null : findTree(flavor)
+        if (tree === null) return new Map()
+        const result = new Map()
+        if (flavor === FLAVOR_OFFICIAL) {
+          for (const workspace of workspaceItems()) {
+            const header = groupHeader(flavor, workspace.workspaceId)
+            if (header !== null) result.set(workspace.workspaceId, header)
+          }
+          return result
+        }
+        const sectionKey = (header) => {
+          const section = header.closest('.dcu-wb-section')
+          if (section === null) return 'projects'
+          if (section.querySelector('.dcu-wb-pinned-list') !== null) return 'pinned'
+          if (section.querySelector('.dcu-wb-collections') !== null) return 'projects'
+          return section.getAttribute('aria-label') ?? 'recent'
+        }
+        const candidates = []
+        for (const header of tree.querySelectorAll('.dcu-wb-section-label[aria-expanded], .dcu-wb-collection-label[aria-expanded], .dcu-wb-project-head[aria-expanded]')) {
+          const section = sectionKey(header)
+          let key
+          if (header.matches('.dcu-wb-section-label')) key = 'section:' + section
+          else if (header.matches('.dcu-wb-collection-label')) {
+            // React preserves this keyed root through count, title and header changes.
+            key = header.closest('.dcu-wb-collection, .dcu-wb-ungrouped') ?? header
+          } else {
+            const project = header.closest('.dcu-wb-project')
+            const ids = [...(project?.querySelectorAll('[data-dcu-session]') ?? [])].map(row => row.getAttribute('data-dcu-session'))
+            const workspace = workspaceItems().find(item => ids.some(id => item.sessionIds.includes(id)))
+            const title = header.querySelector('.dcu-wb-project-title')?.textContent
+            const empty = workspaceItems().filter(item => item.title === title)
+            const id = workspace?.workspaceId ?? (empty.length === 1 ? empty[0].workspaceId : null)
+            key = id === null ? header : 'project:' + section + ':' + id
+          }
+          candidates.push([key, header])
+        }
+        const counts = new Map()
+        for (const [key] of candidates) counts.set(key, (counts.get(key) ?? 0) + 1)
+        for (const [key, header] of candidates) result.set(counts.get(key) === 1 ? key : header, header)
+        return result
+      }
+
+      // Observe only disclosure gestures. Session navigation and header actions
+      // (menu, new session, folder tooltip) must not grant expansion permission.
+      const onGroupToggle = (event) => {
+        if (!alive() || togglingGroup || !(event.target instanceof Element)) return
+        const target = event.target
+        const header = target.closest('[role="treeitem"][aria-expanded], .dcu-wb-section-label[aria-expanded], .dcu-wb-collection-label[aria-expanded]')
+        if (header === null) return
+        const control = target.closest('button, input, select, textarea, a, [role="button"], [class*="rowActions"], .dcu-wb-actions, .dcu-wb-folder')
+        if (control !== null && control !== header) return
+        const flavor = currentFlavor(Date.now())
+        if (event.type === 'keydown') {
+          if (flavor !== FLAVOR_CODEX || target !== header || header.tagName === 'BUTTON' || (event.key !== 'Enter' && event.key !== ' ')) return
+        }
+        for (const [key, candidate] of groupDisclosures(flavor)) {
+          if (candidate !== header) continue
+          const state = foldSignature.get(key) ?? { wantExpanded: false, intent: null }
+          state.wantExpanded = header.getAttribute('aria-expanded') !== 'true'
+          foldSignature.set(key, state)
+          scheduleReconcile()
+          break
         }
       }
 
@@ -4186,7 +4696,7 @@ window.__ModuleLoader__.load({
        * @param {object | null} [flavor] - an already-probed flavor, if the caller has one.
        */
       const writeDynamicSheet = (flavor = currentFlavor(Date.now())) => {
-        applyPinRules(dynamicSheet, flavor, flavor === null ? [] : [...pinSet()],
+        applyPinRules(dynamicSheet, flavor, flavor === null ? [] : visibleSessions,
           panels.collapsed === true, directory.collapsed === true)
       }
 
@@ -4609,6 +5119,8 @@ window.__ModuleLoader__.load({
           // notifies nobody, so the only place that can notice is a pass that
           // is already happening.
           refreshSessions()
+          refreshConnection()
+          reconcileRightSidebar()
           invalidateFlavor()
           const flavor = currentFlavor(Date.now())
           const flavorId = flavor === null ? 'none' : flavor.id
@@ -4638,11 +5150,13 @@ window.__ModuleLoader__.load({
             clearDirectoryRegion()
             clearFooter()
             clearHostRowColors()
+            clearRuntime()
             applyPinRules(dynamicSheet, null, [])
             headCache.clear()
             foldSignature.clear()
             return
           }
+          refreshRuntime()
           const pinned = [...pinSet()]
           ensureHosts()
           // The tree is proven and its host is mounted, so it — and only it —
@@ -4653,15 +5167,22 @@ window.__ModuleLoader__.load({
           reconcilePanels(flavor, tree)
           reconcileDirectoryRegion(flavor, tree)
           reconcileFooter(flavor, tree)
-          applyPinRules(dynamicSheet, flavor, pinned, panels.collapsed === true, directory.collapsed === true)
+          applyPinRules(dynamicSheet, flavor, visibleSessions, panels.collapsed === true, directory.collapsed === true)
           renderRegion()
           // After the region is placed, so a colour chosen for a PINNED session
           // lands on the host row it is hiding and on ours at the same pass.
           reconcileHostRowColors(flavor)
-          if (pinned.length > 0 && regionEl !== null && regionEl.parentElement !== host) {
-            host.insertBefore(regionEl, host.firstChild)
-          } else if (pinned.length === 0) {
+          renderRuntimeSummary(host)
+          if (visibleSessions.length > 0 && regionEl !== null && regionEl.parentElement !== host) {
+            host.insertBefore(regionEl, summaryEl.nextElementSibling)
+          } else if (visibleSessions.length === 0) {
             detachRegion()
+          }
+          for (const row of runtimeRows) {
+            if (row.isConnected !== false) continue
+            row.removeAttribute('data-stp-runtime')
+            row.querySelector('[data-stp-runtime-label]')?.remove()
+            runtimeRows.delete(row)
           }
           reconcileGroups(flavor, new Set(pinned), confirmOnly)
         } catch (error) {
@@ -4671,214 +5192,47 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * Behavior 3/4's fold rule: a foldable directory is CLOSED once when it is
-       * first seen (the spec's "原工作区目录默认折叠"), a group holding a pinned
-       * session folds on every pin change, and a group that has lost its last pin
-       * expands again so the returning session is visible where it went.
-       *
-       * Four rules make that rule survivable, each of which was a separate
-       * measured failure:
-       *
-       *  1. THE SIGNATURE IS THE SET OF PINNED MEMBERS. The previous signature
-       *     was a positional bitmap of the group's whole session list, so
-       *     re-ordering two sessions — or adding one that is not pinned at all —
-       *     read as a pin change and re-folded a group the user had opened by
-       *     hand (`GROUP_ORDER_ONLY_CHANGE`). A sorted member set is invariant
-       *     under exactly those operations and nothing else.
-       *  2. FIRST SIGHT IS AN INITIALIZATION, NOT A PIN DECISION. It is its own
-       *     state (`initial`), it targets CLOSED whatever the pin set says, and
-       *     it ends the moment the group is read closed — a target that flipped
-       *     to "expand" the pass after the click was issued would wait for the
-       *     fold to land and then open the group right behind it.
-       *  3. AFTERWARDS THE GROUP IS THE USER'S. A group the user opens by hand
-       *     is booked as reached and no notification, title change, reorder or
-       *     unrelated pin re-closes it. That is the defect the withdrawn
-       *     "first sight with no pin touches nothing" rule was protecting
-       *     (`GROUP_ZERO_PINS_INITIAL` turned a long-standing `false` into
-       *     `true`), and it survives the new default by becoming a handover
-       *     rather than a first-sight exemption.
-       *  4. NOTHING IS BOOKED BEFORE IT HAPPENED. The previous code recorded the
-       *     signature BEFORE looking for the header and clicking it, so a header
-       *     that had not rendered yet, a click the host ignored and a click that
-       *     threw were all remembered as done and never retried
-       *     (`GROUP_HEADER_LATE`, `GROUP_TOGGLE_RETRY`). Here a group is marked
-       *     confirmed only after its `aria-expanded` has been READ BACK in the
-       *     wanted state, and an unanswered click stays answerable.
-       *
-       * A click in flight is NOT retried on any ordinary signal. There is no
-       * acknowledgement contract on the host's toggle: `click()` returns before
-       * the state lands, and until it lands the reading is indistinguishable
-       * from a click that will never be applied. Any gate made of elapsed time,
-       * read counts or notification counts therefore only MOVES the window in
-       * which a late host gets toggled twice — it cannot remove it. Measured: a
-       * host that applies after 250ms, with one unrelated notification inside
-       * that window, received two clicks and two toggles, and the group ended
-       * in the opposite of the state the plugin wanted.
-       *
-       * THE SAME FAILURE HAS A SECOND FORM, and it is not about time at all. The
-       * plugin is allowed to remember that it clicked; it is NOT allowed to
-       * decide that the click is finished because the world looks different.
-       * `groupHeader` is a live `querySelector` per pass, and a host that
-       * re-renders its rows hands back a NEW element for the same workspace:
-       * measured against a store-backed host whose toggle commits after
-       * 300/400/600/1000ms, keying the pending on the header element produced
-       * two clicks and two toggles on every one of those delays, with the
-       * second click landing before the first had been committed. Element
-       * identity is a fact about the DOM, not about the request; the request
-       * belongs to the workspace and to the state it is trying to reach.
-       *
-       * So the rule is one-sided: ONE unconfirmed intent gets ONE click, and it
-       * is spent. It is identified by (workspace, wanted state) and released
-       * only by the READING MOVING — which is the one thing that proves the
-       * in-flight click actually happened. On top of that:
-       *
-       *  1. an intent is in flight and the reading has NOT moved — this group
-       *     belongs to that request, whatever the pin set says now, and the
-       *     reached-state test below is NOT reached. Unpinning inside the host's
-       *     commit window makes the wanted state equal the current reading, and
-       *     booking it there is what used to write a group off while a toggle of
-       *     ours was still on its way to it;
-       *  2. within that, an intent for the OPPOSITE state is in flight: wait.
-       *     The old click cannot be recalled, and clicking now would either
-       *     toggle it twice or race the state it is about to change. Nothing is
-       *     claimed about cancelling it; when it lands, the reading moves, and
-       *     that is what releases it and re-evaluates the new target;
-       *  3. the reading HAS moved — the click landed, or somebody else acted.
-       *     The intent is spent, and the pass books the reached state or issues
-       *     the new request from the new reading;
-       *  4. the click could not be DELIVERED at all (`click` missing or
-       *     replaced) — nothing reached the host, so nothing could have
-       *     toggled, and one bounded retry is safe. See
-       *     `CLICK_NOT_DELIVERED_RETRY_LIMIT` for why this is NOT a refusal
-       *     signal: no browser reports a listener exception to this caller.
-       *
-       * What this rule deliberately gives up:
-       *
-       *   - a host that accepts a click and never applies it is left alone. The
-       *     plugin does not fight it, does not toggle it back, and does not
-       *     claim to have fixed it — a visible reason for the user is R06's
-       *     business (alert host), not something to fake here;
-       *   - a signature change that still wants the same state does NOT
-       *     re-issue, because nothing about the request changed;
-       *   - a header element that never existed yet still takes its first click
-       *     when it appears: nothing was booked while it was missing.
-       *
-       * The withdrawn guarantees are recorded in task-2-report.md.
-       *
-       * @param {object | null} flavor - the detected sidebar.
-       * @param {ReadonlySet<string>} pinned - the current pin set.
-       * @param {boolean} confirmOnly - true when this pass was scheduled by the
-       *   plugin to check a click of its own; such a pass may read but not click.
+       * Directories stay closed until their own header is activated by the user.
+       * Selection, pin churn and a host reveal never grant expansion permission.
+       * Keep one outstanding toggle per workspace until its read-back moves;
+       * a delayed commit or replacement header is not a reason to toggle twice.
        */
       const reconcileGroups = (flavor, pinned, confirmOnly) => {
         const live = new Set()
-        for (const workspace of workspaceItems()) {
-          if (!isFoldableGroup(workspace.workspaceId)) continue
-          if (workspace.sessionIds.length === 0) continue
-          const key = workspace.workspaceId
+        for (const [key, header] of groupDisclosures(flavor)) {
           live.add(key)
-          const signature = pinnedMembers(workspace.sessionIds, pinned)
           let state = foldSignature.get(key)
           if (state === undefined) {
-            state = { confirmed: null, initial: true, tried: false, intent: null }
+            state = { wantExpanded: false, intent: null }
             foldSignature.set(key, state)
           }
-          // The one-time initialization targets CLOSED whatever the pin set
-          // says. Only once that has been read back does the pin rule below
-          // take over the group.
-          let wantExpanded = state.initial ? false : signature === ''
-          if (state.initial !== true && state.confirmed === signature) continue
-          const header = groupHeader(flavor, key)
-          // Not rendered (yet). Nothing is booked, so the next notification
-          // tries again.
-          if (header === null) continue
+          // A native context menu may temporarily borrow an otherwise absent row.
+          // Its transaction restores the group when that menu closes.
+          if (officialAnchor?.row === header || officialAnchor?.refold != null) continue
           const now = header.getAttribute('aria-expanded')
+          if (now !== 'true' && now !== 'false') continue
+          const expanded = now === 'true'
           const intent = state.intent
-          // IN FLIGHT CHECK FIRST, and it gates the booking below.
-          //
-          // While a click of ours is out and the reading still shows the value
-          // it was issued against, that request owns this group. Booking it as
-          // "already in the wanted state" first is what wrote off a group the
-          // plugin then stopped watching: unpinning during the host's own commit
-          // window makes the wanted state equal the CURRENT reading, so the
-          // reached-state test fired, the intent was dropped, and the toggle
-          // already on its way landed on a group nobody was looking at any more
-          // — measured at a 400ms host, `final expanded=false` after the last pin
-          // was gone.
           if (intent !== null && now === intent.before) {
-            if (intent.wantExpanded !== wantExpanded) {
-              // The opposite request, still in flight. It cannot be recalled and
-              // nothing here can tell "not applied yet" from "never applied" for
-              // it, so this pass waits. When it lands the reading moves, which is
-              // what lets the new target be evaluated below.
-              continue
-            }
-            // The same request, still unconfirmed: one click, already spent.
-            if (confirmOnly) continue
-            // Not a single ordinary notification. Only a click that never got
-            // delivered unlocks the retry; see the constant for why that is
-            // narrower than it sounds.
-            if (intent.undelivered === 0) continue
-            if (intent.attempts > CLICK_NOT_DELIVERED_RETRY_LIMIT) continue
-            // Retrying in place. Replacing the record with a fresh one would
-            // reset the budget on every failure, which is precisely the
-            // "click forever" bug the budget exists to stop.
+            if (confirmOnly || intent.undelivered === 0
+              || intent.attempts > CLICK_NOT_DELIVERED_RETRY_LIMIT) continue
             intent.attempts += 1
           } else {
-            // Nothing is in flight, or the reading moved: whatever click was out
-            // has landed (or somebody else acted), so the intent is spent.
-            const spent = state.intent
             state.intent = null
-            const expandedNow = now === 'true'
-            // HANDOVER. The initialization has been asked for, and the group is
-            // EXPANDED with no pin: the user's own opening is now the state to
-            // respect. Clicking here would re-close a group the user opened,
-            // on every notification, for the rest of the session.
-            if (state.initial === true && state.tried === true
-              && expandedNow === true && signature === '') {
-              state.initial = false
-              state.confirmed = signature
-              continue
-            }
-            if (expandedNow === wantExpanded) {
-              // Reached. Book it, and let go of the intent: from here on an
-              // ordinary notification for the SAME signature must not re-issue
-              // it. Reading the group closed ends the initialization too — from
-              // now on only a pin change may move it.
-              //
-              // Booked against the signature the click was ISSUED against: a pin
-              // that came and went while it was in flight is still unanswered,
-              // and booking the later one would leave the group where the click
-              // put it with no record that anything was owed.
-              state.confirmed = spent === null ? signature : spent.signature
-              state.initial = false
-              if (state.confirmed === signature) continue
-              // The pin set really did move. Ask that question NOW: deferring it
-              // to the next notification would leave the group folded until
-              // something unrelated happened to arrive.
-              wantExpanded = signature === ''
-              if (expandedNow === wantExpanded) {
-                state.confirmed = signature
-                continue
-              }
-            }
-            if (state.intent === null) {
-              if (state.initial === true) state.tried = true
-              state.intent = { wantExpanded, signature, before: now, attempts: 1, undelivered: 0 }
-            }
+            if (expanded === state.wantExpanded) continue
+            // The user's own opening is left to the host. Only an unwanted
+            // expansion needs a corrective toggle; never reopen a closed group.
+            if (state.wantExpanded) continue
+            state.intent = { before: now, attempts: 1, undelivered: 0 }
           }
-          if (toggleGroupHeader(header, key)) {
-            scheduleConfirmPass()
-          } else if (state.intent !== null) {
-            // The click never reached the host, so nothing could have toggled.
-            // Record that, and only that, as the reason a retry is allowed.
-            state.intent.undelivered += 1
-          }
+          if (toggleGroupHeader(header, key)) scheduleConfirmPass()
+          else state.intent.undelivered += 1
         }
-        for (const key of [...foldSignature.keys()]) {
+        for (const key of foldSignature.keys()) {
           if (!live.has(key)) foldSignature.delete(key)
         }
       }
+
 
       /**
        * Is this a node the plugin itself owns?
@@ -4893,7 +5247,7 @@ window.__ModuleLoader__.load({
         if (!(node instanceof Element)) return false
         if (node === regionEl || node === anchorEl) return true
         if (node.getAttribute?.('data-plugin') === PLUGIN_ID) return true
-        return node.closest?.('[data-stp-region], [data-stp-anchor], [data-stp-notice], [data-stp-color-dialog]') != null
+        return node.closest?.('[data-stp-region], [data-stp-anchor], [data-stp-notice], [data-stp-color-dialog], [data-stp-runtime-summary], [data-stp-runtime-label], [data-stp-absolute-button], [data-stp-rename-input]') != null
       }
 
       /**
@@ -6087,7 +6441,13 @@ window.__ModuleLoader__.load({
         // own body has already executed past every `const` it references, and
         // `observer` / `onDismiss` are optional-chained or simply absent.
         fullTeardown = teardown
+        disposers.push(releaseConnection)
         document.addEventListener('contextmenu', onContextMenu, true)
+        document.addEventListener('dblclick', onDoubleClick, true)
+        for (const type of ['click', 'keydown']) {
+          document.addEventListener(type, onGroupToggle, true)
+          disposers.push(() => document.removeEventListener(type, onGroupToggle, true))
+        }
 
         // Publish into the shared context menu as early as possible, then keep
         // trying on a bounded timer while it has not taken: which of the two
@@ -6114,6 +6474,18 @@ window.__ModuleLoader__.load({
         // the per-reconcile identity check both go through — NOT captured here,
         // because a service object captured here is the one that goes stale.
         attachSessionsTo(sessionsService())
+        disposers.push(releaseRightSidebar)
+        // These children wake when a service arrives late and release their
+        // subscriptions on revocation. Neither service gates plugin activation.
+        for (const name of ['sidebarRight', 'sidebarRightTabs']) {
+          ctx.inject([name], (child) => {
+            child.effect(() => {
+              refreshRightSidebar()
+              scheduleReconcile()
+              return () => { releaseRightSidebar(); scheduleReconcile() }
+            }, 'dsh-session-top: right sidebar defaults')
+          })
+        }
 
         // React rewrites the whole list on every keystroke of search typing and
         // on every row animation; a mutation observer is the only signal that
@@ -6125,9 +6497,20 @@ window.__ModuleLoader__.load({
         observer = new MutationObserver((records) => {
           if (!alive()) return
           const external = Array.from(records ?? []).filter(record => !isOwnMutation(record))
+          const transitions = external.filter(record => record.type === 'attributes' && record.attributeName === 'aria-expanded')
+          if (transitions.length > 0) {
+            for (const [key, header] of groupDisclosures(currentFlavor(Date.now()))) {
+              const state = foldSignature.get(key)
+              if (state?.intent == null) continue
+              // oldValue proves a fold landed even if the host already revealed it
+              // again in this batch. A still-pending click never gets another toggle.
+              if (transitions.some(record => record.target === header
+                && (record.oldValue === 'false' || header.getAttribute('aria-expanded') === 'false'))) state.intent = null
+            }
+          }
           if (external.length > 0) scheduleReconcile()
         })
-        observer.observe(document.body, { childList: true, subtree: true })
+        observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeOldValue: true, attributeFilter: ['aria-expanded'] })
 
         // Dismiss the context menu on any outside interaction.
         onDismiss = (event) => {

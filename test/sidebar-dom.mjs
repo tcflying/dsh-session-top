@@ -95,11 +95,18 @@ class MouseEvent {
   stopPropagation() { this.propagationStopped = true }
 }
 
-/** Report one childList change the way the DOM does: target plus added/removed. */function emitMutation(target, added = [], removed = []) {
-  const record = { type: 'childList', target, addedNodes: added, removedNodes: removed }
+/** Deliver child changes and attribute history with the observer's requested fields. */
+function emitMutation(target, added = [], removed = [], attributeName = null, oldValue = null) {
+  const record = attributeName === null
+    ? { type: 'childList', target, addedNodes: added, removedNodes: removed }
+    : { type: 'attributes', target, attributeName }
   mutationLog.records += 1
   for (const observer of [...observers]) {
-    observer.pending.push(record)
+    if (attributeName !== null) {
+      if (observer.options?.attributes !== true) continue
+      if (observer.options.attributeFilter && !observer.options.attributeFilter.includes(attributeName)) continue
+    }
+    observer.pending.push(attributeName === null ? record : { ...record, oldValue: observer.options.attributeOldValue ? oldValue : null })
     observer.schedule()
   }
 }
@@ -111,7 +118,7 @@ class FakeMutationObserver {
     this.scheduled = false
   }
 
-  observe() { observers.add(this) }
+  observe(_target, options = {}) { this.options = options; observers.add(this) }
   disconnect() { observers.delete(this) }
 
   schedule() {
@@ -291,14 +298,16 @@ class El {
   setAttribute(n, v) {
     const next = String(v)
     if (this.attributes.get(n) === next) return
+    const oldValue = this.getAttribute(n)
     this.attributes.set(n, next)
-    emitMutation(this, [], [])
+    emitMutation(this, [], [], n, oldValue)
   }
   getAttribute(n) { return this.attributes.has(n) ? this.attributes.get(n) : null }
   removeAttribute(n) {
     if (!this.attributes.has(n)) return
+    const oldValue = this.getAttribute(n)
     this.attributes.delete(n)
-    emitMutation(this, [], [])
+    emitMutation(this, [], [], n, oldValue)
   }
   hasAttribute(n) { return this.attributes.has(n) }
   get className() { return this.attributes.get('class') ?? '' }
@@ -757,7 +766,7 @@ function openWorkspace(sc) {
     'precondition: the plugin folded this directory on first sight',
   )
   assert.equal(sc.tree.querySelector('[data-row-key^="session:"]'), null, 'precondition: the host unmounted its rows')
-  sc.head.click()
+  sc.head.dispatchEvent(new MouseEvent('click', { bubbles: true }))
   assert.equal(sc.head.getAttribute('aria-expanded'), 'true', 'the user opened it, and the host remounted its rows')
   return sc
 }
@@ -1051,6 +1060,8 @@ async function runBundle(scaffold, {
   // `undefined` for every other case, which is exactly what `ctx.get('slots')`
   // answers on a host that publishes none.
   slots = undefined,
+  // Optional right-column services; the shipped bundle must also work without them.
+  rightSidebar = {},
 } = {}) {
   // The previous generation goes first, so its bundle can no longer arm
   // anything into the set this run is about to start counting.
@@ -1141,7 +1152,12 @@ async function runBundle(scaffold, {
     querySelector: (sel) => scaffold.body.querySelector(sel) ?? scaffold.head.querySelector(sel),
     querySelectorAll: (sel) => [...scaffold.body.querySelectorAll(sel), ...scaffold.head.querySelectorAll(sel)],
     addEventListener: (t, fn) => { if (!listeners.has(t)) listeners.set(t, []); listeners.get(t).push(fn) },
-    removeEventListener: () => {},
+    removeEventListener: (type, fn) => {
+      const handlers = listeners.get(type)
+      const index = handlers?.indexOf(fn) ?? -1
+      if (index >= 0) handlers.splice(index, 1)
+      if (handlers?.length === 0) listeners.delete(type)
+    },
     dispatchEvent: () => {},
   }
   globalThis.window = {
@@ -1234,6 +1250,7 @@ async function runBundle(scaffold, {
     locale,
     slots,
   })) services[name] = value
+  Object.assign(services, rightSidebar)
 
   // Model cordis faithfully: the fiber activates NOW with nothing provided, and
   // `ctx.inject(deps, cb)` defers the callback until the dependency shows up.
@@ -1376,6 +1393,403 @@ function staticCss(scaffold) {
 }
 
 // ---------------------------------------------------------------- the tests
+
+// Per-session entry defaults use the right column even when the left sidebar is unknown.
+for (const makeScaffold of [officialUiScaffold, codexScaffold, makeTree]) {
+  const source = initial => {
+    let value = initial
+    const listeners = new Set()
+    return {
+      getSnapshot: () => value,
+      subscribe: fn => { listeners.add(fn); return () => listeners.delete(fn) },
+      set(next) { value = next; for (const fn of [...listeners]) fn() },
+      listeners,
+    }
+  }
+  const mounted = source(S1)
+  const registry = source(false)
+  const inventory = source([])
+  const states = new Map()
+  const calls = []
+  let adopted = false
+  const state = () => {
+    const id = mounted.getSnapshot()
+    if (!states.has(id)) states.set(id, { expanded: false, active: { id: 'start', kind: 'guide' } })
+    return states.get(id)
+  }
+  const right = {
+    mounted,
+    openTabs: inventory,
+    isExpanded: () => state().expanded,
+    active: () => state().active,
+    toggleExpanded() {
+      if (!adopted) throw new Error('sidebarRight: no session surface is mounted')
+      calls.push(['expand', mounted.getSnapshot()])
+      state().expanded = !state().expanded
+    },
+    openTab(kind, options = {}) {
+      if (!adopted) throw new Error('sidebarRight: no session surface is mounted')
+      assert.equal(registry.getSnapshot(), true, 'never open an unregistered task page')
+      calls.push(['open', mounted.getSnapshot(), kind, options])
+      state().expanded = true
+      state().active = { id: 'task', kind }
+      inventory.set([...inventory.getSnapshot()])
+    },
+  }
+  const sc = makeScaffold()
+  const run = await runBundle(sc, {
+    pinned: [], mutable: true,
+    rightSidebar: {
+      sidebarRight: right,
+      sidebarRightTabs: {
+        get: kind => kind === 'subagent' && registry.getSnapshot() ? { id: 'dsh-better-sidebar:subagent', kind } : undefined,
+        subscribe: registry.subscribe,
+      },
+    },
+  })
+  assert.equal(calls.length, 0, 'selection before store adoption must not mutate another session')
+  adopted = true
+  inventory.set([{ sessionId: S1, tabId: 'start', kind: 'guide' }])
+  await settle()
+  assert.equal(state().expanded, true, 'open the right column before the optional task provider arrives')
+  assert.equal(state().active.kind, 'guide')
+  registry.set(true)
+  await settle()
+  assert.equal(state().active.kind, 'subagent', 'late Task Management registration must become the first displayed page')
+  assert.deepEqual(calls, [['expand', S1], ['open', S1, 'subagent', { replaceTab: 'start' }]], 'replace only the blank guide')
+  state().active = { id: 'file', kind: 'editor' }
+  state().expanded = false
+  const afterDefault = calls.length
+  registry.set(true)
+  inventory.set([])
+  run.nudge()
+  await settle()
+  assert.equal(calls.length, afterDefault, 'list, tab and registry pulses must preserve the user choice within the session')
+  assert.equal(state().expanded, false)
+  assert.equal(state().active.kind, 'editor')
+  mounted.set(S2)
+  await settle()
+  assert.equal(state().expanded, true, 'every newly selected session opens its right column')
+  assert.equal(state().active.kind, 'subagent')
+  mounted.set(S1)
+  await settle()
+  assert.equal(state().expanded, true, 'returning to a session reapplies its entry default')
+  assert.deepEqual(calls.at(-1), ['open', S1, 'subagent', {}], 'an existing editor must never be replaced or closed')
+  mounted.set(undefined)
+  registry.set(true)
+  inventory.set([])
+  await settle()
+  const noSessionCalls = calls.length
+  assert.equal(noSessionCalls, 4, 'global panels must not write to a retained session')
+  mounted.set(S2)
+  run.dispose()
+  await settle()
+  assert.equal(calls.length, noSessionCalls, 'dispose cancels a pending default open')
+  assert.equal(mounted.listeners.size, 0)
+  assert.equal(registry.listeners.size, 0)
+  assert.equal(inventory.listeners.size, 0)
+  assert.equal(run.liveTimers().length, 0)
+}
+console.log('✔ right sidebar: every session enters expanded on Tasks; late adoption/provider, user choice and disposal are covered')
+
+// Runtime indicators must use Host execution, including children of idle parents.
+for (const makeScaffold of [officialScaffold, codexScaffold]) {
+  const sc = makeScaffold()
+  const run = await runBundle(sc, { pinned: [S1], mutable: true })
+  run.live.byId[S1] = { ...run.live.byId[S1], running: true }
+  run.live.byId[S2] = { ...run.live.byId[S2], running: false }
+  run.live.byId.child = { id: 'child', parentId: S2, origin: 'subagent', running: true }
+  run.nudge()
+  await settle()
+  const region = sc.body.querySelector('[data-stp-region]')
+  const first = region.querySelector(`[data-stp-session="${S1}"]`)
+  const second = region.querySelector(`[data-stp-session="${S2}"]`)
+  assert.equal(first.getAttribute('data-stp-runtime'), 'running')
+  assert.equal(second?.getAttribute('data-stp-runtime'), 'children', 'an idle parent must float while children execute')
+  assert.equal(second.querySelector('[data-stp-runtime-label]').textContent, '子代理运行 1')
+  assert.equal(sc.body.querySelector('[data-stp-runtime-summary]').textContent, '运行会话 1 · 子代理 1')
+  assert.match(staticCss(sc), /data-stp-runtime='running'[\s\S]*?#22c55e/)
+  assert.match(staticCss(sc), /data-stp-runtime='children'[\s\S]*?#eab308/)
+  const hidden = sheetRules(sc).join('\n')
+  assert.ok(hidden.includes(S2), 'a floated session must not be duplicated in its workspace')
+  run.live.byId.child.running = false
+  run.live.byId[S1].running = false
+  run.nudge()
+  await settle()
+  assert.equal(first.hasAttribute('data-stp-runtime'), false)
+  assert.equal(region.querySelector(`[data-stp-session="${S2}"]`), null)
+  assert.equal(sc.body.querySelector('[data-stp-runtime-summary]').textContent, '运行会话 0 · 子代理 0')
+  run.dispose()
+  assert.equal(sc.body.querySelector('[data-stp-runtime-summary]'), null)
+  assert.equal(sc.body.querySelector('[data-stp-runtime-label]'), null)
+  console.log('✔ runtime: real execution colors, idle-parent child counts, float-up and cleanup')
+}
+
+
+// Connection notifications must clear stale execution even when the session list is unchanged.
+{
+  const source = initial => {
+    let value = initial
+    const listeners = new Set()
+    return {
+      getSnapshot: () => value,
+      subscribe: fn => { listeners.add(fn); return () => listeners.delete(fn) },
+      set(next) { value = next; for (const fn of [...listeners]) fn() },
+      listeners,
+    }
+  }
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1], mutable: true })
+  const state = source('connected')
+  const generation = source({ id: 1, host: { home: 'fixture' } })
+  run.services.connection = { state, generation }
+  run.live.byId[S1].running = true
+  run.nudge()
+  await settle()
+  const row = sc.body.querySelector('[data-stp-row]')
+  assert.equal(row.getAttribute('data-stp-runtime'), 'running')
+  assert.equal(state.listeners.size, 1)
+  assert.equal(generation.listeners.size, 1)
+  state.set('disconnected')
+  await settle()
+  assert.equal(row.hasAttribute('data-stp-runtime'), false, 'disconnect clears the cached running flag without a list change')
+  assert.equal(sc.body.querySelector('[data-stp-runtime-summary]').textContent, '运行状态暂不可用')
+  generation.set(undefined)
+  state.set('connected')
+  await settle()
+  assert.equal(row.hasAttribute('data-stp-runtime'), false, 'connected alone cannot establish a host generation')
+  generation.set({ id: 2, host: { home: 'fixture' } })
+  await settle()
+  assert.equal(row.getAttribute('data-stp-runtime'), 'running', 'generation publication must trigger its own reconcile')
+  const replacement = { state: source('disconnected'), generation: source(undefined) }
+  run.services.connection = replacement
+  run.nudge()
+  await settle()
+  assert.equal(state.listeners.size, 0)
+  assert.equal(generation.listeners.size, 0)
+  assert.equal(replacement.state.listeners.size, 1)
+  assert.equal(replacement.generation.listeners.size, 1)
+  assert.equal(row.hasAttribute('data-stp-runtime'), false, 'replacement connection controls availability')
+  run.dispose()
+  assert.equal(replacement.state.listeners.size, 0)
+  assert.equal(replacement.generation.listeners.size, 0)
+  assert.equal(sc.body.querySelector('[data-stp-runtime-summary]'), null)
+  console.log('✔ runtime: independent connection signals, replacement and subscription teardown')
+}
+
+const absoluteKey = 'dsh-session-top:absolute-pins'
+const idsInRegion = sc => [...sc.body.querySelectorAll('[data-stp-row]')].map(row => row.getAttribute('data-stp-session'))
+const doubleClick = (run, target) => {
+  const event = { target, preventDefault() {}, stopPropagation() {}, stopImmediatePropagation() {} }
+  for (const fn of [...(run.listeners.get('dblclick') ?? [])]) fn(event)
+}
+
+// Coalesced snapshots must rank by the Host timestamp, never object insertion order.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [S1, S2], mutable: true })
+  run.live.byId[S1] = { ...run.live.byId[S1], running: true, updatedAt: 200 }
+  run.live.byId[S2] = { ...run.live.byId[S2], running: true, updatedAt: 100 }
+  run.nudge()
+  await settle()
+  assert.deepEqual(idsInRegion(sc), [S1, S2], 'newer activity wins within one snapshot')
+  run.live.byId[S1].updatedAt = 300
+  run.live.byId[S2].updatedAt = 250
+  run.nudge()
+  await settle()
+  assert.deepEqual(idsInRegion(sc), [S1, S2], 'coalescing notifications cannot reverse recency')
+  const getSnapshot = run.services.sessions.list.getSnapshot
+  run.services.sessions.list.getSnapshot = () => ({ ...getSnapshot(), phase: 'error' })
+  run.nudge()
+  await settle()
+  assert.equal(sc.body.querySelector('[data-stp-runtime]'), null, 'unavailable snapshots cannot claim execution')
+  assert.equal(sc.body.querySelector('[data-stp-runtime-summary]').textContent, '运行状态暂不可用')
+  run.services.sessions.list.getSnapshot = () => ({ ...getSnapshot(), ids: [S2] })
+  run.nudge()
+  await settle()
+  assert.equal(sc.body.querySelector('[data-stp-runtime-summary]').textContent, '运行会话 1 · 子代理 0')
+  assert.equal(sc.body.querySelector('[data-stp-session="' + S1 + '"]').hasAttribute('data-stp-runtime'), false, 'retained summaries do not establish execution')
+  run.dispose()
+  console.log('✔ runtime: batched recency, unavailable snapshots and retained fallback')
+}
+
+// Absolute priority remains ahead of later activity, survives remount and syncs across windows.
+for (const makeScaffold of [officialScaffold, codexScaffold]) {
+  const sc = makeScaffold()
+  const run = await runBundle(sc, { pinned: [S1], mutable: true })
+  const row = sc.body.querySelector('[data-stp-row]')
+  const star = row.querySelector('[data-stp-absolute-button]')
+  star.dispatch('click', {}, { bubble: true })
+  await settle()
+  assert.equal(run.store.get(absoluteKey), JSON.stringify([S1]))
+  assert.deepEqual(run.opened, [], 'priority control cannot open the session')
+  assert.equal(star.getAttribute('aria-pressed'), 'true')
+  run.live.byId[S2].running = true
+  run.nudge()
+  await settle()
+  assert.deepEqual(idsInRegion(sc), [S1, S2], 'new execution stays below the absolute pin')
+  row.querySelector('[data-stp-absolute-button]').click()
+  await settle()
+  assert.deepEqual(idsInRegion(sc), [S2, S1], 'releasing absolute priority restores latest activity order')
+  writeFromOtherWindow(run, absoluteKey, JSON.stringify([S1]))
+  await settle()
+  assert.deepEqual(idsInRegion(sc), [S1, S2], 'foreign priority writes update this window')
+  run.dispose()
+  assert.equal(sc.body.querySelector('[data-stp-absolute-button]'), null)
+  assert.equal(run.listeners.has('dblclick'), false, 'dispose releases the rename listener')
+  const restored = makeScaffold()
+  const next = await runBundle(restored, { pinned: [S1], storageFixture: run.storageFixture })
+  assert.equal(restored.body.querySelector('[data-stp-row]').hasAttribute('data-stp-absolute'), true)
+  next.dispose()
+  console.log('✔ absolute priority: latest activity, cross-window sync, persistence and cleanup')
+}
+
+// An ordinary host row can be made absolute through the official pin API.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [], mutable: true })
+  const button = sc.row.querySelector('[data-stp-absolute-button]')
+  button.click()
+  await settle()
+  assert.deepEqual(run.pinCalls, [['pin', S1]])
+  assert.deepEqual(idsInRegion(sc), [S1])
+  run.live.pinned = []
+  run.nudge()
+  await settle()
+  assert.equal(idsInRegion(sc).length, 0, 'official unpin still removes an absolute pin')
+  run.services.workspaces.pinSession = async () => ({ ok: false, error: { message: 'refused' } })
+  sc.row.querySelector('[data-stp-absolute-button]').click()
+  await settle()
+  assert.equal(idsInRegion(sc).length, 0, 'refused official pins cannot become absolute')
+  assert.match(sc.body.querySelector('[role="alert"]').textContent, /refused/)
+  run.dispose()
+}
+
+// Inline rename uses the retained Host session, keeps edits through reorders and releases resources.
+for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
+  const sc = makeScaffold()
+  const run = await runBundle(sc, { pinned: [S2, S1], mutable: true })
+  const calls = []
+  let releases = 0
+  let refused = false
+  run.services.sessions.using = async (id, reason, fn) => {
+    assert.equal(reason.source, 'controllerOperation')
+    try {
+      return await fn({ ready: Promise.resolve(), binding: { session: { rename: async title => {
+        calls.push([id, title])
+        if (refused) return { ok: false, error: { message: 'rename refused' } }
+        run.live.byId[id].displayTitle = title
+        run.nudge()
+        return { ok: true }
+      } } } })
+    } finally { releases += 1 }
+  }
+  const row = [...sc.body.querySelectorAll('[data-stp-row]')].find(one => one.getAttribute('data-stp-session') === S1)
+  const title = row.querySelector('[data-stp-row-title]')
+  doubleClick(run, title)
+  let input = row.querySelector('[data-stp-rename-input]')
+  assert.ok(input !== null, 'double click opens an inline field')
+  input.value = '  中文新名字  '
+  input.dispatch('keydown', { key: 'Enter', isComposing: true })
+  assert.equal(calls.length, 0, 'IME confirmation cannot submit a rename')
+  const region = row.parentElement
+  const insertBefore = region.insertBefore
+  // Chromium blurs an editor when insertBefore detaches its containing row.
+  region.insertBefore = function (node, before) {
+    if (node === row && input.parentElement === row) input.dispatch('blur')
+    return insertBefore.call(this, node, before)
+  }
+  const focusCalls = input.focusCalls
+  input.selectionStart = 2
+  input.selectionEnd = 5
+  assert.deepEqual(idsInRegion(sc), [S2, S1])
+  run.live.byId[S1].running = true
+  run.nudge()
+  await settle()
+  assert.deepEqual(idsInRegion(sc), [S1, S2], 'activity really changes the edited row position')
+  assert.equal(row.querySelector('[data-stp-rename-input]'), input, 'actual reorder preserves the editor')
+  assert.equal(input.value, '  中文新名字  ', 'actual reorder preserves the draft')
+  assert.equal(input.focusCalls, focusCalls, 'reordering keeps focus without restarting composition')
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [2, 5])
+  region.insertBefore = insertBefore
+  input.dispatch('keydown', { key: 'Enter' }, { bubble: true })
+  await settle()
+  assert.deepEqual(calls, [[S1, '中文新名字']])
+  assert.equal(releases, 1)
+  assert.equal(row.querySelector('[data-stp-rename-input]'), null)
+  assert.equal(title.textContent, '中文新名字')
+  assert.deepEqual(run.opened, [])
+  doubleClick(run, title)
+  input = row.querySelector('[data-stp-rename-input]')
+  input.value = '   '
+  input.dispatch('keydown', { key: 'Enter' })
+  assert.equal(calls.length, 1)
+  assert.equal(input.getAttribute('aria-invalid'), 'true')
+  input.dispatch('keydown', { key: 'Escape' })
+  assert.equal(row.querySelector('[data-stp-rename-input]'), null)
+  doubleClick(run, title)
+  input = row.querySelector('[data-stp-rename-input]')
+  refused = true
+  input.value = '拒绝的名字'
+  input.dispatch('keydown', { key: 'Enter' })
+  await settle()
+  assert.equal(row.querySelector('[data-stp-rename-input]'), input, 'failure keeps the draft')
+  assert.equal(input.disabled, false)
+  assert.equal(title.textContent, '中文新名字', 'refusal never paints a successful rename')
+  assert.equal(releases, 2)
+  input.dispatch('keydown', { key: 'Escape' })
+  run.dispose()
+  console.log('✔ inline rename: Chinese input, Enter/Escape, refusal, stable draft and release')
+}
+
+// A temporary active row stays editable after execution ends, then leaves on save or cancel.
+for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
+  for (const finish of ['save', 'escape', 'blur']) {
+    const sc = makeScaffold()
+    const run = await runBundle(sc, { pinned: [], mutable: true })
+    const calls = []
+    run.services.sessions.using = async (id, reason, fn) => fn({
+      ready: Promise.resolve(),
+      binding: { session: { rename: async title => {
+        calls.push([id, title])
+        run.live.byId[id].displayTitle = title
+        run.nudge()
+        return { ok: true }
+      } } },
+    })
+    run.live.byId[S1].running = finish !== 'escape'
+    if (finish === 'escape') {
+      run.live.byId.child = { id: 'child', parentId: S1, origin: 'subagent', running: true }
+    }
+    run.nudge()
+    await settle()
+    const row = sc.body.querySelector('[data-stp-row]')
+    const title = row.querySelector('[data-stp-row-title]')
+    doubleClick(run, title)
+    const input = row.querySelector('[data-stp-rename-input]')
+    input.value = '  执行结束后仍能改名  '
+    run.live.byId[S1].running = false
+    if (run.live.byId.child) run.live.byId.child.running = false
+    run.nudge()
+    await settle()
+    assert.deepEqual(idsInRegion(sc), [S1], 'execution ending cannot retire the edited temporary row')
+    assert.equal(row.querySelector('[data-stp-rename-input]'), input)
+    assert.equal(input.value, '  执行结束后仍能改名  ')
+    assert.equal(row.hasAttribute('data-stp-runtime'), false, 'an edited idle row has no running color')
+    assert.equal(sc.body.querySelector('[data-stp-runtime-summary]').textContent, '运行会话 0 · 子代理 0')
+    if (finish === 'blur') input.dispatch('blur')
+    else input.dispatch('keydown', { key: finish === 'save' ? 'Enter' : 'Escape' })
+    await settle()
+    assert.deepEqual(calls, finish === 'save' ? [[S1, '执行结束后仍能改名']] : [])
+    assert.deepEqual(idsInRegion(sc), [], 'closing the editor releases an ended temporary row')
+    assert.equal(input.parentElement, null)
+    assert.equal(sheetRules(sc).some(rule => rule.includes(S1)), false, 'closing the editor restores the workspace row')
+    assert.deepEqual(run.pinCalls, [], 'retaining a draft never pins the session')
+    assert.deepEqual(run.opened, [])
+    run.dispose()
+  }
+  console.log('✔ inline rename: ended temporary rows stay editable until save, Escape or blur')
+}
 
 // --- official flavor
 {
@@ -2798,6 +3212,221 @@ function storeFoldScaffold() {
   }
 }
 
+// Opening a top row must not leave its project expanded by host navigation.
+for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
+  const sc = makeScaffold()
+  const run = await runBundle(sc, { pinned: [S1], mutable: true })
+  const header = sc.tree.querySelector('[aria-expanded]')
+  assert.equal(header.getAttribute('aria-expanded'), 'false')
+  const navigate = run.services.uiWorkspace.openSession
+  run.services.uiWorkspace.openSession = id => {
+    navigate(id)
+    // Both host sidebars reveal the newly selected session's workspace.
+    header.setAttribute('aria-expanded', 'true')
+    run.nudge()
+  }
+  sc.body.querySelector('[data-stp-row]').click()
+  await settle()
+  assert.deepEqual(run.opened, [S1])
+  assert.equal(header.getAttribute('aria-expanded'), 'false', 'top-row navigation must keep the project closed')
+  run.dispose()
+}
+console.log('✔ top-row navigation preserves closed projects on both sidebar flavors')
+
+// Removing the final pin must not expand the project behind the top region.
+{
+  const sc = foldScaffold()
+  const head = sc.makeGroup('wA', false)
+  const run = await runBundle(sc, { pinned: [S1], items: TWO_GROUPS })
+  run.live.pinned = []
+  run.nudge()
+  await settle()
+  assert.equal(head.getAttribute('aria-expanded'), 'false', 'unpin must preserve the collapsed project')
+  assert.equal(head.clicks, 0, 'unpin must not send an expansion click')
+  run.dispose()
+}
+
+// Codex reveals section, collection and project together on selection.
+{
+  const sc = codexScaffold()
+  const section = new El('section')
+  section.className = 'dcu-wb-section'
+  const sectionHead = new El('div')
+  sectionHead.className = 'dcu-wb-section-head'
+  const sectionLabel = new El('button')
+  sectionLabel.className = 'dcu-wb-section-label'
+  sectionLabel.setAttribute('aria-expanded', 'true')
+  const collections = new El('div')
+  collections.className = 'dcu-wb-collections'
+  const collection = new El('div')
+  collection.className = 'dcu-wb-collection'
+  const collectionHead = new El('div')
+  collectionHead.className = 'dcu-wb-collection-head'
+  const collectionLabel = new El('button')
+  collectionLabel.className = 'dcu-wb-collection-label'
+  collectionLabel.setAttribute('aria-expanded', 'true')
+  const title = new El('span')
+  title.className = 'dcu-wb-collection-title'
+  title.textContent = 'Local projects'
+  collectionLabel.appendChild(title)
+  for (const label of [sectionLabel, collectionLabel]) {
+    label.addEventListener('click', () => label.setAttribute('aria-expanded', label.getAttribute('aria-expanded') === 'true' ? 'false' : 'true'))
+  }
+  sectionHead.appendChild(sectionLabel)
+  section.appendChild(sectionHead)
+  section.appendChild(collections)
+  collections.appendChild(collection)
+  collectionHead.appendChild(collectionLabel)
+  collection.appendChild(collectionHead)
+  collection.appendChild(sc.project)
+  sc.tree.appendChild(section)
+  const run = await runBundle(sc, { pinned: [S1] })
+  for (const label of [sectionLabel, collectionLabel, sc.head]) {
+    assert.equal(label.getAttribute('aria-expanded'), 'false', 'every codex disclosure starts folded')
+  }
+  sectionLabel.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+  collectionLabel.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+  await settle()
+  assert.equal(sectionLabel.getAttribute('aria-expanded'), 'true', 'native button click is a manual expansion')
+  assert.equal(collectionLabel.getAttribute('aria-expanded'), 'true')
+  assert.equal(sc.head.getAttribute('aria-expanded'), 'false', 'opening an ancestor does not open its projects')
+  sectionLabel.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+  collectionLabel.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+  await settle()
+  for (const label of [sectionLabel, collectionLabel, sc.head]) label.setAttribute('aria-expanded', 'true')
+  await settle()
+  for (const label of [sectionLabel, collectionLabel, sc.head]) {
+    assert.equal(label.getAttribute('aria-expanded'), 'false', 'host reveal cannot override a manual collapse')
+  }
+  run.dispose()
+}
+
+// Keyboard disclosure belongs to the project header; its child actions are not toggles.
+{
+  const sc = codexScaffold()
+  sc.head.addEventListener('keydown', event => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      sc.head.setAttribute('aria-expanded', sc.head.getAttribute('aria-expanded') === 'true' ? 'false' : 'true')
+    }
+  })
+  const run = await runBundle(sc, { pinned: [S1] })
+  for (const key of ['Enter', ' ']) {
+    sc.head.dispatchEvent(new KeyboardEvent('keydown', { key }))
+    await settle()
+    assert.equal(sc.head.getAttribute('aria-expanded'), 'true', key + ': project keyboard activation grants manual expansion')
+    sc.head.dispatchEvent(new KeyboardEvent('keydown', { key }))
+    await settle()
+    sc.head.setAttribute('aria-expanded', 'true')
+    await settle()
+    assert.equal(sc.head.getAttribute('aria-expanded'), 'false', key + ': host reveal cannot undo a keyboard collapse')
+  }
+  for (const [tag, className] of [['button', 'dcu-wb-new'], ['span', 'dcu-wb-folder'], ['button', 'dcu-wb-more']]) {
+    const action = new El(tag)
+    action.className = className
+    action.addEventListener('click', () => sc.head.setAttribute('aria-expanded', 'true'))
+    sc.head.appendChild(action)
+    action.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await settle()
+    assert.equal(sc.head.getAttribute('aria-expanded'), 'false', className + ': a child action grants no disclosure permission')
+    action.remove()
+  }
+  run.dispose()
+  console.log('✔ project disclosure: Enter/Space preserve user choice; child actions cannot enable host reveals')
+}
+
+// Collection identity must survive count changes and renames on the same host root.
+// The real Ungrouped label has no collection-title class; its full text includes count.
+const disclosureFailures = []
+for (const kind of ['ungrouped-count', 'named-rename']) {
+  const sc = codexScaffold()
+  const collection = new El('div')
+  collection.className = kind === 'ungrouped-count' ? 'dcu-wb-ungrouped' : 'dcu-wb-collection'
+  const head = new El('div')
+  head.className = 'dcu-wb-collection-head'
+  const label = new El('button')
+  label.className = 'dcu-wb-collection-label'
+  label.setAttribute('aria-expanded', 'true')
+  const title = new El('span')
+  if (kind === 'named-rename') title.className = 'dcu-wb-collection-title'
+  title.textContent = kind === 'ungrouped-count' ? 'Ungrouped' : 'Local projects'
+  const count = new El('span')
+  count.className = 'dcu-wb-collection-count'
+  count.textContent = '1'
+  label.appendChild(title)
+  label.appendChild(count)
+  Object.defineProperty(label, 'textContent', { get: () => label.children.map(child => child.textContent).join('') })
+  let clicks = 0
+  label.addEventListener('click', () => {
+    clicks += 1
+    label.setAttribute('aria-expanded', label.getAttribute('aria-expanded') === 'true' ? 'false' : 'true')
+  })
+  head.appendChild(label)
+  collection.appendChild(head)
+  collection.appendChild(sc.project)
+  sc.tree.appendChild(collection)
+  const run = await runBundle(sc, { pinned: [S1] })
+  try {
+    assert.equal(label.getAttribute('aria-expanded'), 'false')
+    label.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await settle()
+    assert.equal(label.getAttribute('aria-expanded'), 'true')
+    const afterManual = clicks
+    if (kind === 'ungrouped-count') {
+      count.textContent = '2'
+      run.live.items = [...run.live.items, { workspaceId: 'w2', title: 'Another project', sessionIds: [] }]
+    } else title.textContent = 'Renamed projects'
+    run.nudge()
+    await settle()
+    assert.equal(label.getAttribute('aria-expanded'), 'true', kind + ': display changes must preserve manual expansion')
+    assert.equal(clicks, afterManual, kind + ': no corrective click after a display change')
+    if (kind === 'named-rename') {
+      const another = new El('div')
+      another.className = 'dcu-wb-collection'
+      const anotherLabel = new El('button')
+      anotherLabel.className = 'dcu-wb-collection-label'
+      anotherLabel.setAttribute('aria-expanded', 'false')
+      const reusedTitle = new El('span')
+      reusedTitle.className = 'dcu-wb-collection-title'
+      reusedTitle.textContent = 'Local projects'
+      anotherLabel.appendChild(reusedTitle)
+      another.appendChild(anotherLabel)
+      sc.tree.appendChild(another)
+      run.nudge()
+      await settle()
+      assert.equal(label.getAttribute('aria-expanded'), 'true', 'reusing a previous group name must preserve the renamed group')
+      assert.equal(clicks, afterManual, 'reused names must not trigger another fold')
+    }
+  } catch (error) {
+    disclosureFailures.push(kind + ': ' + error.message.split('\n')[0])
+  } finally { run.dispose() }
+}
+
+// A completed fold followed by a host reveal is a NEW request, even before debounce.
+for (const kind of ['same-batch', 'async-before-confirm']) {
+  const sc = foldScaffold()
+  sc.makeGroup('wA', false)
+  const run = await runBundle(sc, { pinned: [S1], items: TWO_GROUPS })
+  const header = sc.makeGroup('wB', true, 'late:30')
+  header.addEventListener('click', () => {
+    if (header.clicks !== 1) return
+    harnessSetTimeout(() => {
+      if (kind === 'same-batch') header.setAttribute('aria-expanded', 'false')
+      header.setAttribute('aria-expanded', 'true')
+      run.nudge()
+    }, kind === 'same-batch' ? 30 : 40)
+  })
+  try {
+    run.nudge()
+    await settle(350)
+    assert.equal(header.getAttribute('aria-expanded'), 'false', kind + ': a confirmed fold cannot hide the next host reveal')
+    assert.equal(header.clicks, 2, kind + ': exactly one close for each distinct expansion')
+  } catch (error) {
+    disclosureFailures.push(kind + ': ' + error.message.split('\n')[0])
+  } finally { run.dispose() }
+}
+assert.deepEqual(disclosureFailures, [], 'disclosure state regressions: ' + disclosureFailures.join(' | '))
+console.log('✔ disclosure history: count/rename preserves user choice; rapid host reveals get a fresh close')
+
 // --- S3: a group that is ALREADY closed costs nothing — on first sight, on
 // later notifications, and again after the plugin is torn down and re-applied
 // (the "service reload" shape).
@@ -2851,11 +3480,10 @@ function storeFoldScaffold() {
 // Two rules make it survivable, and both are about which question the pass is
 // asking:
 //
-//  1. UNTIL THE GROUP HAS BEEN READ CLOSED, THE TARGET IS "CLOSED" — whatever
-//     the pin set says. The pin rule ("no pin means expand") only takes over
-//     once that has happened. A state that flipped to "expand" the moment the
-//     default click was issued would wait for the fold to land and then
-//     immediately open the group again, one reconcile later.
+//  1. THE TARGET STAYS "CLOSED" UNTIL THE USER ACTIVATES THE HEADER — whatever
+//     the pin set says. A state that flipped to "expand" when the default click
+//     was issued would wait for the fold to land and immediately open it again.
+//     Removing the last pin grants no expansion permission either.
 //  2. AFTERWARDS, A GROUP THE USER OPENS IS BOOKED AS REACHED. Otherwise every
 //     idle pass, title change, reorder and unrelated pin is a reason to close
 //     the group again — the `GROUP_ZERO_PINS_INITIAL` defect, still fatal under
@@ -2888,7 +3516,7 @@ function storeFoldScaffold() {
   assert.equal(a.clicks + b.clicks, 2, 'a closed group is never clicked again')
 
   // The user opens one by hand. From here nothing may close it again.
-  a.setAttribute('aria-expanded', 'true')
+  a.dispatchEvent(new MouseEvent('click', { bubbles: true }))
   const clicksAfterOpen = a.clicks
   run.live.byId = { ...run.live.byId, [S2]: { id: S2, displayTitle: 'two (renamed)', updatedAt: 9 } }
   run.live.items = [
@@ -2902,8 +3530,8 @@ function storeFoldScaffold() {
   for (let i = 0; i < 3; i += 1) { run.nudge(); await settle() }
   assert.equal(a.clicks, clicksAfterOpen, 'no idle pass, title, reorder or foreign pin may re-close it')
   assert.equal(a.getAttribute('aria-expanded'), 'true', 'and it must stay exactly as the user left it')
-  // The group that DOES hold a pin still answers to it.
-  assert.equal(b.getAttribute('aria-expanded'), 'true', 'losing its last pin re-opens that group')
+  // Pin changes cannot expand a directory that was never opened by hand.
+  assert.equal(b.getAttribute('aria-expanded'), 'false', 'losing its last pin leaves that group folded')
   run.dispose()
   console.log("✔ R07/S3b: a directory is closed once on first sight, and the user's own opening survives every later change")
 }
@@ -2976,7 +3604,7 @@ console.log(`✔ R07/S3d: the first-sight fold is never followed by the pin rule
   assert.equal(a.clicks, 1, 'exactly one click')
 
   // The user opens it again by hand.
-  a.setAttribute('aria-expanded', 'true')
+  a.dispatchEvent(new MouseEvent('click', { bubbles: true }))
   const clicksBefore = a.clicks
 
   run.live.items = [
@@ -3213,18 +3841,8 @@ console.log('✔ R07/S5e: the host re-rendering its header does not re-issue a c
   console.log('✔ R07/S5f: a pending fold is inherited across a header replacement and a signature change')
 }
 
-// --- S5g UNPIN WHILE A FOLD IS STILL IN FLIGHT.
-//
-// The defect this pins down is not about time at all: it is that the "already
-// in the state we wanted" test ran BEFORE the in-flight check. Unpinning while
-// our own fold is still pending makes the wanted state equal the CURRENT
-// reading, so the plugin booked the group as done, dropped the intent, and
-// stopped watching — and the toggle that was already on its way then landed on
-// a group the plugin had written off, leaving it folded after its last pin is
-// gone. Measured before the fix, at a 400ms host: `final expanded=false`.
-//
-// The rule this encodes needs no acknowledgement and no timeout: an intent owns
-// the group until the reading MOVES from the value it was issued against.
+// --- S5g: unpinning while the default fold is pending cannot reopen it.
+// The same single intent survives pin churn and waits for its read-back.
 {
   const sc = storeFoldScaffold()
   sc.mount('wA', false)
@@ -3240,22 +3858,22 @@ console.log('✔ R07/S5e: the host re-rendering its header does not re-issue a c
   run.live.pinned = []
   run.nudge()
   await settle(120)
-  assert.equal(sc.clicks('wB'), 1, 'the opposite request waits instead of adding a click')
+  assert.equal(sc.clicks('wB'), 1, 'unpinning keeps the same pending fold')
 
   await settle(1200)
   assert.equal(
     sc.expanded('wB'),
-    true,
-    'the group must end EXPANDED: losing its last pin re-opens it',
+    false,
+    'the group must stay folded after its last pin is removed',
   )
   assert.equal(
     sc.transitions('wB'),
-    2,
-    'the spent fold and the unfold it made necessary, and nothing after that',
+    1,
+    'only the default fold lands; unpinning must not reopen it',
   )
-  assert.equal(sc.clicks('wB'), 2, 'exactly one click for each request')
+  assert.equal(sc.clicks('wB'), 1, 'exactly one fold click despite pin churn')
   run.dispose()
-  console.log('✔ R07/S5g: unpinning while a fold is in flight re-opens the group instead of writing it off')
+  console.log('✔ R07/S5g: unpinning during a delayed fold never reopens the group')
 }
 
 // --- S5c THE HOST'S OWN HANDLER THROWS. That is NOT an acknowledgement, and
@@ -3333,8 +3951,7 @@ console.log('✔ R07/S5e: the host re-rendering its header does not re-issue a c
   console.log('✔ R07/S5c(2): a click that cannot be delivered at all is retried once, then stops')
 }
 
-// --- Acceptance 4 + 5: a group already in the wanted state is not clicked, and
-// a real pin/unpin pair still folds and unfolds exactly once each.
+// --- Pinning and unpinning never change a manually selected disclosure state.
 {
   const sc = foldScaffold()
   const a = sc.makeGroup('wA', 'false')
@@ -3346,18 +3963,19 @@ console.log('✔ R07/S5e: the host re-rendering its header does not re-issue a c
   run.live.pinned = []
   run.nudge()
   await settle()
-  assert.equal(a.getAttribute('aria-expanded'), 'true', 'unpinning re-opens the group')
-  assert.equal(a.clicks, 1)
-  assert.equal(a.transitions, 1)
+  assert.equal(a.getAttribute('aria-expanded'), 'false', 'unpinning leaves the group folded')
+  assert.equal(a.clicks, 0)
+  assert.equal(a.transitions, 0)
+  a.dispatchEvent(new MouseEvent('click', { bubbles: true }))
 
   run.live.pinned = [S1]
   run.nudge()
   await settle()
-  assert.equal(a.getAttribute('aria-expanded'), 'false', 'pinning folds it again')
-  assert.equal(a.clicks, 2)
-  assert.equal(a.transitions, 2)
+  assert.equal(a.getAttribute('aria-expanded'), 'true', 'pinning preserves the user opening')
+  assert.equal(a.clicks, 1)
+  assert.equal(a.transitions, 1)
   run.dispose()
-  console.log('✔ R07: a real pin/unpin pair folds and unfolds once each, and never clicks a satisfied group')
+  console.log('✔ R07: pinning and unpinning preserve the user disclosure without extra clicks')
 }
 
 // =====================================================================
@@ -3687,7 +4305,7 @@ console.log('✔ directories: only an explicit \'1\' folds; absent, junk and \'0
   const toggle = dirsToggle(sc)
   assert.equal(sc.head.getAttribute('aria-expanded'), 'false', 'precondition: the directory was closed on first sight')
   // The user opens that one directory by hand, then folds the whole region.
-  sc.head.click()
+  sc.head.dispatchEvent(new MouseEvent('click', { bubbles: true }))
   assert.equal(sc.head.getAttribute('aria-expanded'), 'true', 'the user opened it')
   const clicksBefore = sc.head.onclickCount
   toggle.click()
@@ -4821,8 +5439,9 @@ const colorSurfaceOf = (row) => {
     child.getAttribute('data-stp-row-slot') !== null ? 'slot'
       : child.getAttribute('data-stp-row-title') !== null ? 'title'
         : child.getAttribute('data-stp-row-time') !== null ? 'time'
-          : child.getAttribute('data-stp-row-color') !== null ? 'color' : '?')
-  assert.deepEqual(order, ['slot', 'title', 'time', 'color'], 'exactly what a first render produces')
+          : child.hasAttribute('data-stp-absolute-button') ? 'absolute'
+            : child.getAttribute('data-stp-row-color') !== null ? 'color' : '?')
+  assert.deepEqual(order, ['slot', 'title', 'time', 'absolute', 'color'], 'exactly what a first render produces')
   assert.equal(rowsOf(region)[0], row, 'and the row is updated in place')
   assert.equal(swatchOf(row), swatch, 'the colour control is not rebuilt either')
   assert.equal(listenersOf([row]), 2, 'and no listener was added')
@@ -5693,9 +6312,9 @@ function makeRowMenuSlots() {
 const TYPOGRAPHY_ANCHOR = '[data-stp-typography]'
 
 const TYPO_VALUE_OK = {  'font-family': v => /^(inherit|var\(--stp-token-font,\s*inherit\)|[A-Za-z-]+(,\s*[A-Za-z-]+)*)$/.test(v),
-  'font-size': v => /^\d+(\.\d+)?px$/.test(v),
-  'font-weight': v => /^[1-9]00$/.test(v),
-  'line-height': v => /^\d+(\.\d+)?(px)?$/.test(v),
+  'font-size': v => /^(inherit|\d+(\.\d+)?px)$/.test(v),
+  'font-weight': v => /^(inherit|[1-9]00)$/.test(v),
+  'line-height': v => /^(inherit|\d+(\.\d+)?(px)?)$/.test(v),
 }
 
 /** The sheet with its comments removed, so a comment is never read as a rule. */
@@ -5932,10 +6551,14 @@ function importantOf(css, selector) {
       assert.ok(MUST_WIN.includes(prop), `${selector} declares !important on ${prop}, which is not a layout property that has to win`);
     }
   }
-  // And nowhere else in the sheet, apart from the two folding rules that have
-  // always needed it: hiding a host row and collapsing this plugin's own region
-  // are the operations that must beat the host's own stylesheet outright.
-  const ALWAYS_ALLOWED = ['[data-stp-region][hidden]', "[data-stp-region][data-stp-collapsed='true'] > [data-stp-row]"]
+  // Execution backgrounds must beat personal row colors; only that property
+  // may use the flag. Fold rules still need it to override host visibility.
+  const RUNTIME_RULES = ["[data-stp-runtime='running']", "[data-stp-runtime='children']"]
+  for (const selector of RUNTIME_RULES) {
+    assert.deepEqual([...new Set(importantOf(css, selector))], ['background'],
+      `${selector} must override only the execution background`)
+  }
+  const ALWAYS_ALLOWED = ['[data-stp-region][hidden]', "[data-stp-region][data-stp-collapsed='true'] > [data-stp-row]", ...RUNTIME_RULES]
   const flaggedElsewhere = rulesOf(css).filter(r => /!important/.test(r.body))
     .filter(r => !IMPORTANT_RULES.includes(r.selector)
       && !r.selector.startsWith('[data-stp-footer-balance]')

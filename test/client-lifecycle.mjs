@@ -488,6 +488,110 @@ async function testMountFailureRecovery() {
   assert.equal(probe.regions(), 0, 'disposing after recovery removes the region')
 }
 
+/** Late right-column services and their child fibers must follow real Cordis lifetimes. */
+async function testRightSidebarLifecycle() {
+  const scaffold = page()
+  installGlobals(scaffold)
+  const registration = await loadBundle()
+  const store = services()
+  const source = initial => {
+    let value = initial
+    const listeners = new Set()
+    return {
+      getSnapshot: () => value,
+      subscribe: fn => { listeners.add(fn); return () => listeners.delete(fn) },
+      set(next) { value = next; for (const fn of [...listeners]) fn() },
+      listeners,
+    }
+  }
+  const mounted = source(S1)
+  const inventory = source([])
+  const registry = source(true)
+  const calls = []
+  let active = { id: 'start', kind: 'guide' }
+  let expanded = false
+  const right = {
+    mounted, openTabs: inventory,
+    active: () => active,
+    isExpanded: () => expanded,
+    toggleExpanded() { expanded = !expanded },
+    openTab(kind, options) {
+      calls.push([mounted.getSnapshot(), kind, options])
+      active = { id: 'task', kind }
+      expanded = true
+    },
+  }
+  const root = new Context()
+  const fiber = root.extend({}).plugin(registration.factory())
+  try {
+    await fiber.await()
+    root.provide('workspaces', store.value.workspaces)
+    root.provide('sessions', store.value.sessions)
+    await settle()
+    assert.equal(fiber.state, 2, 'missing optional right-column services must not delay boot')
+    let disposeRight = root.provide('sidebarRight', right)
+    await settle()
+    let disposeTabs = root.provide('sidebarRightTabs', {
+      get: kind => kind === 'subagent' && registry.getSnapshot() ? { kind } : undefined,
+      subscribe: registry.subscribe,
+    })
+    await settle()
+    assert.deepEqual(calls, [[S1, 'subagent', { replaceTab: 'start' }]], 'late service publication applies the default without a list pulse')
+    assert.equal(mounted.listeners.size, 1)
+    assert.equal(inventory.listeners.size, 1)
+    assert.equal(registry.listeners.size, 1)
+    disposeRight()
+    await settle()
+    assert.equal(mounted.listeners.size, 0)
+    assert.equal(inventory.listeners.size, 0)
+    const beforeRevoke = calls.length
+    active = { id: 'start', kind: 'guide' }
+    expanded = false
+    mounted.set(S2)
+    await settle()
+    assert.equal(calls.length, beforeRevoke, 'a revoked service cannot act')
+    disposeRight = root.provide('sidebarRight', right)
+    await settle()
+    assert.deepEqual(calls.at(-1), [S2, 'subagent', { replaceTab: 'start' }])
+    assert.equal(mounted.listeners.size, 1, 're-providing must attach exactly one subscriber')
+    assert.equal(registry.listeners.size, 1)
+    active = { id: 'file', kind: 'editor' }
+    expanded = false
+    disposeTabs()
+    await settle()
+    registry.set(true)
+    const beforeProviderReturns = calls.length
+    disposeTabs = root.provide('sidebarRightTabs', {
+      get: kind => kind === 'subagent' ? { kind } : undefined,
+      subscribe: registry.subscribe,
+    })
+    await settle()
+    assert.equal(calls.length, beforeProviderReturns, 'same-session registry re-publication must preserve the user choice')
+    assert.equal(active.kind, 'editor')
+    assert.equal(expanded, false)
+    disposeRight()
+    await settle()
+    disposeRight = root.provide('sidebarRight', right)
+    await settle()
+    assert.equal(calls.length, beforeProviderReturns, 'same-session controller re-publication must preserve the user choice')
+    assert.equal(active.kind, 'editor')
+    assert.equal(expanded, false)
+    mounted.set(S1)
+    mounted.set(S2)
+    await settle()
+    assert.equal(calls.length, beforeProviderReturns + 1, 'a brief switch still starts a new entry')
+    mounted.set(S1)
+    fiber.dispose()
+    await settle()
+    assert.equal(calls.length, beforeProviderReturns + 1, 'dispose cancels the pending default')
+    assert.equal(mounted.listeners.size, 0)
+    assert.equal(inventory.listeners.size, 0)
+    assert.equal(registry.listeners.size, 0)
+  } finally {
+    fiber.dispose()
+  }
+}
+
 // ----------------------------------------------------------------------- R03-minor
 
 /**
@@ -863,6 +967,7 @@ async function testDuplicateApply() {
 const checks = [
   ['R02: revoke → revive → re-provide re-mounts, in real cordis', testServiceLifecycle],
   ['R02: a mount that throws is recoverable on the next activation', testMountFailureRecovery],
+  ['right sidebar: late services, revoke/re-provide, brief switch and disposal, in real cordis', testRightSidebarLifecycle],
   ['R03-minor: a takeover after a failed mount is clean, silent and complete', testTakeoverAfterFailedMount],
   // The name states the moment on purpose. The residue is reclaimed when a
   // NEW instance takes the document over — not at the moment of the failure,
