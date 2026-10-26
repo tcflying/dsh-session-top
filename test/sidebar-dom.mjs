@@ -1068,6 +1068,8 @@ async function runBundle(scaffold, {
   slots = undefined,
   // Optional right-column services; the shipped bundle must also work without them.
   rightSidebar = {},
+  activityFetch = undefined,
+  activityTransport = true,
 } = {}) {
   // The previous generation goes first, so its bundle can no longer arm
   // anything into the set this run is about to start counting.
@@ -1170,7 +1172,9 @@ async function runBundle(scaffold, {
     addEventListener: addWindowListener,
     removeEventListener: removeWindowListener,
     dispatchEvent: () => false,
+    fetch: activityFetch,
   }
+  globalThis.__DSH_TRANSPORT__ = activityFetch === undefined || !activityTransport ? undefined : { fetch: activityFetch }
   globalThis.localStorage = fakeStorage
   globalThis.MutationObserver = FakeMutationObserver
   globalThis.Element = El
@@ -1617,6 +1621,77 @@ const doubleClick = (run, target) => {
   assert.equal(sc.body.querySelector('[data-stp-session="' + S1 + '"]').hasAttribute('data-stp-runtime'), false, 'retained summaries do not establish execution')
   run.dispose()
   console.log('✔ runtime: batched recency, unavailable snapshots and retained fallback')
+}
+
+// Assistant/tool commits advance Host activity, while rc.3 updatedAt stays prompt-only.
+for (const makeScaffold of [officialScaffold, codexScaffold]) {
+  const sc = makeScaffold()
+  let payload = { enabled: true, activityBySession: { [S1]: 100, [S2]: 200 } }
+  let reject = false
+  let hang = false
+  const requests = []
+  const run = await runBundle(sc, {
+    pinned: [S1, S2], mutable: true,
+    activityTransport: makeScaffold === officialScaffold,
+    activityFetch: async (path, options) => {
+      requests.push({ path, signal: options.signal })
+      if (hang) return new Promise((resolve, reject) => options.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }))
+      if (reject) throw new Error('offline')
+      return { ok: true, json: async () => payload }
+    },
+  })
+  run.live.byId[S1] = { ...run.live.byId[S1], running: true, updatedAt: 10 }
+  run.live.byId[S2] = { ...run.live.byId[S2], running: true, updatedAt: 20 }
+  run.nudge()
+  await settle()
+  assert.deepEqual(idsInRegion(sc), [S2, S1])
+  payload = { ...payload, activityBySession: { [S1]: 300, [S2]: 200 } }
+  await settle(1200)
+  assert.deepEqual(idsInRegion(sc), [S1, S2], 'assistant/tool activity floats a continuously running root without a prompt timestamp change')
+  assert.equal(run.live.byId[S1].updatedAt, 10)
+  assert.equal(requests[0].path, 'api/dsh-session-top/status')
+  sc.body.querySelector('[data-stp-session="' + S1 + '"] [data-stp-absolute-button]').click()
+  await settle()
+  payload = { ...payload, activityBySession: { [S1]: 300, [S2]: 400 } }
+  await settle(1200)
+  assert.deepEqual(idsInRegion(sc), [S1, S2], 'Host activity never overtakes an absolute pin')
+  sc.body.querySelector('[data-stp-session="' + S1 + '"] [data-stp-absolute-button]').click()
+  await settle()
+  assert.deepEqual(idsInRegion(sc), [S2, S1])
+  payload = { ...payload, activityBySession: { [S1]: 250, [S2]: 400, bad: 'invalid' } }
+  await settle(1200)
+  assert.deepEqual(idsInRegion(sc), [S2, S1], 'stale or malformed activity cannot create a new rank')
+  reject = true
+  await settle(1200)
+  assert.deepEqual(idsInRegion(sc), [S2, S1], 'activity transport failure preserves working rows')
+  reject = false
+  payload = { enabled: true, ranked: [{ id: S1, rank: 500 }, { id: S2, rank: 400 }] }
+  await settle(1200)
+  assert.deepEqual(idsInRegion(sc), [S1, S2], 'polling recovers and reads the installed older Host payload')
+  run.live.byId[S2].updatedAt = 700
+  run.nudge()
+  await settle()
+  assert.deepEqual(idsInRegion(sc), [S2, S1])
+  payload = { enabled: true, activityBySession: { [S1]: 650, [S2]: 700 } }
+  await settle(1200)
+  assert.deepEqual(idsInRegion(sc), [S2, S1], 'a delayed Host clock cannot overtake a newer prompt already observed')
+  payload = { ...payload, activityBySession: { [S1]: 800, [S2]: 700 } }
+  await settle(1200)
+  assert.deepEqual(idsInRegion(sc), [S1, S2])
+  run.live.byId[S2].updatedAt = 750
+  run.nudge()
+  await settle()
+  assert.deepEqual(idsInRegion(sc), [S1, S2], 'a delayed summary cannot overtake a newer Host clock already observed')
+  hang = true
+  await settle(1200)
+  const pending = requests.length
+  await settle(1200)
+  assert.equal(requests.length, pending, 'only one activity request may be in flight')
+  run.dispose()
+  await settle(20)
+  assert.equal(run.liveTimers().length, 0, 'dispose cancels activity polling too')
+  assert.ok(requests.every(request => request.signal.aborted), 'dispose aborts its activity request scope')
+  console.log('✔ runtime: Host activity floats running roots independently of prompt timestamps')
 }
 
 // Absolute priority remains ahead of later activity, survives remount and syncs across windows.

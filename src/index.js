@@ -1188,6 +1188,8 @@ function applyImpl(ctx, config = {}) {
     })),
     registry: registryProjection(),
     ranked: rankedSessions(),
+    // Complete bounded root-event clock for temporary client ordering, not a durable reorder plan.
+    activityBySession: Object.fromEntries(lastActivity),
   })
 
   /**

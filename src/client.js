@@ -25,7 +25,7 @@
  *  1. Active float-up — the durable order itself is re-sorted by the host half
  *     through `insertSessionBefore`, so a session with new activity is above
  *     its inactive neighbours in BOTH the sidebar's "recent" and "manual"
- *     order modes. Here we only keep the flat pinned region in pin order.
+ *     order modes. The temporary region follows root activity, below absolute pins.
  *  2. Right-click to pin — the pin actions are published into the SHARED
  *     session context menu that `@baihejiangnan/dsh-session-context-menu`
  *     renders, so a right-clicked row offers Pin / Unpin next to the host's own
@@ -2678,6 +2678,50 @@ window.__ModuleLoader__.load({
       const observedActivity = new Map()
       const floatedActivity = new Map()
       let activitySequence = 0
+      let hostActivity = new Map()
+
+      // rc.3 summary.updatedAt only advances on user prompts; use the Host's
+      // existing filtered root-event clock for assistant/tool commits as well.
+      const watchActivity = () => {
+        const transport = globalThis.__DSH_TRANSPORT__
+        const fetchActivity = typeof transport?.fetch === 'function'
+          ? transport.fetch.bind(transport)
+          : typeof window.fetch === 'function' ? window.fetch.bind(window) : null
+        if (fetchActivity === null) return
+        let controller
+        disposers.push(() => controller?.abort())
+        const poll = async () => {
+          if (!alive()) return
+          let deadline
+          try {
+            if (connectionUnavailable()) return
+            controller = new AbortController()
+            deadline = ownTimer(setTimeout(() => controller.abort(), 10000))
+            const response = await fetchActivity('api/dsh-session-top/status', { signal: controller.signal, cache: 'no-store' })
+            if (!response.ok) return
+            const status = await response.json()
+            if (!alive()) return
+            // Older Host installations only expose the diagnostic top 25.
+            const entries = status.enabled === true
+              ? status.activityBySession != null
+                ? Object.entries(status.activityBySession)
+                : (status.ranked ?? []).map(row => [row.id, row.rank])
+              : []
+            const next = new Map(entries.filter(([id, time]) => typeof id === 'string' && Number.isFinite(time)))
+            const changed = next.size !== hostActivity.size || [...next].some(([id, time]) => hostActivity.get(id) !== time)
+            hostActivity = next
+            if (changed) scheduleReconcile()
+          } catch { /* offline/older Hosts retain the last usable clock and summary fallback */ }
+          finally {
+            releaseTimer(deadline)
+            controller?.abort()
+            if (alive()) {
+              const timer = ownTimer(setTimeout(() => { mountTimers.delete(timer); void poll() }, 1000))
+            }
+          }
+        }
+        void poll()
+      }
 
       // Capture one coherent Host snapshot for colors, counts and list ordering.
       const refreshRuntime = () => {
@@ -2694,7 +2738,8 @@ window.__ModuleLoader__.load({
           const summary = byId[id]
           const previous = observedActivity.get(id)
           const active = execution.running || execution.runningChildren > 0
-          const timestamp = Number.isFinite(summary?.updatedAt) ? summary.updatedAt : 0
+          const timestamp = Math.max(previous?.time ?? 0, hostActivity.get(id) ?? 0,
+            Number.isFinite(summary?.updatedAt) ? summary.updatedAt : 0)
           // A legacy summary without running cannot establish a new activity fact.
           if (typeof summary?.running === 'boolean' && (
             (active && (previous === undefined || !previous.active || timestamp > previous.time))
@@ -2720,8 +2765,8 @@ window.__ModuleLoader__.load({
         rest.sort((a, b) => {
           const left = floatedActivity.get(a)
           const right = floatedActivity.get(b)
-          return (right?.sequence ?? 0) - (left?.sequence ?? 0)
-            || (right?.time ?? 0) - (left?.time ?? 0)
+          return (right?.time ?? 0) - (left?.time ?? 0)
+            || (right?.sequence ?? 0) - (left?.sequence ?? 0)
         })
         visibleSessions = [...fixed, ...rest]
       }
@@ -6459,6 +6504,7 @@ window.__ModuleLoader__.load({
         // the per-reconcile identity check both go through — NOT captured here,
         // because a service object captured here is the one that goes stale.
         attachSessionsTo(sessionsService())
+        watchActivity()
         disposers.push(releaseRightSidebar)
         // These children wake when a service arrives late and release their
         // subscriptions on revocation. Neither service gates plugin activation.

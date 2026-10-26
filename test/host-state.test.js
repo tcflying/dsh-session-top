@@ -416,6 +416,23 @@ function logTree(dir) {
     })
 }
 
+test('status exposes the complete bounded root activity clock beyond the diagnostic top 25', async (t) => {
+  const h = harness({ workspaces: [], webServer: true })
+  await applyPlugin({ ctx: h.ctx, config: { maxTrackedSessions: 30 } })
+  t.after(() => h.dispose())
+  for (let n = 0; n < 31; n += 1) h.emit(session('root' + n), activity(1000 + n))
+  h.emit({ id: 'child', header: { origin: 'subagent' } }, activity(9999))
+  h.emit(session('root1'), activity(1))
+  await settle()
+  const status = await h.status()
+  assert.equal(status.ranked.length, 25)
+  assert.equal(Object.keys(status.activityBySession).length, 30)
+  assert.equal(status.activityBySession.root1, 1001)
+  assert.equal(status.activityBySession.root30, 1030)
+  assert.equal(Object.hasOwn(status.activityBySession, 'root0'), false)
+  assert.equal(Object.hasOwn(status.activityBySession, 'child'), false)
+})
+
 // --------------------------------------------------------------------- R01
 
 test('R01: activity in one workspace never re-writes another workspace', async (t) => {
