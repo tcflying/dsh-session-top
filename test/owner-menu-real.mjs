@@ -635,6 +635,13 @@ async function run({ pinned = [S1], withOwner = true, order = 'owner-first', tit
     if (!globalThis.globalListeners.has(type)) globalThis.globalListeners.set(type, [])
     globalThis.globalListeners.get(type).push(fn)
   }
+  globalThis.removeEventListener = (type, fn) => {
+    const list = globalThis.globalListeners.get(type) ?? []
+    const index = list.indexOf(fn)
+    if (index >= 0) list.splice(index, 1)
+  }
+  globalThis.window.addEventListener = globalThis.addEventListener
+  globalThis.window.removeEventListener = globalThis.removeEventListener
   globalThis.dispatchEvent = (event) => {
     if (event.type === 'dsh:session-context-menu') ownerEvents.push(event.detail)
     for (const fn of [...(globalThis.globalListeners.get(event.type) ?? [])]) fn(event)
@@ -872,29 +879,26 @@ function menuItem(document, label) {
 // --- SAME-NAME sessions. `titleFrom` reads the row's own text and
 //     `resolveSession` refuses an ambiguous match, so the owner legitimately
 //     answers with NO session and drops the session-scoped items. The plugin
-//     must neither fabricate one nor pick the wrong same-named session, and a
-//     pinned row must behave exactly like the host row it stands in for.
+//     must not fabricate or guess a session; its own pinned row can still use
+//     the exact id for Unpin while ordinary host rows remain unresolved.
 {
   const t = await run({ pinned: [S1], titles: { [S1]: 'Explore', [S2]: 'Explore' } })
   const ownRow = t.document.body.querySelector('[data-stp-row]')
   await rightClick(t.docListeners, ownRow.querySelector('[data-stp-row-title]'))
-  assert.equal(t.document.body.querySelector('[data-stp-menu]'), null, 'still the owner, not a plugin menu')
-  const labels = menuLabels(t.document)
-  assert.deepEqual(
-    labels,
-    unresolvedMenu(),
-    'with an ambiguous title the owner drops the session-scoped items; the plugin adds none of its own',
-  )
-  assert.ok(!labels.includes('取消置顶'), 'an unresolved session must not offer an Unpin that could hit the wrong one')
-  assert.equal(t.ownerEvents[0].session, null, 'and the owner itself reports no session')
+  const ownMenu = t.document.body.querySelector('[data-stp-menu]')
+  assert.ok(ownMenu !== null, 'a pinned row with a known id must still offer Unpin when the owner cannot resolve its title')
+  assert.equal(menuLabels(t.document), null, 'the unresolved owner menu must close before the fallback opens')
+  assert.equal(t.ownerEvents[0].session, null, 'the owner still reports no session; none is fabricated')
+  const unpin = ownMenu.querySelector('[data-stp-pin-item]')
+  assert.match(unpin.textContent, /取消置顶/)
+  unpin.click()
+  await new Promise(r => { setTimeout(r, 20) })
+  assert.deepEqual(t.pinCalls, [['unpin', S1]], 'Unpin uses the pinned row id, never another same-named session')
 
-  // Parity: the ordinary host row with the same ambiguity loses the same items.
+  // An ordinary host row still belongs to the owner and remains unresolved.
   await rightClick(t.docListeners, t.rows[S1].title, 130, 250)
-  assert.deepEqual(
-    menuLabels(t.document), labels,
-    'a pinned row and the host row it stands in for must offer the SAME menu, ambiguity included',
-  )
-  console.log('✔ same-named sessions: no fabricated session, and exact parity with the host row')
+  assert.deepEqual(menuLabels(t.document), unresolvedMenu())
+  console.log('✔ same-named pinned row: exact-id Unpin fallback; ordinary host row unchanged')
   t.dispose(); t.disposeOwner()
 }
 

@@ -6424,22 +6424,38 @@ window.__ModuleLoader__.load({
         const hostRow = hostRowFor(flavor, id)
         if (hostRow !== null) {
           publishSharedMenu()
-          const forwarded = redispatchContextMenu(hostRow, x, y)
+          // The owner resolves by title and can lose or misidentify same-named
+          // sessions. Our row already has an exact id; keep Unpin scoped to it.
+          let ownerMismatch = false
+          const inspectContext = (event) => {
+            if (event.detail?.row === hostRow) ownerMismatch = event.detail.session?.id !== id
+          }
+          window.addEventListener('dsh:session-context-menu', inspectContext)
+          let forwarded
+          try {
+            forwarded = redispatchContextMenu(hostRow, x, y)
+          } finally {
+            window.removeEventListener('dsh:session-context-menu', inspectContext)
+          }
           if (forwarded !== null) {
-            // codex only. The stock sidebar's own "…" menu is served by our
+            // Only the unclaimed-gesture fallback below is codex-only. The stock
+            // sidebar's own "…" menu is served by our
             // ordinary handler, which sees this same re-delivered event and
             // decides about it one microtask later; giving it a second path to
             // open a menu would put two of them on one gesture. What codex
             // leaves open is whether its OWN session-row handler claimed the
             // gesture — lib/client.js:4617, a synchronous `preventDefault` —
             // and the whole dispatch has finished by the time this reads that.
-            if (flavor.nativeContextMenu === true) {
-              afterDispatch(() => {
-                if (!alive()) return
-                if (forwarded.defaultPrevented === true) return
+            afterDispatch(() => {
+              if (!alive()) return
+              if (ownerMismatch) {
+                document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
                 openMenu(id, x, y)
-              })
-            }
+                return
+              }
+              if (flavor.nativeContextMenu !== true || forwarded.defaultPrevented === true) return
+              openMenu(id, x, y)
+            })
             return
           }
         }

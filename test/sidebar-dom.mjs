@@ -1666,7 +1666,7 @@ for (const makeScaffold of [officialScaffold, codexScaffold]) {
   assert.deepEqual(idsInRegion(sc), [S2, S1], 'activity transport failure preserves working rows')
   reject = false
   payload = { enabled: true, ranked: [{ id: S1, rank: 500 }, { id: S2, rank: 400 }] }
-  await settle(1200)
+  await waitUntil(() => idsInRegion(sc).join() === [S1, S2].join(), 'Host activity recovery', 3000)
   assert.deepEqual(idsInRegion(sc), [S1, S2], 'polling recovers and reads the installed older Host payload')
   run.live.byId[S2].updatedAt = 700
   run.nudge()
