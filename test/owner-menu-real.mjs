@@ -135,6 +135,11 @@ const OWNER_CONTRACTS = {
   },
 }
 
+// The desktop installation is byte-identical to main@ab40cced after CRLF -> LF.
+// Pin its raw hash explicitly so the installed source still runs unchanged.
+OWNER_CONTRACTS['b54beb84ce4e91a41e64c650c9d04aebfc4fc10f138c1bd7f625e4626a8740ec'] =
+  OWNER_CONTRACTS['9ccc3ab8dbefb1d8e100b232c7e612315d81aa084ddced55e789ec48cc6243b9']
+
 /** The owner's file, hashed, and the contract that hash is pinned to. */
 const ownerSource = readFileSync(ownerClientPath, 'utf8')
 const ownerSha256 = createHash('sha256').update(ownerSource, 'utf8').digest('hex')
