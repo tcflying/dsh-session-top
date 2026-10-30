@@ -11,7 +11,7 @@
  *                                            a descendant `button[aria-label]`
  *                                            naming "会话操作"/"session action"
  *   titleFrom       lib/client.js:194-197
- *   resolveSession  lib/client.js:199-214  unique title match over state.ids
+ *   resolveSession  lib/client.js:199-214  exact row ID patch; legacy unique title fallback
  *   menu build      OWNER_CONTRACTS below  rename/archive[/delete]/explorer/
  *                                            copycwd/copyid/fork + extensions
  *                                            + refresh
@@ -37,6 +37,9 @@
  * the owner happened to render is a test that cannot fail, so neither is done.
  * An artifact that is neither pin FAILS, rather than being accommodated.
  *
+ * Default runs the version-guarded exact-ID patch in memory (disk stays untouched).
+ * Set DSH_CTX_MENU_PATCH=0 to exercise the original artifact and its fallback.
+ *
  * Run: node test/owner-menu-real.mjs
  *      DSH_CTX_MENU_CLIENT=<path to a pinned owner's lib/client.js> node test/owner-menu-real.mjs
  */
@@ -47,6 +50,7 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { patchContextMenuSource } from '../scripts/patch-context-menu.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const repoRoot = resolve(here, '..')
@@ -54,7 +58,11 @@ const PKG = '@baihejiangnan/dsh-session-context-menu'
 
 const S1 = 'session-aaaaaaaa-1111-4111-8111-111111111111'
 const S2 = 'session-bbbbbbbb-2222-4222-8222-222222222222'
+const PIN_ID = 'dsh-session-top.pin'
 const UNPIN_ID = 'dsh-session-top.unpin'
+const SUPER_ID = 'dsh-session-top.super-pin'
+const UNSUPER_ID = 'dsh-session-top.unsuper-pin'
+const ABSOLUTE_STORAGE_KEY = 'dsh-session-top:absolute-pins'
 const KEY = Symbol.for('dsh.session-context-menu.extensions')
 const LEASE = Symbol.for('dsh.session-context-menu.lease')
 
@@ -135,15 +143,29 @@ const OWNER_CONTRACTS = {
   },
 }
 
+OWNER_CONTRACTS['3ad94eecaca6a1590e7356468ef7898db6d94b581a47314c5a0a928ddf44f813'] = {
+  ...OWNER_CONTRACTS['9ccc3ab8dbefb1d8e100b232c7e612315d81aa084ddced55e789ec48cc6243b9'],
+  revision: 'main@ab40cced + exact session IDs and owner liveness', exactIds: true,
+}
+OWNER_CONTRACTS['12a253eab46778a6e1388b37ed98deff97e050ad8245abfe15a0f66ac3dec280'] =
+  OWNER_CONTRACTS['3ad94eecaca6a1590e7356468ef7898db6d94b581a47314c5a0a928ddf44f813']
+
 // The desktop installation is byte-identical to main@ab40cced after CRLF -> LF.
 // Pin its raw hash explicitly so the installed source still runs unchanged.
 OWNER_CONTRACTS['b54beb84ce4e91a41e64c650c9d04aebfc4fc10f138c1bd7f625e4626a8740ec'] =
   OWNER_CONTRACTS['9ccc3ab8dbefb1d8e100b232c7e612315d81aa084ddced55e789ec48cc6243b9']
 
 /** The owner's file, hashed, and the contract that hash is pinned to. */
-const ownerSource = readFileSync(ownerClientPath, 'utf8')
+const ownerOriginal = readFileSync(ownerClientPath, 'utf8')
+const ownerSource = process.env.DSH_CTX_MENU_PATCH === '0' ? ownerOriginal : patchContextMenuSource(ownerOriginal)
+assert.equal(patchContextMenuSource(patchContextMenuSource(ownerOriginal)), patchContextMenuSource(ownerOriginal))
+assert.throws(() => patchContextMenuSource(ownerOriginal + '\n// unknown revision'), /Unsupported context-menu client SHA-256/)
 const ownerSha256 = createHash('sha256').update(ownerSource, 'utf8').digest('hex')
-const ownerContract = OWNER_CONTRACTS[ownerSha256]
+const originalSha256 = createHash('sha256').update(ownerOriginal.replace(/\r\n/g, '\n')).digest('hex')
+const baseContract = OWNER_CONTRACTS[originalSha256] ?? OWNER_CONTRACTS[ownerSha256]
+const ownerContract = baseContract && {
+  ...baseContract, exactIds: baseContract.exactIds || ownerSource !== ownerOriginal,
+}
 if (ownerContract === undefined) {
   throw new Error(
     `the owner at ${ownerClientPath} is not a revision this file has a menu contract for.\n`
@@ -160,14 +182,14 @@ if (ownerContract === undefined) {
 /**
  * The owner's full menu for a resolved session, plus this plugin's entries.
  *
- * TWO of them now, in the order they are registered: the pin/unpin toggle
- * (order 50/51) and the row-colour item (order 52). The owner's own items and
+ * Ordinary pin/unpin, super pin/cancel and row colour register in orders 50–54.
+ * Visibility follows the ordinary and super pin states. The owner's own items and
  * its 刷新 tail are untouched, which is the whole point of registering into its
  * table rather than replacing the menu.
  */
-const ownRowMenu = (pinLabel) => [...ownerContract.sessionMenu, pinLabel, COLOR_LABEL, ...ownerContract.tail]
+const ownRowMenu = (...pinLabels) => [...ownerContract.sessionMenu, ...pinLabels, COLOR_LABEL, ...ownerContract.tail]
 /** The same, on an ordinary host row. */
-const hostRowMenu = (pinLabel) => [...ownerContract.sessionMenu, pinLabel, COLOR_LABEL, ...ownerContract.tail]
+const hostRowMenu = (...pinLabels) => [...ownerContract.sessionMenu, ...pinLabels, COLOR_LABEL, ...ownerContract.tail]
 /** The owner's menu when the title is ambiguous and no session can be attributed. */
 const unresolvedMenu = () => [...ownerContract.unresolvedMenu, ...ownerContract.tail]
 
@@ -559,13 +581,21 @@ function openHostMenu(document, id, title) {
 
 // ------------------------------------------------------- run plugin + owner
 
-async function run({ pinned = [S1], withOwner = true, order = 'owner-first', titles = null, native = false } = {}) {
+async function run({ pinned = [S1], withOwner = true, order = 'owner-first', titles = null, native = false, current = undefined } = {}) {
   delete globalThis[KEY]
   const host = buildHost({ native })
   ACTIVE_DOCUMENT = host
   const pinCalls = []
   const opened = []
   const ownerEvents = []
+  const workspaceListeners = new Set()
+  const storage = new Map([[ABSOLUTE_STORAGE_KEY, '[]']])
+  const storageWrites = []
+  define('localStorage', {
+    getItem: key => storage.get(key) ?? null,
+    setItem: (key, value) => { storageWrites.push([key, String(value)]); storage.set(key, String(value)) },
+    removeItem: key => storage.delete(key),
+  })
   globalThis.__hostMenuInvoked = []
 
   // `titles` rewrites the titles the HOST rows render, which is how the
@@ -592,15 +622,23 @@ async function run({ pinned = [S1], withOwner = true, order = 'owner-first', tit
           archivedSessionIds: [],
           phase: 'ready',
         }),
-        subscribe: () => () => {},
+        subscribe: fn => { workspaceListeners.add(fn); return () => workspaceListeners.delete(fn) },
       },
-      pinSession: async (id) => { pinCalls.push(['pin', id]) },
-      unpinSession: async (id) => { pinCalls.push(['unpin', id]) },
+      pinSession: async (id) => {
+        pinCalls.push(['pin', id])
+        pinned = [...new Set([...pinned, id])]
+        for (const fn of workspaceListeners) fn()
+      },
+      unpinSession: async (id) => {
+        pinCalls.push(['unpin', id])
+        pinned = pinned.filter(one => one !== id)
+        for (const fn of workspaceListeners) fn()
+      },
       archiveSession: async (id) => { pinCalls.push(['archive', id]) },
     },
     sessions: {
       list: {
-        getSnapshot: () => ({ ids: [S1, S2], byId: summaries, phase: 'ready', projectionsBySession: {} }),
+        getSnapshot: () => ({ ids: [S1, S2], byId: summaries, current, phase: 'ready', projectionsBySession: {} }),
         subscribe: () => () => {},
       },
       fork: async ({ sessionId }) => { pinCalls.push(['fork', sessionId]); return `${sessionId}-child` },
@@ -705,6 +743,9 @@ async function run({ pinned = [S1], withOwner = true, order = 'owner-first', tit
     ...host,
     ownerEvents,
     pinCalls,
+    storage,
+    storageWrites,
+    pinnedSessionIds: () => [...pinned],
     opened,
     ownerEntries: () => {
       const api = globalThis[KEY]
@@ -772,7 +813,7 @@ function menuItem(document, label) {
   assert.ok(labels !== null, 'the REAL owner must have built .dshcm-menu for the pinned row')
   assert.deepEqual(
     labels,
-    ownRowMenu('取消置顶'),
+    ownRowMenu('取消置顶', '超级置顶'),
     `a pinned row must offer this owner revision's full menu plus Unpin; got ${JSON.stringify(labels)}`,
   )
   console.log('✔ own pinned row: the REAL owner builds its full menu on it')
@@ -826,17 +867,97 @@ function menuItem(document, label) {
   t2.dispose(); t2.disposeOwner()
 }
 
+// --- A real-owner gesture walks unpinned → super → ordinary → unpinned.
+{
+  const t = await run({ pinned: [] })
+  const entries = t.ownerEntries()
+  assert.deepEqual(entries.map(entry => entry.id), [PIN_ID, UNPIN_ID, SUPER_ID, UNSUPER_ID, COLOR_ID])
+  await rightClick(t.docListeners, t.rows[S1].title)
+  assert.deepEqual(menuLabels(t.document), hostRowMenu('普通置顶', '超级置顶'))
+  menuItem(t.document, '超级置顶').click()
+  await new Promise(r => { setTimeout(r, 80) })
+  assert.deepEqual(t.pinCalls, [['pin', S1]], 'super pin creates official membership once')
+  assert.deepEqual(t.pinnedSessionIds(), [S1])
+  assert.deepEqual(JSON.parse(t.storage.get(ABSOLUTE_STORAGE_KEY)), [S1], 'super pin adds local priority')
+  const superRow = t.document.body.querySelector('[data-stp-row]')
+  assert.equal(superRow?.closest('[data-stp-tier="absolute"]')?.getAttribute('data-stp-tier'), 'absolute')
+
+  await rightClick(t.docListeners, superRow.querySelector('[data-stp-row-title]'))
+  assert.deepEqual(menuLabels(t.document), ownRowMenu('取消超级置顶（保留普通置顶）'))
+  menuItem(t.document, '取消超级置顶（保留普通置顶）').click()
+  await new Promise(r => { setTimeout(r, 80) })
+  assert.deepEqual(t.pinCalls, [['pin', S1]], 'cancelling super pin never unpins the official session')
+  assert.deepEqual(t.pinnedSessionIds(), [S1], 'ordinary membership survives demotion')
+  assert.deepEqual(JSON.parse(t.storage.get(ABSOLUTE_STORAGE_KEY)), [], 'demotion removes local priority')
+  const ordinaryRow = t.document.body.querySelector('[data-stp-row]')
+  assert.ok(ordinaryRow !== null, 'the ordinary pinned row remains')
+  assert.equal(ordinaryRow.closest('[data-stp-tier="absolute"]'), null)
+
+  await rightClick(t.docListeners, ordinaryRow.querySelector('[data-stp-row-title]'))
+  assert.deepEqual(menuLabels(t.document), ownRowMenu('取消置顶', '超级置顶'))
+  menuItem(t.document, '取消置顶').click()
+  await new Promise(r => { setTimeout(r, 80) })
+  assert.deepEqual(t.pinCalls, [['pin', S1], ['unpin', S1]])
+  assert.deepEqual(t.pinnedSessionIds(), [])
+  assert.equal(t.document.body.querySelector('[data-stp-row]'), null, 'ordinary unpin removes the idle pinned row')
+  await rightClick(t.docListeners, t.rows[S1].title)
+  assert.deepEqual(menuLabels(t.document), hostRowMenu('普通置顶', '超级置顶'))
+  assert.ok(t.ownerEvents.every(detail => detail.session?.id === S1 && detail.row === t.rows[S1].row))
+
+  t.dispose()
+  assert.deepEqual(t.ownerEntries(), [], 'dispose unregisters every entry')
+  const calls = [...t.pinCalls]
+  const storage = [...t.storage]
+  const writes = [...t.storageWrites]
+  const dom = t.document.body.descendants()
+  let closed = 0
+  for (const entry of entries) await entry.run({ session: { id: S1 }, close: () => { closed += 1 } })
+  await new Promise(r => { setTimeout(r, 80) })
+  assert.deepEqual(t.pinCalls, calls, 'retained runners cannot write official state after dispose')
+  assert.deepEqual([...t.storage], storage, 'retained runners cannot change local priority after dispose')
+  assert.deepEqual(t.storageWrites, writes, 'retained runners cannot write storage, including writes that cancel each other')
+  assert.deepEqual(t.document.body.descendants(), dom, 'retained runners cannot rebuild menus or dialogs after dispose')
+  assert.equal(closed, 0, 'retained runners cannot close a live owner menu after dispose')
+  t.disposeOwner()
+  console.log('✔ real owner: super pin → cancel to ordinary → unpin, with full host menus and inert stale runners')
+}
+
+// --- An unloaded real owner leaves entries behind but must release both tier menus.
+if (ownerSource.includes('active: () => leases > 0')) {
+  for (const order of ['owner-first', 'plugin-first']) {
+    const t = await run({ order, pinned: [S1] })
+    const api = globalThis[KEY]
+    assert.equal(api.active(), true)
+    t.disposeOwner()
+    assert.equal(api.active(), false, 'dispose drops the real owner lease')
+    assert.equal(api.list().length, 5, 'extension entries survive owner disposal')
+    for (const target of [t.rows[S2].title, t.document.body.querySelector('[data-stp-row-title]')]) {
+      await rightClick(t.docListeners, target)
+      const menu = t.document.body.querySelector('[data-stp-menu]')
+      assert.ok(menu !== null, 'host and pinned rows retain their tier menu after owner unload')
+      assert.ok(menu.querySelector('[data-stp-pin-item]'))
+      assert.ok(menu.querySelector('[data-stp-absolute-item]'))
+      assert.equal(t.document.body.querySelector('.dshcm-menu'), null)
+    }
+    assert.deepEqual(t.pinCalls, [], 'opening menus never changes official pins')
+    assert.deepEqual(t.storageWrites, [], 'opening menus never changes local priorities')
+    t.dispose()
+    assert.equal(globalThis[KEY], undefined, 'last entry release removes the unleased table')
+  }
+  console.log('✔ real owner unload: host and pinned rows keep tier menus in either load order')
+}
+
 // --- The REAL host row keeps working exactly as before (no regression).
 {
   const t = await run({ pinned: [S1] })
   await rightClick(t.docListeners, t.rows[S2].title)
   assert.deepEqual(
     menuLabels(t.document),
-    hostRowMenu('置顶该会话'),
-    'an ordinary, unpinned host row still offers Pin in the full owner menu',
+    hostRowMenu('普通置顶', '超级置顶'),
+    'an unpinned host row offers ordinary and super pin in the full owner menu',
   )
   assert.equal(t.ownerEvents[0].row, t.rows[S2].row)
-  console.log('✔ ordinary host row: unchanged — the full owner menu plus Pin')
+  console.log('✔ unpinned host row: the full owner menu plus ordinary and super pin')
   t.dispose(); t.disposeOwner()
 }
 
@@ -846,8 +967,8 @@ function menuItem(document, label) {
 {
   const t = await run({ pinned: [S1], order: 'plugin-first' })
   assert.deepEqual(
-    t.ownerEntries().map(entry => entry.id).sort(),
-    ['dsh-session-top.pin', UNPIN_ID, COLOR_ID].sort(),
+    t.ownerEntries().map(entry => entry.id),
+    [PIN_ID, UNPIN_ID, SUPER_ID, UNSUPER_ID, COLOR_ID],
     'the bounded retry must publish every entry into a table the owner created late',
   )
   const ownRow = t.document.body.querySelector('[data-stp-row]')
@@ -855,7 +976,7 @@ function menuItem(document, label) {
   assert.equal(t.document.body.querySelector('[data-stp-menu]'), null, 'no plugin menu either way round')
   assert.deepEqual(
     menuLabels(t.document),
-    ownRowMenu('取消置顶'),
+    ownRowMenu('取消置顶', '超级置顶'),
     'plugin-first must reach exactly the same owner menu',
   )
   assert.equal(t.ownerEvents.length, 1, 'exactly one menu per gesture — the re-delivery must not recurse')
@@ -873,7 +994,7 @@ function menuItem(document, label) {
   await rightClick(t.docListeners, ownRow.querySelector('[data-stp-row-title]'))
   assert.deepEqual(
     menuLabels(t.document),
-    ownRowMenu('取消置顶'),
+    ownRowMenu('取消置顶', '超级置顶'),
   )
   assert.equal(t.ownerEvents[0].row, t.rows[S2].row)
   assert.equal(t.ownerEvents[0].session?.id, S2, 'the CURRENT pinned session, not the other one')
@@ -881,12 +1002,60 @@ function menuItem(document, label) {
   t.dispose(); t.disposeOwner()
 }
 
+// --- Patched owner: exact row IDs keep full menus for duplicate/missing titles.
+if (ownerContract.exactIds) {
+  const t = await run({ pinned: [S1], titles: { [S1]: 'Explore', [S2]: 'Explore' }, current: S2 })
+  const ownRow = t.document.body.querySelector('[data-stp-row]')
+  await rightClick(t.docListeners, ownRow.querySelector('[data-stp-row-title]'))
+  assert.deepEqual(menuLabels(t.document), ownRowMenu('取消置顶', '超级置顶'))
+  assert.equal(t.ownerEvents.at(-1).session?.id, S1)
+  assert.equal(t.document.body.querySelector('[data-stp-menu]'), null)
+
+  await rightClick(t.docListeners, t.rows[S2].title)
+  assert.deepEqual(menuLabels(t.document), hostRowMenu('普通置顶', '超级置顶'))
+  assert.equal(t.ownerEvents.at(-1).session?.id, S2)
+  menuItem(t.document, '普通置顶').click()
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.deepEqual(t.pinCalls, [['pin', S2]], 'same-name pin writes the row ID')
+
+  // Selected/current and visible title disagree: the explicit ID wins.
+  t.rows[S2].row.setAttribute('data-dcu-session', S1)
+  t.rows[S2].title.textContent = ''
+  await rightClick(t.docListeners, t.rows[S2].title)
+  assert.equal(t.ownerEvents.at(-1).session?.id, S1)
+  assert.deepEqual(menuLabels(t.document), hostRowMenu('取消置顶', '超级置顶'))
+
+  // The stock sidebar's stable key has the same exact-ID semantics.
+  t.rows[S1].row.removeAttribute('data-dcu-session')
+  t.rows[S1].row.setAttribute('data-row-key', 'session:' + S1)
+  await rightClick(t.docListeners, t.rows[S1].title)
+  assert.equal(t.ownerEvents.at(-1).session?.id, S1)
+  assert.deepEqual(menuLabels(t.document), hostRowMenu('取消置顶', '超级置顶'))
+
+  // An explicit unknown/empty/prototype ID must never fall back to current/title.
+  for (const id of ['session-missing', '', '__proto__', 'constructor']) {
+    t.rows[S2].row.setAttribute('data-dcu-session', id)
+    await rightClick(t.docListeners, t.rows[S2].title)
+    assert.equal(t.ownerEvents.at(-1).session, null, 'invalid explicit ID: ' + id)
+    assert.deepEqual(menuLabels(t.document), unresolvedMenu())
+  }
+  t.dispose(); t.disposeOwner()
+  console.log('✔ exact IDs: full same-name menus, stock key, selected/title mismatch, invalid IDs fail closed')
+
+  const legacy = await run({ pinned: [] })
+  legacy.rows[S1].row.removeAttribute('data-dcu-session')
+  await rightClick(legacy.docListeners, legacy.rows[S1].title)
+  assert.equal(legacy.ownerEvents.at(-1).session?.id, S1, 'rows without an ID retain the unique-title fallback')
+  assert.deepEqual(menuLabels(legacy.document), hostRowMenu('普通置顶', '超级置顶'))
+  legacy.dispose(); legacy.disposeOwner()
+}
+
 // --- SAME-NAME sessions. `titleFrom` reads the row's own text and
 //     `resolveSession` refuses an ambiguous match, so the owner legitimately
 //     answers with NO session and drops the session-scoped items. The plugin
 //     must not fabricate or guess a session; its own pinned row can still use
 //     the exact id for Unpin while ordinary host rows remain unresolved.
-{
+if (!ownerContract.exactIds) {
   const t = await run({ pinned: [S1], titles: { [S1]: 'Explore', [S2]: 'Explore' } })
   const ownRow = t.document.body.querySelector('[data-stp-row]')
   await rightClick(t.docListeners, ownRow.querySelector('[data-stp-row-title]'))
@@ -921,7 +1090,7 @@ function menuItem(document, label) {
 //     list never mounts to render it.
 //
 //     So forwarding bought the user a pinned row's menu with nothing in it that
-//     a pinned row needs, while the plugin's own menu holds exactly those two
+//     a pinned row needs, while the plugin's own menu holds its pin and colour
 //     actions. The plugin's own row is served here; codex's own rows are
 //     untouched.
 {

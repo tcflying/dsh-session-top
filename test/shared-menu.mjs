@@ -40,6 +40,9 @@ const S1 = 'session-aaaaaaaa-1111-4111-8111-111111111111'
 const S2 = 'session-bbbbbbbb-2222-4222-8222-222222222222'
 const PIN_ID = 'dsh-session-top.pin'
 const UNPIN_ID = 'dsh-session-top.unpin'
+const SUPER_ID = 'dsh-session-top.super-pin'
+const UNSUPER_ID = 'dsh-session-top.unsuper-pin'
+const ABSOLUTE_STORAGE_KEY = 'dsh-session-top:absolute-pins'
 const COLOR_ID = 'dsh-session-top.row-color'
 const COLOR_LABEL = '自定义行背景颜色…'
 
@@ -174,7 +177,8 @@ function matchSimple(el, selector) {
  * lib/client.js:70-92 — the registry is created lazily by the OWNER and frozen,
  * and unchanged by later revisions;
  * register() throws on a duplicate id; the returned disposer also drops the
- * global when nothing holds it any more.
+ * global when nothing holds it any more. The repository patch adds active()
+ * to expose the existing lease count without mutating it.
  */
 function ownerRegistry() {
   if (!globalThis[KEY]) {
@@ -190,6 +194,7 @@ function ownerRegistry() {
         }
       },
       list: () => [...entries.values()].sort((a, b) => (a.order ?? 0) - (b.order ?? 0)),
+      active: () => leases > 0,
       [LEASE](delta) {
         leases += delta
         if (!leases && !entries.size && globalThis[KEY] === api) delete globalThis[KEY]
@@ -418,21 +423,70 @@ function labelOf(node) {
   return own === '' ? node.children.map(labelOf).join('') : own
 }
 
+// ClientWorkspaceModel's global pinRequestSeq and batched notifications, from
+// the bundled @deepseek-ai/dsh-api-workspace-controller client. RPC success can
+// precede membership: only the latest request may install its complete pin set.
+function concurrentWorkspace() {
+  let pinRequestSeq = 0
+  let snapshot = {
+    items: [{ workspaceId: 'w1', title: 'W1', path: '/work', sessionIds: [S1, S2] }],
+    pinnedSessionIds: [], archivedSessionIds: [], phase: 'ready',
+  }
+  const listeners = new Set()
+  const pending = []
+  let notificationScheduled = false
+  const installPinned = ids => {
+    snapshot = { ...snapshot, pinnedSessionIds: [...ids] }
+    if (notificationScheduled) return
+    notificationScheduled = true
+    queueMicrotask(() => {
+      notificationScheduled = false
+      for (const listener of listeners) listener()
+    })
+  }
+  const write = async id => {
+    const requestSeq = ++pinRequestSeq
+    const result = await new Promise(resolve => { pending.push({ id, resolve }) })
+    if (result.ok && requestSeq === pinRequestSeq) installPinned(result.value.pinnedSessionIds)
+  }
+  return {
+    list: {
+      getSnapshot: () => snapshot,
+      subscribe: listener => { listeners.add(listener); return () => listeners.delete(listener) },
+    },
+    pinSession: write,
+    unpinSession: write,
+    async reply(ids) {
+      assert.ok(pending.length > 0, 'an official pin request must be pending')
+      pending.shift().resolve({ ok: true, value: { pinnedSessionIds: ids } })
+      await new Promise(resolve => { setImmediate(resolve) })
+    },
+  }
+}
+
 // ------------------------------------------------------------ run the plugin
 
 async function run({
   pinned = [], withOwner = 'before', withUiWorkspace = true, refuseUnpin = false,
-  throwOnOpen = false, deferUnpinReject = false, official = false,
+  throwOnOpen = false, deferUnpinReject = false, official = false, absolute = [],
+  deferPinResponse = false, workspace = null,
 } = {}) {
   // Set when `deferUnpinReject` asked for an RPC that settles on OUR schedule,
   // so a rejection can be delivered after the plugin has been disposed.
   let rejectPending = null
+  let resolvePendingPin = null
   delete globalThis[KEY]
   const scaffold = page({ official })
   const ownCalls = []
   const pinCalls = []
   const opened = []
   const retained = []
+  const storage = new Map([[ABSOLUTE_STORAGE_KEY, JSON.stringify(absolute)]])
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
+    getItem: key => storage.get(key) ?? null,
+    setItem: (key, value) => storage.set(key, String(value)),
+    removeItem: key => storage.delete(key),
+  } })
 
   const summaries = {
     [S1]: { id: S1, displayTitle: 'first', cwd: '/work/one', updatedAt: 1 },
@@ -449,7 +503,15 @@ async function run({
         }),
         subscribe: () => () => {},
       },
-      pinSession: async (id) => { pinCalls.push(['pin', id]) },
+      pinSession: async (id) => {
+        pinCalls.push(['pin', id])
+        pinned = [...new Set([...pinned, id])]
+        if (deferPinResponse) {
+          deferPinResponse = false
+          // The Host publishes membership before answering the RPC.
+          await new Promise(resolve => { resolvePendingPin = resolve })
+        }
+      },
       unpinSession: async (id) => {
         if (deferUnpinReject) {
           // Sits unresolved until the test releases it — the shape of a host RPC
@@ -465,6 +527,7 @@ async function run({
           throw error
         }
         pinCalls.push(['unpin', id])
+        pinned = pinned.filter(one => one !== id)
       },
     },
     sessions: {
@@ -487,6 +550,7 @@ async function run({
       subagentAddress: () => undefined,
     },
   }
+  if (workspace !== null) services.workspaces = workspace
   if (withUiWorkspace === 'late') {
     // Published only AFTER the plugin has mounted — the exact timing that used
     // to be captured as `undefined` at mount time and never re-read.
@@ -553,11 +617,19 @@ async function run({
     ...scaffold,
     owner,
     pinCalls,
+    storage,
     opened,
     retained,
     ownCalls,
     /** Publish `uiWorkspace` after mount, the way a late host plugin does. */
     publishUiWorkspace() { services.__publishUiWorkspace?.() },
+    /** Answer a pin RPC whose Host snapshot has already changed. */
+    resolvePendingPin() {
+      assert.ok(resolvePendingPin, 'a pin RPC must be pending')
+      const resolve = resolvePendingPin
+      resolvePendingPin = null
+      resolve()
+    },
     /** Settle a deferred unpin RPC with a rejection. */
     rejectPendingUnpin(error = new Error('unpin refused late')) {
       const reject = rejectPending
@@ -575,12 +647,10 @@ async function run({
 {
   const run1 = await run({ withOwner: 'before', pinned: [] })
   const entries = run1.owner.api.list()
-  assert.deepEqual(entries.map(entry => entry.id), [PIN_ID, UNPIN_ID, COLOR_ID], 'every entry must be registered in order')
-  assert.equal(entries[0].label, '置顶该会话')
-  assert.equal(entries[1].label, '取消置顶')
-  assert.equal(entries[2].label, COLOR_LABEL)
-  assert.deepEqual(entries.map(entry => entry.order), [50, 51, 52], 'the pin/unpin orders must be unchanged')
-  console.log('✔ owner first: pin/unpin/row-colour are in the shared table at mount, in order')
+  assert.deepEqual(entries.map(entry => entry.id), [PIN_ID, UNPIN_ID, SUPER_ID, UNSUPER_ID, COLOR_ID], 'every entry must be registered in order')
+  assert.deepEqual(entries.map(entry => entry.label), ['普通置顶', '取消置顶', '超级置顶', '取消超级置顶（保留普通置顶）', COLOR_LABEL])
+  assert.deepEqual(entries.map(entry => entry.order), [50, 51, 52, 53, 54], 'ordinary, super and colour entries must stay in order')
+  console.log('✔ owner first: ordinary/super/row-colour entries are in the shared table at mount, in order')
 
   // The right-click must reach the owner untouched by the plugin.
   const ev = await rightClickAndSettle(run1.docListeners, run1.rows[S1].title)
@@ -593,13 +663,13 @@ async function run({
   const labels = menuLabels(run1.document)
   assert.deepEqual(
     labels,
-    ['重命名会话', '归档会话', '永久删除会话', '置顶该会话', COLOR_LABEL, '刷新'],
+    ['重命名会话', '归档会话', '永久删除会话', '普通置顶', '超级置顶', COLOR_LABEL, '刷新'],
     `the owner's own items must survive next to ours; got ${JSON.stringify(labels)}`,
   )
   console.log('✔ owner live: the gesture is untouched and the host items are preserved')
 
   // Clicking our entry closes the owner's menu and pins through the official RPC.
-  const pinItem = menuItem(run1.document, '置顶该会话')
+  const pinItem = menuItem(run1.document, '普通置顶')
   pinItem.click()
   await new Promise(r => { setTimeout(r, 20) })
   assert.deepEqual(run1.pinCalls, [['pin', S1]], 'the entry must pin through workspaces.pinSession')
@@ -608,24 +678,104 @@ async function run({
   console.log('✔ owner live: the Pin entry closes the menu and pins through the official RPC')
 
   run1.dispose()
-  assert.deepEqual(run1.owner.api.list(), [], 'disposal must take both entries back out of the table')
+  assert.deepEqual(run1.owner.api.list(), [], 'disposal must take all five entries back out of the table')
   run1.disposeOwner()
   assert.equal(globalThis[KEY], undefined, 'with no lease and no entries the owner drops the table')
-  console.log('✔ disposal unregisters both entries and leaves the table as it was found')
+  console.log('✔ disposal unregisters all five entries and leaves the table as it was found')
 }
 
-// --- a session pinned by ANY route offers Unpin, from a plain host row
+// --- an ordinary pinned session offers Unpin and super pin from a plain host row
 {
   const run1 = await run({ withOwner: 'before', pinned: [S1] })
   // S1 is pinned, S2 is not — and S1 is an ordinary host row, not one of ours.
   await rightClickAndSettle(run1.docListeners, run1.rows[S1].title)
   const labels = menuLabels(run1.document)
-  assert.deepEqual(labels, ['重命名会话', '归档会话', '永久删除会话', '取消置顶', COLOR_LABEL, '刷新'])
-  assert.ok(!labels.includes('置顶该会话'), 'pin and unpin must be mutually exclusive')
+  assert.deepEqual(labels, ['重命名会话', '归档会话', '永久删除会话', '取消置顶', '超级置顶', COLOR_LABEL, '刷新'])
+  assert.ok(!labels.includes('普通置顶'), 'ordinary pin and unpin must be mutually exclusive')
   menuItem(run1.document, '取消置顶').click()
   await new Promise(r => { setTimeout(r, 20) })
   assert.deepEqual(run1.pinCalls, [['unpin', S1]], 'Unpin must write through workspaces.unpinSession')
-  console.log('✔ an already-pinned host row offers Unpin — the official pin set is the only truth')
+  console.log('✔ an ordinary pinned host row offers Unpin and super pin')
+  run1.dispose()
+  run1.disposeOwner()
+}
+
+// --- Super pin cancellation removes only local priority, retaining ordinary pin.
+{
+  const run1 = await run({ pinned: [S1], absolute: [S1] })
+  await rightClickAndSettle(run1.docListeners, run1.rows[S1].title)
+  assert.deepEqual(menuLabels(run1.document), ['重命名会话', '归档会话', '永久删除会话', '取消超级置顶（保留普通置顶）', COLOR_LABEL, '刷新'])
+  menuItem(run1.document, '取消超级置顶（保留普通置顶）').click()
+  await new Promise(r => { setTimeout(r, 20) })
+  assert.deepEqual(run1.pinCalls, [], 'demotion must not unpin through the official RPC')
+  assert.deepEqual(JSON.parse(run1.storage.get(ABSOLUTE_STORAGE_KEY)), [], 'demotion removes local priority')
+  await rightClickAndSettle(run1.docListeners, run1.rows[S1].title)
+  assert.deepEqual(menuLabels(run1.document), ['重命名会话', '归档会话', '永久删除会话', '取消置顶', '超级置顶', COLOR_LABEL, '刷新'])
+  run1.dispose()
+  run1.disposeOwner()
+  console.log('✔ cancelling super pin restores the ordinary pinned menu without an official unpin')
+}
+
+// --- A late promotion response cannot override a newer ordinary pin action.
+{
+  for (const repinBeforeResponse of [false, true]) {
+    const run1 = await run({ pinned: [], deferPinResponse: true })
+    try {
+      await rightClickAndSettle(run1.docListeners, run1.rows[S1].title)
+      menuItem(run1.document, '超级置顶').click()
+      await rightClickAndSettle(run1.docListeners, run1.rows[S1].title)
+      assert.deepEqual(run1.pinCalls, [['pin', S1]], 'the promotion RPC is still pending after Host membership changes')
+      menuItem(run1.document, '取消置顶').click()
+      await rightClickAndSettle(run1.docListeners, run1.rows[S1].title)
+      assert.deepEqual(run1.pinCalls, [['pin', S1], ['unpin', S1]], 'ordinary unpin succeeds before the older pin reply')
+      if (repinBeforeResponse) menuItem(run1.document, '普通置顶').click()
+      run1.resolvePendingPin()
+      await new Promise(r => { setTimeout(r, 20) })
+      if (!repinBeforeResponse) menuItem(run1.document, '普通置顶').click()
+      await rightClickAndSettle(run1.docListeners, run1.rows[S1].title)
+      assert.deepEqual(JSON.parse(run1.storage.get(ABSOLUTE_STORAGE_KEY)), [], 'a superseded promotion must never persist local priority')
+      assert.deepEqual(run1.pinCalls, [['pin', S1], ['unpin', S1], ['pin', S1]])
+      assert.deepEqual(menuLabels(run1.document), ['重命名会话', '归档会话', '永久删除会话', '取消置顶', '超级置顶', COLOR_LABEL, '刷新'], 'ordinary repin stays ordinary on either side of the late reply')
+    } finally {
+      run1.dispose()
+      run1.disposeOwner()
+    }
+  }
+  console.log('✔ a deferred super promotion cannot override ordinary unpin/repin before or after its reply')
+}
+
+// --- Another session's pending request suppresses the super pin's unary echo.
+{
+  for (const newerAction of ['none', 'ordinary-pin', 'unpin-repin', 'demote', 'dispose']) {
+    const workspace = concurrentWorkspace()
+    const run1 = await run({ workspace })
+    try {
+      const action = (entryId, id) => run1.owner.api.list().find(entry => entry.id === entryId)
+        .run({ session: { id }, close() {} })
+      action(SUPER_ID, S1)
+      action(PIN_ID, S2)
+      await workspace.reply([S1])
+      assert.deepEqual(workspace.list.getSnapshot().pinnedSessionIds, [], 'the global request sequence suppresses A while B is pending')
+      assert.deepEqual(JSON.parse(run1.storage.get(ABSOLUTE_STORAGE_KEY)), [], 'a confirmed promotion waits for official membership')
+      if (newerAction === 'ordinary-pin') action(PIN_ID, S1)
+      if (newerAction === 'unpin-repin') { action(UNPIN_ID, S1); action(PIN_ID, S1) }
+      if (newerAction === 'demote') action(UNSUPER_ID, S1)
+      if (newerAction === 'dispose') run1.dispose()
+      await workspace.reply([S2, S1])
+      if (newerAction === 'unpin-repin') await workspace.reply([S2])
+      if (newerAction === 'ordinary-pin' || newerAction === 'unpin-repin') await workspace.reply([S1, S2])
+      assert.deepEqual(JSON.parse(run1.storage.get(ABSOLUTE_STORAGE_KEY)), newerAction === 'none' ? [S1] : [],
+        'membership completes only the still-current confirmed promotion: ' + newerAction)
+      if (newerAction !== 'dispose') {
+        await rightClickAndSettle(run1.docListeners, run1.rows[S1].title)
+        assert.equal(menuLabels(run1.document).includes('取消超级置顶（保留普通置顶）'), newerAction === 'none')
+      }
+    } finally {
+      run1.dispose()
+      run1.disposeOwner()
+    }
+  }
+  console.log('✔ confirmed super pin survives another session’s pending echo; newer same-id actions and dispose cancel it')
 }
 
 // --- owner initialized AFTER the plugin: the bounded retry finds it
@@ -633,28 +783,33 @@ async function run({
   const run1 = await run({ withOwner: 'after', pinned: [] })
   assert.deepEqual(
     run1.owner.api.list().map(entry => entry.id),
-    [PIN_ID, UNPIN_ID, COLOR_ID],
+    [PIN_ID, UNPIN_ID, SUPER_ID, UNSUPER_ID, COLOR_ID],
     'a late owner must still receive the entries, however the two apply orders fall out',
   )
   await rightClickAndSettle(run1.docListeners, run1.rows[S2].title)
   assert.equal(run1.document.body.querySelector('.dshcm-menu') !== null, true, 'the owner now builds the menu')
+  assert.deepEqual(menuLabels(run1.document), ['重命名会话', '归档会话', '永久删除会话', '普通置顶', '超级置顶', COLOR_LABEL, '刷新'])
   assert.ok(run1.document.body.querySelector('[data-stp-menu]') === null, "the plugin still keeps its hands off")
   console.log('✔ owner last: the bounded retry publishes the entries and the plugin steps aside')
   run1.dispose()
   run1.disposeOwner()
 }
 
-// --- NO owner at all, on codex. codex serves its own session menu on
-// right-click, so the gesture is not this plugin's to claim: with nobody
-// building a menu it still must not cover the host's. And it must never invent
-// the owner's table, claim blank space, or write into a foreign surface.
+// --- No owner on codex: recognized rows get both pin tiers. The plugin never
+// invents the owner's table, claims blank space, or writes into foreign surfaces.
 {
   const run1 = await run({ withOwner: 'none', pinned: [] })
   assert.equal(globalThis[KEY], undefined, 'the plugin must never create the owner\'s table itself')
 
+  const storageBefore = [...run1.storage]
   const ev = await rightClickAndSettle(run1.docListeners, run1.rows[S1].title)
-  assert.equal(ev.defaultPrevented, false, "codex's own session menu must not be prevented")
-  assert.ok(run1.document.body.querySelector('[data-stp-menu]') === null, 'and not covered by a plugin menu')
+  assert.equal(ev.defaultPrevented, true, 'a recognized native row without an owner gets the fallback')
+  const menu = run1.document.body.querySelector('[data-stp-menu]')
+  assert.ok(menu !== null)
+  assert.match(menu.querySelector('[data-stp-pin-item]').textContent, /普通置顶/)
+  assert.equal(menu.querySelector('[data-stp-absolute-item]').textContent, '超级置顶')
+  assert.deepEqual(run1.pinCalls, [], 'opening the menu does not pin a session')
+  assert.deepEqual([...run1.storage], storageBefore, 'opening the menu does not persist priority')
 
   // Blank space inside the sidebar is not a row: never claimed.
   const blank = await rightClickAndSettle(run1.docListeners, run1.tree)
@@ -667,7 +822,7 @@ async function run({
   run1.body.appendChild(foreign)
   await new Promise(r => { setTimeout(r, 120) })
   assert.equal(foreign.querySelector('[data-stp-pin-item]'), null, 'no graft into a surface we do not own')
-  console.log('✔ owner disabled on codex: nothing claimed, nothing grafted')
+  console.log('✔ owner disabled on codex: recognized rows offer both pin tiers without state writes or grafts')
   run1.dispose()
 }
 
@@ -680,7 +835,8 @@ async function run({
   assert.equal(ev.defaultPrevented, true, 'with nothing else to open a menu, the plugin owns the row it resolved')
   const own = run1.document.body.querySelector('[data-stp-menu]')
   assert.ok(own !== null, "the plugin's own menu must open")
-  assert.match(labelOf(own), /置顶该会话/)
+  assert.match(labelOf(own), /普通置顶/)
+  assert.match(labelOf(own), /超级置顶/)
   console.log('✔ stock row with no host menu control: the plugin\'s own pin menu')
   run1.dispose()
 }
@@ -693,27 +849,25 @@ async function run({
 // hands the gesture to nobody: every right-click falls through silently.
 {
   const run1 = await run({ withOwner: 'before', pinned: [] })
-  assert.equal(run1.owner.api.list().length, 3, 'entries start registered')
+  assert.equal(run1.owner.api.list().length, 5, 'entries start registered')
   run1.disposeOwner()
 
   // The entries are still there. That fact must NOT disable our own menu.
   assert.equal(globalThis[KEY] !== undefined, true, "our entries keep the owner's table alive")
   assert.deepEqual(
     run1.owner.api.list().map(entry => entry.id),
-    [PIN_ID, UNPIN_ID, COLOR_ID],
+    [PIN_ID, UNPIN_ID, SUPER_ID, UNSUPER_ID, COLOR_ID],
     'the table survives its owner',
   )
 
   const ev = await rightClickAndSettle(run1.docListeners, run1.rows[S1].title)
-  assert.equal(
-    ev.defaultPrevented, false,
-    "entries left in a table must not tempt the plugin into claiming codex's own menu",
-  )
-  assert.ok(
-    run1.document.body.querySelector('[data-stp-menu]') === null,
-    "and it must not open its own menu once the owner is gone",
-  )
-  console.log('✔ owner unloaded with our entries still in its table: the gesture still belongs to codex')
+  assert.equal(ev.defaultPrevented, true, 'an unloaded owner must not hide the tier fallback')
+  const menu = run1.document.body.querySelector('[data-stp-menu]')
+  assert.ok(menu !== null, 'known native rows retain their pin menu after owner unload')
+  assert.match(labelOf(menu), /普通置顶/)
+  assert.match(labelOf(menu), /超级置顶/)
+  assert.equal(run1.document.body.querySelector('.dshcm-menu'), null)
+  console.log('✔ owner unloaded with surviving entries: known native rows keep both pin tiers')
   run1.dispose()
 }
 

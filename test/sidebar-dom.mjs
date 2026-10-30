@@ -340,6 +340,7 @@ class El {
    * code to match a fake.
    */
   insertBefore(c, a) {
+    if (c === a) return c
     // Pre-insert, step one: a node with a parent is REMOVED from it — including
     // when that parent is this very list. Skipping the same-parent case is
     // exactly the old bug in a narrower form: the row is spliced in a second
@@ -1620,6 +1621,50 @@ for (const makeScaffold of [officialScaffold, codexScaffold]) {
   console.log('✔ pins: idle recency, separate super group, demotion and ordinary cancellation')
 }
 
+// Both tiers use recency on mount and on activity, including a newly created idle pin.
+for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
+  const sc = makeScaffold()
+  const run = await runBundle(sc, { pinned: [S2, S1], mutable: true, storageSeed: { [absoluteKey]: JSON.stringify([S1, S2]) } })
+  assert.deepEqual(idsInRegion(sc), [S1, S2], 'super pins sort by recency on mount')
+  run.live.byId[S2].updatedAt = 100
+  run.nudge()
+  await settle()
+  assert.deepEqual(idsInRegion(sc), [S2, S1], 'new activity leads its own super tier')
+  run.live.byId[S9] = { id: S9, displayTitle: 'new idle pin', running: false, createdAt: 200 }
+  run.live.pinned.push(S9)
+  run.nudge()
+  await settle()
+  assert.deepEqual(idsInRegion(sc), [S2, S1, S9], 'a new ordinary pin stays below the super tier')
+  sc.body.querySelector('[data-stp-session="' + S1 + '"] [data-stp-absolute-button]').click()
+  await settle()
+  assert.deepEqual(idsInRegion(sc), [S2, S9, S1], 'demotion retains membership and joins ordinary recency')
+  assert.deepEqual(run.live.pinned, [S2, S1, S9], 'demotion never unpins the official session')
+  sc.body.querySelector('[data-stp-session="' + S2 + '"] [data-stp-pin-button]').click()
+  await settle()
+  assert.deepEqual(idsInRegion(sc), [S9, S2, S1], 'the minus control also demotes a super pin first')
+  assert.deepEqual(run.live.pinned, [S2, S1, S9])
+  assert.equal(sc.body.querySelector('[data-stp-tier="absolute"]'), null)
+  run.dispose()
+}
+
+// A demotion menu keeps that intent even if another window already demoted it.
+for (const makeScaffold of [officialScaffold, codexScaffold]) {
+  const sc = makeScaffold()
+  const run = await runBundle(sc, { pinned: [S1], mutable: true, storageSeed: { [absoluteKey]: JSON.stringify([S1]) } })
+  const row = sc.body.querySelector('[data-stp-row]')
+  rightClickAt(run, row, 100, 200)
+  await settle()
+  const item = sc.body.querySelector('[data-stp-pin-item]')
+  assert.match(item.textContent, /取消超级置顶/)
+  writeFromOtherWindow(run, absoluteKey, '[]')
+  await settle()
+  item.click()
+  await settle()
+  assert.deepEqual(run.live.pinned, [S1], 'an old demotion cannot cancel an ordinary pin')
+  assert.deepEqual(run.pinCalls, [], 'demotion remains local after a foreign tier change')
+  run.dispose()
+}
+
 // A newly observed idle pin must outrank an older session with cached activity.
 for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
   const sc = makeScaffold()
@@ -2083,47 +2128,45 @@ for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
   console.log('✔ codex flavor: group folded through .dcu-wb-project-head toggle')
 }
 
-// --- right-click on a codex row. codex-ui SERVES ITS OWN session menu on
-// right-click, with its own actions in it, so the gesture is not this plugin's
-// to claim: preventing it, or opening a plugin menu over it, would cost the user
-// the host's menu and gain them exactly one entry. Pin on this rendering comes
-// from the shared menu owner (@baihejiangnan/dsh-session-context-menu), which
-// renders into the menu codex already opens.
-//
-// What must still hold: the plugin never goes looking for someone else's menu
-// surface to graft into, and it never stops a listener downstream from seeing
-// the event.
+// --- A recognized native row without a shared owner gets both pin tiers before
+// React claims the gesture. Opening the menu writes nothing; super pinning uses
+// the official RPC, and demotion keeps that official pin.
 {
   const sc = codexScaffold()
-  const { listeners, pinCalls } = await runBundle(sc, { pinned: [] })
-  const handlers = listeners.get('contextmenu') ?? []
-  assert.ok(handlers.length > 0, 'a contextmenu listener must be installed')
-
-  const rootSentinel = []
-  sc.tree.addEventListener('contextmenu', (e) => { rootSentinel.push(e) })
-
-  const ev = {
-    target: sc.title,
-    clientX: 100,
-    clientY: 200,
-    defaultPrevented: false,
-    propagationStopped: false,
-    preventDefault() { this.defaultPrevented = true },
-    stopPropagation() { this.propagationStopped = true },
-    stopImmediatePropagation() { this.propagationStopped = true },
-  }
-  handlers[0](ev)
+  const run = await runBundle(sc, { pinned: [], mutable: true })
+  const ev = new MouseEvent('contextmenu', { cancelable: true, clientX: 100, clientY: 200 })
+  ev.target = sc.title
+  sc.row.dispatchEvent(ev)
+  assert.equal(ev.defaultPrevented, true, 'the fallback must claim synchronously before React')
+  assert.equal(ev.propagationStopped, true, 'the native handler must not open behind the fallback')
+  assert.deepEqual(sc.nativeClaims, [], 'the native row handler never receives the claimed event')
   await afterDispatch()
-  assert.equal(
-    ev.defaultPrevented, false,
-    "codex's own session menu must be neither prevented nor covered",
-  )
-  assert.equal(
-    sc.body.querySelector('[data-stp-menu]'), null,
-    'and no plugin menu may open on top of it',
-  )
-  assert.equal(rootSentinel.length, 0, 'the event must not also reach a host listener')
-  console.log('✔ codex flavor: the native session menu and its actions are left alone')
+  const own = sc.body.querySelector('[data-stp-menu]')
+  assert.ok(own !== null, 'a recognized unpinned native row gets the fallback')
+  assert.match(own.querySelector('[data-stp-pin-item]').textContent, /普通置顶/)
+  assert.equal(own.querySelector('[data-stp-absolute-item]').textContent, '超级置顶')
+  assert.equal(sc.body.querySelector('.dcu-host-menu'), null)
+  assert.deepEqual(run.pinCalls, [], 'opening the menu must not pin any session')
+  assert.deepEqual(run.storageCalls.writes, [], 'opening the menu must not persist priority')
+  own.querySelector('[data-stp-absolute-item]').click()
+  await settle()
+  assert.deepEqual(run.pinCalls, [['pin', S1]], 'super pin writes the exact recognized session through the official RPC')
+  assert.deepEqual(run.live.pinned, [S1], 'no other session is pinned')
+  assert.deepEqual(JSON.parse(run.store.get(absoluteKey)), [S1])
+  const row = sc.body.querySelector('[data-stp-row]')
+  assert.equal(row.parentElement.getAttribute('data-stp-tier'), 'absolute')
+
+  rightClickAt(run, sc.title, 100, 200)
+  const demote = sc.body.querySelector('[data-stp-pin-item]')
+  assert.match(demote.textContent, /取消超级置顶（保留普通置顶）/)
+  assert.equal(sc.body.querySelector('[data-stp-absolute-item]'), null)
+  demote.click()
+  await settle()
+  assert.deepEqual(run.live.pinned, [S1], 'demotion preserves the official pin')
+  assert.deepEqual(run.pinCalls, [['pin', S1]], 'demotion never emits an official unpin')
+  assert.deepEqual(JSON.parse(run.store.get(absoluteKey)), [])
+  assert.equal(row.parentElement.getAttribute('data-stp-tier'), null)
+  console.log('✔ codex no owner: ordinary/super options, exact-id super pin and safe demotion')
 
   // A foreign surface appearing afterwards must stay untouched.
   const foreign = new El('div')
@@ -2140,7 +2183,37 @@ for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
     'the plugin must never write into a menu surface it does not own',
   )
   assert.ok(foreignRow.isConnected, 'the host must keep its own menu rows')
+  run.dispose()
   console.log('✔ no DOM graft: a foreign menu surface is never touched')
+}
+
+// --- Unknown native ids, missing ids and non-row targets stay observe-only.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, { pinned: [] })
+  for (const id of [S9, 'constructor', '', null]) {
+    if (id === null) sc.row.removeAttribute('data-dcu-session')
+    else sc.row.setAttribute('data-dcu-session', id)
+    const ev = rawContextMenu(sc.title)
+    for (const fn of run.listeners.get('contextmenu') ?? []) fn(ev)
+    await afterDispatch()
+    assert.equal(ev.defaultPrevented, false, `unknown native id ${String(id)} must not be claimed`)
+    assert.equal(ev.propagationStopped, false)
+    assert.equal(sc.body.querySelector('[data-stp-menu]'), null)
+  }
+  sc.row.setAttribute('data-dcu-session', S1)
+  for (const target of [sc.tree, null]) {
+    const ev = rawContextMenu(target)
+    for (const fn of run.listeners.get('contextmenu') ?? []) fn(ev)
+    await afterDispatch()
+    assert.equal(ev.defaultPrevented, false, 'a missing session row must never be claimed')
+    assert.equal(ev.propagationStopped, false)
+    assert.equal(sc.body.querySelector('[data-stp-menu]'), null)
+  }
+  assert.deepEqual(run.pinCalls, [], 'unrecognized events never mutate official pin state')
+  assert.deepEqual(run.storageCalls.writes, [], 'unrecognized events never persist priority')
+  run.dispose()
+  console.log('✔ unknown native ids, missing ids and missing rows are untouched')
 }
 
 // --- The plugin's own menu, where it is still the right answer: an OFFICIAL
@@ -2148,7 +2221,8 @@ for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
 // through the official pin RPC, not through anything of its own.
 {
   const sc = officialUiScaffold({ hostRowMenu: false })
-  const { listeners, pinCalls } = await runBundle(sc, { pinned: [] })
+  const run = await runBundle(sc, { pinned: [], mutable: true })
+  const { listeners, pinCalls } = run
   const handlers = listeners.get('contextmenu') ?? []
   handlers[0]({
     target: sc.row,
@@ -2163,11 +2237,33 @@ for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
   assert.ok(own !== null, 'a row with no host menu control still gets the pin fallback')
   const item = own.querySelector('[data-stp-pin-item]')
   assert.ok(item !== null, 'the fallback must offer the pin action')
-  assert.match(item.textContent, /置顶该会话/, 'an unpinned session offers Pin')
+  assert.match(item.textContent, /普通置顶/, 'an unpinned session offers an ordinary pin')
   item.click()
   await new Promise(r => { harnessSetTimeout(r, 20) })
   assert.deepEqual(pinCalls, [['pin', S1]], 'the pin must go through workspaces.pinSession')
-  console.log('✔ own menu item pins through the official workspace RPC')
+  await settle()
+  const row = sc.body.querySelector('[data-stp-row]')
+  rightClickAt(run, row, 100, 200)
+  await settle()
+  sc.body.querySelector('[data-stp-absolute-item]').click()
+  await settle()
+  assert.equal(row.parentElement.getAttribute('data-stp-tier'), 'absolute')
+  rightClickAt(run, row, 100, 200)
+  await settle()
+  const demote = sc.body.querySelector('[data-stp-pin-item]')
+  assert.match(demote.textContent, /取消超级置顶（保留普通置顶）/)
+  demote.click()
+  await settle()
+  assert.deepEqual(run.live.pinned, [S1], 'fallback super cancellation keeps official pin')
+  assert.deepEqual(pinCalls, [['pin', S1]], 'promotion and demotion emit no extra official RPC')
+  assert.equal(row.parentElement.getAttribute('data-stp-tier'), null)
+  rightClickAt(run, row, 100, 200)
+  await settle()
+  sc.body.querySelector('[data-stp-pin-item]').click()
+  await settle()
+  assert.deepEqual(run.live.pinned, [], 'a later ordinary cancellation removes the pin')
+  run.dispose()
+  console.log('✔ fallback tier actions promote, demote and unpin through official state')
 }
 
 // --- the graft must NOT touch a menu that was already open before the click
@@ -2389,9 +2485,7 @@ for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
   // Wait out the memoization window so the next probe really re-reads the DOM.
   await new Promise(r => { harnessSetTimeout(r, 320) })
 
-  // Right-click the now-rendered codex row. Its menu is codex's own, so the
-  // gesture stays the host's — and still nothing of anyone else's menu surface
-  // may be touched.
+  // A late-rendered recognized native row also gets the no-owner fallback.
   const late = {
     target: row, defaultPrevented: false, propagationStopped: false,
     preventDefault() { this.defaultPrevented = true },
@@ -2401,13 +2495,14 @@ for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
   handlers[0](late)
   await afterDispatch()
   assert.equal(
-    late.defaultPrevented, false,
-    "a late-rendered codex row's native menu is the host's, not the plugin's to replace",
+    late.defaultPrevented, true,
+    'a late-rendered recognized codex row gets both pin tiers without an owner',
   )
-  assert.equal(
-    bare.body.querySelector('[data-stp-menu]'), null,
-    'and no plugin menu may appear on top of it',
-  )
+  assert.equal(late.propagationStopped, true)
+  const menu = bare.body.querySelector('[data-stp-menu]')
+  assert.ok(menu !== null)
+  assert.match(menu.querySelector('[data-stp-pin-item]').textContent, /普通置顶/)
+  assert.equal(menu.querySelector('[data-stp-absolute-item]').textContent, '超级置顶')
 
   const surface = new El('div')
   surface.setAttribute('data-menu-material', 'translucent')
@@ -4762,19 +4857,22 @@ function rightClickAt(run, target, x, y) {
   console.log('✔ official row: another owner\'s claim is never overridden')
 }
 
-// --- 2c: codex keeps its native menu — actions and all.
+// --- 2c: an unrecognized codex row still reaches the native handler.
 {
   const sc = codexScaffold()
+  sc.row.setAttribute('data-dcu-session', S9)
   const run = await runBundle(sc, { pinned: [] })
-  const event = rightClickAt(run, sc.row, 120, 200)
+  const event = new MouseEvent('contextmenu', { cancelable: true, clientX: 120, clientY: 200 })
+  event.target = sc.title
+  sc.row.dispatchEvent(event)
   await afterDispatch()
-  assert.equal(
-    event.defaultPrevented, false,
-    'the host\'s own native menu must not be prevented or covered by a plugin menu',
-  )
-  assert.equal(sc.body.querySelector('[data-stp-menu]'), null, 'and not replaced by a plugin menu')
+  assert.equal(sc.nativeClaims.length, 1, 'an unknown id must reach the native handler')
+  assert.equal(event.defaultPrevented, true, 'the native handler claims its own event')
+  assert.deepEqual(sc.body.querySelector('.dcu-host-menu').children.map(item => item.textContent), CODEX_SESSION_MENU)
+  assert.equal(sc.body.querySelector('[data-stp-menu]'), null, 'no fallback may replace an unknown row')
+  assert.deepEqual(run.pinCalls, [])
   run.dispose()
-  console.log('✔ codex: the native session menu is left to the host, with its own actions')
+  console.log('✔ unknown codex row: native menu and its actions stay reachable')
 }
 
 // --- 2d: a PINNED row — the plugin's own row, whose official row the pin rule
@@ -4979,8 +5077,8 @@ function rightClickAt(run, target, x, y) {
 //     applies. Asserting only one half of that pair is how the previous
 //     revision shipped a regression.
 //
-//     codex's own rows are untouched either way: this never claims a host row,
-//     only a row this plugin drew.
+//     This case covers the plugin's own pinned row; recognized native host rows
+//     use the same no-owner fallback, covered above.
 {
   const sc = codexScaffold()
   const run = await runBundle(sc, { pinned: [S1] })
@@ -5012,9 +5110,8 @@ function rightClickAt(run, target, x, y) {
   console.log('✔ codex pinned row, no owner: its own menu (Unpin + colour), not the host\'s menu without them')
 }
 
-// (The host's OWN rows stay observe-only — that is case 2c above, which holds
-//  for a pinned session's host row too: the plugin claims only rows it drew,
-//  never a `[data-dcu-session]` the host rendered.)
+// (Unknown host ids stay observe-only — case 2c proves the native handler still
+//  receives them. A registered shared owner keeps the full menu for known ids.)
 
 // =====================================================================
 // REQUIREMENT 3 — the Pinned region's OWN header folds its rows away.
@@ -6143,7 +6240,7 @@ const alertOf = (sc) => sc.body.querySelector('[data-stp-alert]')
   assert.ok(own !== null, 'with no host "…" control, the plugin serves its own menu')
   assert.deepEqual(
     [...own.querySelectorAll('[role="menuitem"]')].map(node => node.textContent),
-    [`${PIN_GLYPH}置顶该会话`, '自定义行背景颜色…'],
+    [`${PIN_GLYPH}普通置顶`, '超级置顶', '自定义行背景颜色…'],
     'the fallback menu carries the colour entry as well as the pin action',
   )
   own.querySelector('[data-stp-color-item]').click()
@@ -6243,17 +6340,17 @@ const OFFICIAL_COLOR_LABEL = '自定义行背景颜色…'
  */
 function makeRowMenuSlots() {
   const entries = []
-  const subs = new Set()
+  const subs = new Map()
   const businessRpc = []
   const hookCalls = []
+  const injectCalls = []
+  const componentCalls = []
   const hostComponent = (props) => {
+    componentCalls.push(props.sessionId)
     const menuOpenState = props.useMenuOpenState()
     const setMenuOpen = menuOpenState[1]
-    hookCalls.push(['useMenuOpenState'])
     const pinned = props.usePinned(p => p.has(props.sessionId))
-    hookCalls.push(['usePinned'])
     const archived = props.useArchived(a => a.has(props.sessionId))
-    hookCalls.push(['useArchived'])
     if (archived) return null
     return {
       label: props.t(pinned ? 'menu.unpinSession' : 'menu.pinSession'),
@@ -6264,15 +6361,18 @@ function makeRowMenuSlots() {
     }
   }
   const state = { pinned: new Set(), archived: new Set(), open: false }
-  const inject = (sessionId) => ({
-    sessionId,
-    useMenuOpenState: () => [state.open, (next) => { state.open = next }],
-    usePinned: selector => selector(state.pinned),
-    useArchived: selector => selector(state.archived),
-    pinSession: async (id) => { businessRpc.push(['pin', id]) },
-    unpinSession: async (id) => { businessRpc.push(['unpin', id]) },
-    t: key => `host:${key}`,
-  })
+  const inject = (...args) => {
+    injectCalls.push(args)
+    return {
+      sessionId: args[0],
+      useMenuOpenState: () => { hookCalls.push(['useMenuOpenState']); return [state.open, (next) => { state.open = next }] },
+      usePinned: selector => { hookCalls.push(['usePinned']); return selector(state.pinned) },
+      useArchived: selector => { hookCalls.push(['useArchived']); return selector(state.archived) },
+      pinSession: async (id) => { businessRpc.push(['pin', id]) },
+      unpinSession: async (id) => { businessRpc.push(['unpin', id]) },
+      t: key => `host:${key}`,
+    }
+  }
   const host = {
     options: { name: SLOT_ROW_MENU, id: 'pin', order: 100, locale: 'dsh-ui-sidebar' },
     component: hostComponent,
@@ -6283,28 +6383,47 @@ function makeRowMenuSlots() {
   return {
     businessRpc,
     hookCalls,
+    injectCalls,
+    componentCalls,
     state,
     entries,
     registry: {
-      entries: name => (name === SLOT_ROW_MENU ? [...entries] : []),
-      subscribe: (name, cb) => { subs.add(cb); return () => subs.delete(cb) },
+      entries: name => entries.filter(e => e.options.name === name),
+      entriesOfSlot: (name) => {
+        const winners = new Map()
+        for (const entry of entries.filter(e => e.options.name === name)) {
+          const cell = entry.options.key ?? entry.options.id
+          const current = winners.get(cell)
+          if (current === undefined || (entry.options.priority ?? 0) < (current.options.priority ?? 0)) winners.set(cell, entry)
+        }
+        return [...winners.values()]
+      },
+      subscribe: (name, cb) => {
+        if (!subs.has(name)) subs.set(name, new Set())
+        subs.get(name).add(cb)
+        return () => subs.get(name)?.delete(cb)
+      },
       register: (options, component) => {
         const cell = options.key ?? options.id
-        if (entries.some(e => (e.options.key ?? e.options.id) === cell)) {
-          throw new Error(`list slot "${options.name}" already has an entry with id "${cell}"`)
+        const priority = options.priority ?? 0
+        if (entries.some(e => e.options.name === options.name && (e.options.key ?? e.options.id) === cell && (e.options.priority ?? 0) === priority)) {
+          throw new Error(`list slot "${options.name}" already has an entry with id "${cell}" at priority ${priority}`)
         }
         const entry = { options, component, inject: options.inject, registrant: options.registrant }
         entries.push(entry)
-        for (const cb of [...subs]) cb()
+        for (const cb of [...(subs.get(options.name) ?? [])]) cb()
+        let disposed = false
         return () => {
+          if (disposed) return
+          disposed = true
           const at = entries.indexOf(entry)
           if (at >= 0) entries.splice(at, 1)
-          for (const cb of [...subs]) cb()
+          for (const cb of [...(subs.get(options.name) ?? [])]) cb()
         }
       },
-      listenersFor: () => subs.size,
+      listenersFor: (name = SLOT_ROW_MENU) => (subs.get(name) ?? new Set()).size,
       /** The live subscribers, so a case can fire a real host-side notification. */
-      listeners: () => [...subs],
+      listeners: (name = SLOT_ROW_MENU) => [...(subs.get(name) ?? [])],
     },
   }
 }
@@ -6312,13 +6431,26 @@ function makeRowMenuSlots() {
 {
   const sc = officialUiScaffold({ hostRowMenu: false })
   const slots = makeRowMenuSlots()
+  const host = slots.entries[0]
+  const original = { ...host, options: { ...host.options } }
   const run = await runBundle(sc, { pinned: [], slots: slots.registry })
 
   assert.deepEqual(
     slots.entries.map(e => e.options.id),
-    ['pin', OFFICIAL_COLOR_ID],
-    'a NEW namespaced id, added beside the host entry — never a shadow of it',
+    ['pin', OFFICIAL_COLOR_ID, 'pin', 'dsh-session-top.super-pin'],
+    'colour, an ordinary-pin shadow and a namespaced super-pin action accompany the preserved host entry',
   )
+  const ordinary = slots.registry.entriesOfSlot(SLOT_ROW_MENU).find(e => e.options.id === 'pin')
+  assert.notEqual(ordinary, host, 'the lower-priority shadow wins the same pin cell')
+  assert.equal(ordinary.options.priority, (host.options.priority ?? 0) - 1)
+  assert.equal(ordinary.options.order, host.options.order)
+  assert.throws(
+    () => slots.registry.register({ ...host.options, id: 'another-pin', key: 'pin' }, host.component),
+    /at priority 0/, 'the same cell at the same priority is still rejected, even under another id',
+  )
+  const superPin = slots.entries.find(e => e.options.id === 'dsh-session-top.super-pin')
+  assert.equal(superPin.options.order, host.options.order + 10)
+  assert.equal(superPin.options.locale, host.options.locale)
   const ours = slots.entries.find(e => e.options.id === OFFICIAL_COLOR_ID)
   assert.equal(ours.options.order, 500, 'and it reads after EVERY one of the host\'s own items (pin 100, rename 200, fork 300, archive 400), so it never wins a tie')
   assert.equal(ours.options.locale, 'dsh-ui-sidebar', 'the host\'s locale namespace is kept, so its other keys still translate')
@@ -6329,6 +6461,8 @@ function makeRowMenuSlots() {
   const props = ours.inject(S1, 'one')
   assert.deepEqual(slots.businessRpc, [], 'injection must not touch a pin RPC')
   const rendered = ours.component(props)
+  assert.deepEqual(slots.injectCalls, [[S1, 'one']], 'the original injector receives every argument exactly once')
+  assert.deepEqual(slots.componentCalls, [S1], 'the original component renders exactly once')
   assert.equal(rendered.label, OFFICIAL_COLOR_LABEL, 'the host\'s own component, with OUR label for its two keys')
   assert.equal(props.t('menu.pinSession'), 'host:menu.pinSession', 'every other key still reaches the host\'s translator')
   // Fixed hook order, one call each — the contract the real component relies on
@@ -6378,10 +6512,108 @@ function makeRowMenuSlots() {
   )
 
   run.dispose()
-  assert.deepEqual(slots.entries.map(e => e.options.id), ['pin'], 'dispose takes the item back out')
-  assert.equal(slots.entries[0].options.order, 100, 'and leaves the host\'s entry exactly as it was')
+  assert.deepEqual(slots.entries, [host], 'dispose removes all plugin entries and preserves the original host object')
+  assert.deepEqual(host, original, 'and leaves the host\'s component, injector and options exactly as they were')
+  assert.equal(slots.registry.entriesOfSlot(SLOT_ROW_MENU)[0], host, 'the original pin cell becomes visible again')
   assert.equal(slots.registry.listenersFor(), 0, 'and releases the slot watch')
-  console.log('✔ official row menu: a namespaced colour item beside the host\'s own Pin entry, and nothing else touched')
+  console.log('✔ official row menu: colour plus ordinary/super registrations preserve the original host pin cell')
+}
+
+// --- pin choices use the winning host cells and retain the original hook contract.
+{
+  const sc = officialUiScaffold({ hostRowMenu: false })
+  const slots = makeRowMenuSlots()
+  const host = slots.entries[0]
+  const run = await runBundle(sc, { pinned: [], mutable: true, slots: slots.registry })
+  const staleActions = []
+  const steps = [
+    { labels: ['普通置顶', '超级置顶'], select: '普通置顶', pinned: [S1], absolute: [], calls: [['pin', S1]] },
+    { labels: ['取消置顶', '超级置顶'], select: '超级置顶', pinned: [S1], absolute: [S1], calls: [['pin', S1]] },
+    { labels: ['取消超级置顶（保留普通置顶）'], select: '取消超级置顶（保留普通置顶）', pinned: [S1], absolute: [], calls: [['pin', S1]] },
+    { labels: ['取消置顶', '超级置顶'], select: '取消置顶', pinned: [], absolute: [], calls: [['pin', S1], ['unpin', S1]] },
+    { labels: ['普通置顶', '超级置顶'], select: '超级置顶', pinned: [S1], absolute: [S1], calls: [['pin', S1], ['unpin', S1], ['pin', S1]] },
+    { labels: ['取消超级置顶（保留普通置顶）'], select: '取消超级置顶（保留普通置顶）', pinned: [S1], absolute: [], calls: [['pin', S1], ['unpin', S1], ['pin', S1]] },
+    { labels: ['取消置顶', '超级置顶'], select: '取消置顶', pinned: [], absolute: [], calls: [['pin', S1], ['unpin', S1], ['pin', S1], ['unpin', S1]] },
+  ]
+  for (const step of steps) {
+    slots.state.pinned = new Set(run.live.pinned)
+    const actions = []
+    for (const entry of slots.registry.entriesOfSlot(SLOT_ROW_MENU).sort((a, b) => a.options.order - b.options.order)) {
+      slots.hookCalls.length = 0
+      slots.injectCalls.length = 0
+      slots.componentCalls.length = 0
+      const props = entry.inject(S1, 'one')
+      const rendered = entry.component(props)
+      assert.deepEqual(slots.injectCalls, [[S1, 'one']], `${entry.options.id} injects exactly once`)
+      assert.deepEqual(slots.componentCalls, [S1], `${entry.options.id} calls the original component exactly once, including a hidden super item`)
+      assert.deepEqual(slots.hookCalls, [['useMenuOpenState'], ['usePinned'], ['useArchived']], `${entry.options.id} calls the original hooks exactly once in order`)
+      assert.equal(props.t('menu.pinSession'), 'host:menu.pinSession', 'rendering never mutates the injected translator')
+      if (rendered === null) continue
+      staleActions.push(rendered.onSelect)
+      if (entry.options.id !== OFFICIAL_COLOR_ID) actions.push(rendered)
+    }
+    assert.deepEqual(actions.map(item => item.label), step.labels, 'the stock menu offers only the actions valid for this pin tier')
+    slots.state.open = true
+    actions.find(item => item.label === step.select).onSelect()
+    assert.equal(slots.state.open, false, 'the original component closes the host menu before dispatching its action')
+    await afterDispatch()
+    await settle()
+    assert.deepEqual(run.live.pinned, step.pinned, `${step.select} preserves the required official membership`)
+    assert.deepEqual(JSON.parse(run.store.get(absoluteKey) ?? '[]'), step.absolute, `${step.select} updates only the super tier when demoting`)
+    assert.deepEqual(run.pinCalls, step.calls, 'promotion of an ordinary pin and demotion must not issue another official pin RPC')
+    assert.deepEqual(slots.businessRpc, [], 'the original injected RPCs never bypass the workspace controller')
+    assert.equal(dialogOf(sc), null, 'pin actions do not open a colour dialog')
+  }
+
+  slots.state.archived.add(S1)
+  for (const entry of slots.registry.entriesOfSlot(SLOT_ROW_MENU)) {
+    slots.hookCalls.length = 0
+    slots.injectCalls.length = 0
+    slots.componentCalls.length = 0
+    assert.equal(entry.component(entry.inject(S1, 'one')), null, 'every official action remains hidden for archived sessions')
+    assert.deepEqual(slots.injectCalls, [[S1, 'one']])
+    assert.deepEqual(slots.componentCalls, [S1])
+    assert.deepEqual(slots.hookCalls, [['useMenuOpenState'], ['usePinned'], ['useArchived']], 'archived renders retain the same single-call hook order')
+  }
+  slots.state.archived.clear()
+  const pinCalls = [...run.pinCalls]
+  const writes = [...run.storageCalls.writes]
+  const pinned = [...run.live.pinned]
+  const subscribers = slots.registry.listeners()
+  run.dispose()
+  for (let repeat = 0; repeat < 3; repeat += 1) {
+    for (const action of staleActions) action()
+    for (const cb of subscribers) cb()
+    await afterDispatch()
+  }
+  assert.deepEqual(run.pinCalls, pinCalls, 'repeated stale pin callbacks after dispose cannot issue an RPC')
+  assert.deepEqual(run.live.pinned, pinned)
+  assert.deepEqual(run.storageCalls.writes, writes, 'repeated stale super and colour callbacks cannot persist anything')
+  assert.deepEqual(slots.businessRpc, [])
+  assert.equal(dialogOf(sc), null, 'stale colour actions cannot reopen a dialog after dispose')
+  assert.deepEqual(slots.entries, [host], 'stale registry notifications cannot republish plugin entries')
+  assert.equal(slots.registry.entriesOfSlot(SLOT_ROW_MENU)[0], host)
+  assert.equal(slots.registry.listenersFor(), 0)
+  assert.equal(run.liveTimers().length, 0, 'stale actions cannot leave a reconcile timer after dispose')
+  console.log('✔ official row menu: tier transitions, direct super pin, hook order, archived sessions and repeated stale actions')
+}
+
+// A rendered demotion cannot turn into a full unpin after a foreign tier update.
+{
+  const sc = officialUiScaffold({ hostRowMenu: false })
+  const slots = makeRowMenuSlots()
+  const run = await runBundle(sc, { pinned: [S1], mutable: true, slots: slots.registry, storageSeed: { [absoluteKey]: JSON.stringify([S1]) } })
+  slots.state.pinned.add(S1)
+  const entry = slots.registry.entriesOfSlot(SLOT_ROW_MENU).find(one => one.options.id === 'pin')
+  const action = entry.component(entry.inject(S1, 'one'))
+  assert.equal(action.label, '取消超级置顶（保留普通置顶）')
+  writeFromOtherWindow(run, absoluteKey, '[]')
+  await settle()
+  action.onSelect()
+  await settle()
+  assert.deepEqual(run.live.pinned, [S1], 'stale official demotion retains ordinary membership')
+  assert.deepEqual(run.pinCalls, [], 'stale official demotion sends no unpin RPC')
+  run.dispose()
 }
 
 // --- the host's OWN Pin entry registers LATE, then goes away again.
@@ -6389,8 +6621,8 @@ function makeRowMenuSlots() {
 // The previous case only proved the plugin did not throw against an EMPTY slot.
 // Apply order is not knowable — the plugin can mount before the host's own
 // registrations land — so what has to hold is the watch: the entry appears, the
-// colour item follows it, the entry is withdrawn, and the colour item leaves
-// with it instead of being stranded in a slot nobody renders.
+// colour and pin actions follow it, the entry is withdrawn, and those actions
+// leave with it instead of being stranded in a slot nobody renders.
 {
   const sc = officialUiScaffold({ hostRowMenu: false })
   const slots = makeRowMenuSlots()
@@ -6403,8 +6635,8 @@ function makeRowMenuSlots() {
   slots.entries.push(hostEntry)
   for (const cb of [...slots.registry.listeners()]) cb()
   assert.deepEqual(
-    slots.entries.map(e => e.options.id), ['pin', OFFICIAL_COLOR_ID],
-    'a host entry that arrives late is still picked up',
+    slots.entries.map(e => e.options.id), ['pin', OFFICIAL_COLOR_ID, 'pin', 'dsh-session-top.super-pin'],
+    'a host entry that arrives late gets colour and both pin actions',
   )
   const late = slots.entries.find(e => e.options.id === OFFICIAL_COLOR_ID)
   const lateProps = late.inject(S1, 'one')
@@ -6415,12 +6647,12 @@ function makeRowMenuSlots() {
   assert.ok(dialogOf(sc) !== null, 'the late-registered item works like any other')
   buttonOf(dialogOf(sc), 'data-stp-color-cancel').click()
 
-  // And when the host withdraws its own entry, the colour entry goes too.
+  // And when the host withdraws its own entry, all three plugin entries go too.
   slots.entries.splice(slots.entries.indexOf(hostEntry), 1)
   for (const cb of [...slots.registry.listeners()]) cb()
   assert.deepEqual(
     slots.entries.map(e => e.options.id), [],
-    'the colour entry does not outlive the host entry it is derived from',
+    'none of the plugin entries outlives the host entry it is derived from',
   )
   run.dispose()
   console.log('✔ official row menu: a host entry arriving late is picked up, and withdrawn with it')
@@ -6900,7 +7132,7 @@ function importantOf(css, selector) {
   assert.ok(menuItemDecls['min-height'] !== undefined, 'the fallback menu items must be styled, not left to the UA')
   assert.equal(menuItemDecls['min-height'], '24px', 'a menu row is still a click target')
   assert.equal(menuItemDecls['background'], 'transparent', 'and it is not a filled default button')
-  for (const selector of ['[data-stp-menu] [data-stp-pin-item]', '[data-stp-menu] [data-stp-color-item]']) {
+  for (const selector of ['[data-stp-menu] [data-stp-pin-item]', '[data-stp-menu] [data-stp-absolute-item]', '[data-stp-menu] [data-stp-color-item]']) {
     assert.ok(
       rulesOf(css).every(r => !r.selector.split(', ').includes(selector)
         || r.selector === menuItemRule.selector

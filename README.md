@@ -21,17 +21,18 @@ ZCode 风格的会话列表 for DeepSeek Harness 0.2.x：会话有新活动就�
 也会触发上浮。活动接口不可用时退回宿主摘要；初次加载或同批更新按活动时间比较新旧。
 这层临时展示不写入置顶集合，与原有的工作区活动重排分开。
 
-**普通置顶按最近活动排序，超级置顶独立显示在它上方。** 初次加载即比较已有的活动
-时间，不必等待下一次运行。行尾「−」取消普通置顶，「+」设为普通置顶；星标设置或取消
-超级置顶。普通未置顶会话会先通过官方 pin 接口置顶，成功后才设置超级置顶。
+**两级置顶各自按最近活动排序，超级置顶独立显示在普通置顶上方。** 初次加载即比较
+已有的活动时间，新会话也可按创建时间入序。行尾「+」设为普通置顶；超级区的「−」和星标
+都先降为普通置顶，普通区的「−」才取消置顶。右键未置顶会话可选择「普通置顶」或
+「超级置顶」；未置顶会话先通过官方 pin 接口置顶，成功后才设置超级置顶。
 置顶集合仍由宿主保存，星标只在本浏览器的 `localStorage`
 （`dsh-session-top:absolute-pins`）记录该集合内的优先级；同源窗口会同步，
 不承诺跨浏览器或跨设备同步。再次点击星标只取消绝对优先，保留普通置顶；
 取消普通置顶也会清除超级置顶记录，之后重新置顶不会恢复旧的超级优先级。
 
 **当前选中行显示红色。** 选中底色覆盖运行状态和自定义底色，运行文字与边标仍保留。
-Windows 打包桌面版的任务栏与托盘图标显示为深蓝色（`#1e3a8a`）实心圆；插件停用或
-Host 退出时恢复原图标。仅对已验证的桌面 Host 及其直接 Electron 父进程生效，命令行
+Windows 打包桌面版的任务栏与托盘图标显示为全白实心方块，每个像素均为不透明白色；
+插件停用或 Host 退出时恢复原图标。仅对已验证的桌面 Host 及其直接 Electron 父进程生效，命令行
 和其他平台不修改图标。后续 Explorer 重启、窗口重建或 DPI 变化需重新加载插件。
 
 **双击会话标题可行内改名。** Enter 保存，提交前去掉首尾空白（`trim`），
@@ -60,7 +61,7 @@ Host 退出时恢复原图标。仅对已验证的桌面 Host 及其直接 Elect
 | # | 验收标准 | 实现位置 |
 |---|---|---|
 | 1 | **工作区活动重排**：有新活动的 session 上浮到所属工作区顶部；绝对优先仍优先于顶部区域的活跃顺序 | `src/index.js` 的 `onSessionEvent` 记录活动时间 → `reorderSessions()` 通过官方 `workspace.insertSessionBefore` 把该 session 上浮到所属工作区账户顶部。算法在 `src/core.js` 的 `planFloatToTop`。 |
-| 2 | **右键置顶**：右键会话行出「置顶该会话」/「取消置顶」 | `src/client.js` 的 `registerSharedMenu`（发布进共享扩展表，由 owner 渲染）+ `onContextMenu` / `openMenu`（owner 不在场时的自有兜底菜单，在光标处弹出）。 |
+| 2 | **右键置顶**：未置顶可选「普通置顶」和「超级置顶」；超级置顶取消后保留普通置顶 | `src/client.js` 的 `registerSharedMenu`（发布进共享扩展表，由 owner 渲染）+ `onContextMenu` / `openMenu`（owner 不在场时的自有兜底菜单，在光标处弹出）。 |
 | 3 | **顶部区域**：置顶及临时运行会话抽出工作区，顶部平铺且分组内不重复；未置顶的运行会话完成后回到原分组。所有原生区段、分组和目录默认收起，仅手动激活各自表头才允许展开；点击顶部会话不会展开原分组 | `src/client.js` 的 `renderRegion`（平铺渲染）+ `applyPinRules`（样式表规则隐藏分组内的原行）+ `reconcileGroups`（折叠分组）。 |
 | 4 | **取消置顶**：没有自身或子代理执行时移出顶部区域，回到原工作区分组；仍在执行则保留为临时运行行 | 同一套 `reconcile`：仅在置顶和临时运行集合都不再包含该会话时恢复原行；分组保留用户手动选择，取消置顶不会自动展开目录。 |
 | 5 | **持久化**：置顶状态跨重启保留 | 置顶集合直接用宿主已有的 registry 全局 pin 集（`workspaceRegistry.pinnedSessionIds`），经官方 `workspaces.pinSession` / `unpinSession` RPC 写入。宿主自己落盘，插件不存第二份置顶集合；星标优先级另存本浏览器 `localStorage`。 |
@@ -110,7 +111,7 @@ Host 退出时恢复原图标。仅对已验证的桌面 Host 及其直接 Elect
 `test/core.test.js` 里 `planFloatToTop preserves the relative order of the rest`
 就是守这一条。
 
-### 为什么没有挂 slot（有意为之）
+### 为什么顶部区域不挂 slot（有意为之）
 
 官方侧栏**已经自带**置顶：`sidebar.workspaces.session.menu.item` 里 order 100
 的置顶行，写的是同一个 Host pin 集。再注册一条就是同一个动作出现两次。
@@ -124,7 +125,7 @@ Host 退出时恢复原图标。仅对已验证的桌面 Host 及其直接 Elect
 
 所以这里 DOM 层是正确工具，代码里把每一处 DOM 操作都收窄并加了守卫。
 
-唯一的例外是**只读影子**：别的插件（`dsh-session-pin`）在
+现有 slot 的适配另行处理。**置顶计数影子**：别的插件（`dsh-session-pin`）在
 `sidebar.footer.action` / `shell.overlay` 上挂着自己的置顶计数和面板，
 它数的是自己的私有 store，于是顶部 5 条、底部却写「(2)」。这里对这两条
 entry 各注册一条低一档 priority 的影子，复用原 component 和原 inject，
@@ -176,7 +177,7 @@ entry 各注册一条低一档 priority 的影子，复用原 component 和原 i
 | 会话列表容器 | `[role="tree"]`（`.dcu-wb-tree`，**无** aria-label） | `[role="tree"][aria-label]`（label = `t('section.sessions')`） |
 | 置顶隐藏规则 | `[role='tree'] [data-dcu-session="<id>"]` | `[role='tree'] [data-row-key='session:<id>']` |
 | 主题 token | `--dcu-sidebar-*` | `--dsh-*` |
-| 右键菜单 | 宿主自己的 `sessionMenuItems()`，**没有**置顶项，也加不进去 | `sidebar.workspaces.session.menu.item`，有官方 `pin` 行；本插件在旁边加 `dsh-session-top.row-color`（order 500） |
+| 右键菜单 | 共享 owner 已注册时保留完整菜单；否则已验证的会话行用插件分级置顶菜单。原生 `sessionMenuItems()` 无置顶项，也无扩展入口 | `sidebar.workspaces.session.menu.item`；本插件接入分级置顶并加 `dsh-session-top.row-color`（order 500） |
 
 ### 侧栏上另外几件实际行为
 
@@ -211,25 +212,23 @@ FLAT 视图根本没有目录）、且侧栏不在 56px 窄栏态——按宿主
 这条）。codex-ui 每个工作区一个 `.dcu-wb-project`，没有一个装着它们全部的座位，所以不
 提供这一层；但它的**每个目录**默认收起照常生效，因为那条规则只需要各自的分组表头。
 
-**官方侧栏的右键直接复用宿主自己的菜单。** 官方行的入口是 "…" 按钮菜单，所以插件不
-改写那份菜单：右键时把宿主那一行临时挪到指针下、点它自己的 "…"，弹出的就是宿主原生
-那一整份（置顶/取消置顶、重命名、分叉会话、归档会话、复制 Session ID），置顶不出现
-第二份。宿主行因为分组折叠而不存在时，先用分组表头把它展开出来；仍然拿不到才退回
-插件自有的单项菜单。菜单关闭、第二次右键、卸载，都会把临时样式和只有插件展开过的那个
-分组还回去。codex-ui 有自己的原生右键菜单，只观察、不抢。
+**官方侧栏的右键复用宿主菜单，并接入分级置顶。** 官方行的入口是 "…" 按钮菜单；
+右键时临时把宿主行挪到指针下，点它自己的 "…"，保留重命名、分叉、归档、复制 Session ID
+等原生动作。宿主行因分组折叠而不存在时，先临时展开分组；仍拿不到才退回插件分级置顶菜单。
+菜单关闭、第二次右键或卸载时，还原临时样式与插件展开的分组。codex-ui 的已验证会话行仅在
+共享 owner 未注册时由插件接管；owner 已注册时保留其完整菜单，未知行不干预。
 
 **颜色菜单入口在哪、哪没有。** 这取决于这一版装了什么菜单 owner，**不是所有右键都有
 颜色项**，说清楚边界：
 
 - **官方侧栏（有 host session row）**：本插件通过公开 slot
   `sidebar.workspaces.session.menu.item` 注册一个**独立命名的**新条目
-  （id `dsh-session-top.row-color`，order 450，排在宿主自己 order 100 的置顶项之后），
-  复用宿主的 `PinSessionMenuItem` 组件和 `inject`。结果就是**宿主那一整份菜单照旧**，后面
-  多出第六项「自定义行背景颜色…」。宿主自己的置顶项**一个字都没改**：不 shadow、不替换、
-  不改 order，它晚到、被换掉或被撤销时，颜色项跟着它的宿主项走。
+  （id `dsh-session-top.row-color`，order 500），复用宿主的 `PinSessionMenuItem` 组件和
+  `inject`。原有 Pin 单元由优先级更高的视图接入分级取消，另加「超级置顶」；其他原生动作
+  保留。原注册不被修改或移除，卸载后恢复；宿主项晚到、替换或撤销时，附加条目跟随它。
 - **装了共享 owner（`@baihejiangnan/dsh-session-context-menu`）**：走共享扩展表，
   它渲染进 owner 自己的菜单。
-- **两者都没有的行**：只剩插件自有的 fallback 菜单（置顶 + 颜色两项）和置顶行尾的色点。
+- **两者都没有的行**：只剩插件自有的 fallback 菜单（普通/超级置顶与颜色；超级区只提供降级与颜色）和置顶行尾的色点。
 
 宿主的归档会话上不提供颜色项——这是宿主组件自己的契约（archived 返回 null），不是
 本插件加的限制。
@@ -324,37 +323,23 @@ client 侧在 `globalThis[Symbol.for('dsh.session-context-menu.extensions')]` �
 `[data-menu-material]` 菜单面往里嫁接节点——owner 根本不用那套标记，于是在真机
 上每行右键都匹配到零个菜单面，什么也没发生。
 
-事件归属**不看注册表**。表在 owner 卸载后仍然存在（lease 归零但还有条目时表不
-删），`api.list()` 里能看到我们自己的 id，这只能证明条目在，不能证明 owner 活着。
-所以归属按**事件实际发生了什么**判定：
+**注册状态和事件认领分开判断。** codex-ui 的已验证会话行在没有已注册的共享 owner 时，
+由插件接管并打开分级置顶菜单。`sharedMenuServing(sharedMenuApi())` 每次检查条目和
+owner 的实时租约；旧 owner 缺少租约接口时保留事件认领降级。未知行、未知 flavor 和已经
+`defaultPrevented` 的手势不接管。
 
-- owner 声称手势的方式是它在自己的 document 捕获监听里 `preventDefault()` +
-  `stopPropagation()`；
-- 我们在同一个节点同一个阶段，轮到本 handler 时无法知道它的监听是已经跑过还是
-  排在注册序前面。
+官方侧栏宿主行的兜底**延后一个微任务**，等整轮 dispatch 完成后再读 `defaultPrevented`。
+owner 的 document 捕获监听会调用 `preventDefault()` + `stopPropagation()`，因此无论
+监听顺序如何，只要 owner 已认领，插件就不再开菜单。注册表可能在 owner 卸载后留存，
+条目存在本身不等于有人处理了事件。
 
-因此自己的兜底菜单**延后一个微任务**（在整轮 dispatch 之后）打开，且只在事件到
-那一刻仍 `defaultPrevented === false` 时才开。这同时覆盖 owner 先监听、owner 后
-监听、owner 卸载后我们的条目留在表里、owner 从未加载四种情形；owner 在场时它先
-`preventDefault`，我们的兜底什么都不做，两边不会同时开菜单，空白区域也永远不会被
-认领。
+**置顶行转发到同一会话的真实宿主行。** codex-ui 没有已注册的共享 owner 时直接开插件
+菜单；owner 已注册时转发，让 owner 保留完整动作并渲染分级置顶、颜色条目。官方侧栏则
+优先借用自己的「…」菜单。转发是否有人认领仍看转发事件的 `defaultPrevented`，
+不是看宿主行是否存在；无人认领或无法转发时才走对应兜底。
 
-**置顶行自己被右键时，判据换成"转发出去的事件本身"。** 区域行不是宿主行，
-codex 不会为它开菜单，所以这里的归属只有两个来源：转发到该会话真实宿主行上的
-那一轮 dispatch 里，谁调用了 `preventDefault()`。转发**送达**不等于有人**认领**
-——宿主行存在只说明送得出去。所以 `redispatchContextMenu` 返回事件对象而不是
-成功标志，`openOwnRowMenu` 在同一个微任务回调里读它的 `defaultPrevented`：
-owner 认领 → 只有 owner 的完整菜单；codex 自己的会话行处理器认领
-（`dsh-codex-ui/lib/client.js:4617`，同步 `preventDefault` + `stopPropagation`）
-→ 宿主菜单原样保留；**没有任何人认领** → 退到本插件的置顶/取消置顶菜单。
-连重投递都构造不出来（没有 `MouseEvent` 或宿主行拒绝）时同样退到兜底：那说明
-既没人服务这次右键、也不可能有人服务，此时"因为宿主行在所以不动"是把右键丢在
-地上。普通宿主行的 codex 原生门（`nativeContextMenu`）保持不变，仍然只观察。
-
-`test/shared-menu.mjs` 直接照抄 0.2.14 的 `ownerRegistry()` 与它的
-`onContextMenu` 来驱动真 bundle，逐条验证上表（含 owner 卸载后接管、owner 晚加载、
-owner 先加载、owner 重载）；`test/sidebar-dom.mjs` 对两种侧栏各建一套骨架 DOM，
-验证上表其余各行。
+`test/shared-menu.mjs` 覆盖 owner 先加载、晚加载、卸载与重载；
+`test/sidebar-dom.mjs` 覆盖两种侧栏的已知行、未知行与菜单交接。
 
 **菜单内容随 owner 版本变化，测试按 sha256 钉版本。** v0.2.14 的 tagged 产物菜单里
 **没有**「删除会话」；未发布的 main 才加了
@@ -437,62 +422,30 @@ ctx.inject(['workspaces'], (child) => mount(child, warn))
 `test/core.test.js` 里有一条静态拦截：源码里出现 `insertRule` / `deleteRule` /
 `cssRules` 就失败。
 
-## 右键：codex-ui 的宿主菜单不能借——但装了共享 owner 时借得更值
+## 右键：codex-ui 与共享 owner
 
-codex-ui 的行菜单是 `SessionRow` 的一个 **prop**，由它自己的 `sessionMenuItems()`
-现场拼出来（`@michengai/dsh-codex-ui` lib/client.js:1757-1836），**不是**
-`sidebar.workspaces.session.menu.item` 那张 slot 表。条目是重命名 / 标记为未读 /
-归档 / 分叉 / 在资源管理器中打开 / 项目 / 复制会话 ID / 复制会话标题 /
-复制工作目录（注册表允许时还有删除）——**没有取消置顶，也没有自定义行背景颜色**，
-而且加不进去：codex-ui 自己以 `priority: -1` 抢占了 `sidebar.workspaces` 这个
-`single` slot（`ui-slots/src/index.ts` 的 `entriesOfSlot`：每个 cell 只返回第一个
-存活条目），官方那个**声明了 `session.menu.item` 并注册 `pin` 行**的
-`WorkspaceBrowser` 因此从不挂载，那张列表没有任何渲染者；本插件注册进同一张
-列表的颜色项也同样注册成功、没人画。
+codex-ui 的行菜单由 `SessionRow` 的 `sessionMenuItems()` prop 生成，
+不读取 `sidebar.workspaces.session.menu.item`，也没有普通/超级置顶与行颜色入口。
+因此已验证的原生会话行在共享 owner 未注册时由插件接管，打开分级置顶与颜色菜单；
+未知行原样放行。
 
-**所以「有没有共享 owner 在场」决定走哪条路，这是承重的，不是可有可无的：**
+共享 owner 已注册时，宿主行和顶部置顶行都保留 owner 的完整菜单。owner 自己构建
+`.dshcm-menu`，再从共享扩展表读取本插件的分级置顶和颜色条目；不向菜单 DOM 嫁接节点。
+双击标题的行内改名仍通过公开会话重命名接口。
 
-- **owner 不在场** → 自有置顶行的右键**不转发**宿主行，直接 `openMenu` 开自己的
-  菜单（取消置顶 + 自定义行背景颜色…）。转发在这个宿主上买到的是一条**缺了这两项**
-  的菜单，而自己的菜单正好只有这两项。
-- **owner 在场** → **仍然转发**，因为共享 owner
-  （`@baihejiangnan/dsh-session-context-menu`）**根本不用那张 slot 表**：它自己
-  从零拼一个 `.dshcm-menu`，并从
-  `Symbol.for('dsh.session-context-menu.extensions')` 里读本插件注册进去的条目。
-  于是在**同一个 codex 宿主**上，它的菜单同时有宿主动作（重命名 / 归档…）
-  **和**取消置顶**和**行颜色——比上面两个选项都多。此时短路转发只会白白拿走这些。
-  判据用 `sharedMenuRegistered(sharedMenuApi())`，读 owner 自己的 `list()`，
-  不是记住注册时的状态，所以 owner 卸载后自动退回「不转发」那一支。
+owner 原先按标题解析会话，重名可能丢失会话动作。仓库提供可复现补丁，修改
+`@baihejiangnan/dsh-session-context-menu` 的 `resolveSession`：先用
+`data-dcu-session` 或 `data-row-key="session:<id>"` 精确查找，再在没有显式 ID 时按标题回退。
+显式 ID 无效就返回空，不再按标题猜测；重名但 ID 有效的行保留完整菜单。补丁还暴露
+`active()` 读取 owner 的现有租约，卸载后即使扩展表仍在，原生行和顶部行也恢复分级置顶菜单。
 
-普通未置顶的宿主行在两种情况下都仍然只观察、不抢——那条菜单有八九项能用的动作，
-本插件替换不了。官方侧栏（`nativeContextMenu: false`）不受影响，仍然转发，菜单里
-同时有官方 `pin` 行和本插件的颜色项。
+```bash
+node scripts/patch-context-menu.mjs "<path to owner lib/client.js>"
+```
 
-这两个半边都有断言：`test/sidebar-dom.mjs` 钉「owner 不在场」，
-`test/owner-menu-real.mjs` 拿**真实 owner 产物**钉「owner 在场」（它断言的正是
-自有菜单**不得**出现、必须由 owner 建出完整菜单）。只钉一半，就是上一版把
-owner 集成改坏的那条路。
-
-仍然**不向宿主菜单 DOM 嫁接节点**，宿主菜单里的重命名 / 归档 / 分叉保持原样。
-双击标题的行内改名另走公开会话重命名接口。
-
-## 右键：宿主行那一支只观察，不碰事件
-
-真机上 codex-ui 的行菜单**不再打开**（`[role=menu]` count=0）。React 是把监听
-挂在 **root 容器**上的（委托），所以只要事件在 document 捕获阶段被打断
-（`stopPropagation` 之类），React 根本收不到，菜单永远不开。
-
-现在宿主行的分支在 `return` 之前**完全不碰 `event`** —— 不 preventDefault、
-不 stopPropagation、不 stopImmediatePropagation，事件原样放行，插件只是观察。
-
-追加逻辑也收紧了：只碰**右键之后才出现**的菜单面。右键之前就已经开着的菜单
-（设置弹层、侧栏导航）属于别人，往别人的 React 菜单里塞外来节点正是「把宿主
-搞坏」的典型方式。
-
-`test/sidebar-dom.mjs` 用一个挂在 tree 上的哨兵监听器模拟 React root，
-断言事件仍然能到达它；`test/core.test.js` 另有一条静态拦截：own-menu 分支之前
-出现任何事件中断调用就失败（这条第一版只检查 `if` 分支内部，会漏掉「放在
-分支上面」的中断，我实测复现后才补上）。
+将参数替换为 owner 的实际客户端路径。脚本先备份原文件，并用上游 SHA-256 钉住支持的版本；
+不对生命周期做 monkeypatch。`test/owner-menu-real.mjs` 验证真实 owner 的完整菜单与会话归属，
+`test/sidebar-dom.mjs` 验证无 owner 时的已知原生行接管及未知行放行。
 
 ## flavor 必须惰性探测（装机实测踩过两次）
 
@@ -516,42 +469,24 @@ owner 集成改坏的那条路。
 
 ## 右键：事件归属规则
 
-右键处理路径只有两处可以中断事件，写在同一处并逐条列明前置条件：
+按下表顺序判断；只有明确识别的会话行可以接管。
 
 | # | 条件 | 行为 | 是否碰 event |
 |---|---|---|---|
-| 1 | 事件到达时 `defaultPrevented` 已为 true | **只观察**（owner 或别人已经接手） | 否 |
-| 2 | `closest('[data-stp-row]')` 命中 | 转发宿主行（官方侧栏，或 codex 宿主且共享 owner 在场）/ 立即开自己的菜单（其余情况） | **是**（自有行，没有宿主菜单竞争） |
-| 3 | `flavor === null` | **只观察** | 否 |
-| 4 | 解析出宿主的 session 行，且 dispatch 结束时仍无人处理 | 延后一个微任务开自己的兜底菜单 | **是**（dispatch 之后） |
+| 1 | 事件到达时 `defaultPrevented === true` | 保留已经打开的菜单 | 否 |
+| 2 | 命中 `[data-stp-row]` | 官方侧栏借用宿主菜单；codex 有已注册 owner 时转发，否则打开插件菜单 | 是 |
+| 3 | 未知 flavor、未知行，或 codex 原生行 ID 不在当前会话列表 | 原样放行 | 否 |
+| 4 | 已验证的 codex 原生会话行，且共享 owner 未注册 | 打开插件分级置顶菜单 | 是 |
+| 5 | 已验证的官方侧栏宿主会话行 | dispatch 后仍无人认领时，借用官方「…」菜单或打开兜底菜单 | 是，仅无人认领时 |
 
-第 2 条里的「转发」在两种宿主上会发生，各有各的理由：
+第 4 条保证未置顶会话也能选择「普通置顶」和「超级置顶」。共享 owner 已注册时不会用
+插件菜单覆盖其完整菜单；转发后的手势同样以该事件的 `defaultPrevented` 为认领依据。
+React 在 root 容器委托监听，所以未知行不调用 `preventDefault()`、`stopPropagation()`
+或 `stopImmediatePropagation()`。空白区域也不接管。
 
-- **官方侧栏**：宿主菜单由 `sidebar.workspaces.session.menu.item` 渲染，`pin` 行
-  就在里面，本插件再把 `pinSession`/`unpinSession` 两个回调换成颜色对话框，于是同
-  一条菜单里既有官方的置顶/取消置顶、也有本插件的 `自定义行背景颜色…`。
-- **codex 宿主，且共享 owner 在场**：owner 自己建菜单、且从共享表读到本插件的
-  两个条目，比宿主那条多得多，理由见上一节。
-
-codex 宿主**没有 owner 时**不走转发：它的菜单里既没有这两项、也加不进去，
-转发只会买到一条更差的菜单。
-
-在**转发**这条路上，判据同第 1、4 条但作用在**转发出去的**那个事件上：谁
-`preventDefault()` 就是谁认领，无人认领才落到置顶/取消置顶兜底菜单，连事件都发
-不出去也落到兜底。"宿主行存在"不是认领。
-
-React 把监听挂在 **root 容器**上，所以捕获阶段任何中断都会让宿主菜单永远
-打不开 —— codex-ui 的行菜单因此死过两次。现在「不认识 = 只观察」，不做任何
-事件修改、不开自己的菜单。owner 在场时它自己 `preventDefault`，第 4 条就永远
-不触发；owner 不在场（或卸载后条目还留在它的表里）时第 4 条接管。
-
-`test/sidebar-dom.mjs` 用挂在 tree 上的哨兵监听器模拟 React root，断言事件
-仍然能到达；另有行为测试：flavor none 完全不干预、区域行不带宿主标记、
-侧栏晚于插件渲染时仍被正确识别、以及 `MutationObserver` 静止一秒零突变且行节点
-身份不变（这些我都注入回归验证过会失败）。归属的四种时序在
-`test/shared-menu.mjs` 里对着 0.2.14 的真实 owner 代码逐条验证；转发后"有人认领
-/ 没人认领 / 构造不出事件 / 已卸载"四种判据在
-`test/owner-menu-real.mjs` 里对着两个未修改的真实 owner 产物逐条验证。
+`test/sidebar-dom.mjs` 覆盖已知原生行接管、未知行到达 React root 哨兵、官方菜单交接、
+flavor 惰性探测及卸载清理；`test/shared-menu.mjs` 和 `test/owner-menu-real.mjs`
+覆盖加载顺序、完整 owner 菜单、分级置顶与重名会话归属。
 
 ## 降级契约
 
@@ -716,7 +651,7 @@ npm test        # 单元测试 + bundle 冒烟 + 真实 cordis 激活 + 双侧�
 - `test/sidebar-dom.mjs`：两种侧栏骨架；**先让 apply 在服务
   publish 之前跑**（复现真机时序）；flavor none 只观察；区域行不带宿主标记；
   只在宿主自己的行没挂载时也不误判；**侧栏晚渲染仍能正确识别**；
-  右键事件到达 React root 哨兵；只追加新出现的菜单面；隐藏规则、静态样式存活、
+  无 owner 时已知原生行的分级菜单、未知行到达 React root 哨兵；官方菜单交接、隐藏规则、静态样式存活、
   区域锚点、分组折叠、顶部会话导航后的自动展开纠正、codex 区段/集合/项目手动选择、
   表头动作排除和取消置顶保持折叠。另覆盖真实执行绿/黄提示与总数、空闲父会话上浮与完成退回、
   同批活动排序、快照不可用与留存记录排除、独立连接信号与替换/卸载清理、

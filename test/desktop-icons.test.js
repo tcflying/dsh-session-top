@@ -23,6 +23,38 @@ test('desktop icons accept only the Windows Electron desktop Host', () => {
   ]) assert.equal(desktopIconCommand({ ...runtime, ...change }), undefined)
 })
 
+test('native icons cover every pixel with opaque white at small and large DPI sizes', { skip: process.platform !== 'win32' }, () => {
+  const source = readFileSync(new URL('../src/desktop-icons.ps1', import.meta.url), 'utf8')
+    .match(/Add-Type @'([\s\S]*?)'@ -ReferencedAssemblies System.Drawing/)[1]
+  // Compile only the native class; do not run the helper or mutate desktop icons.
+  const command = `$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Drawing
+Add-Type @'
+${source}
+'@ -ReferencedAssemblies System.Drawing
+foreach ($size in 16,20,24,32,48,64) {
+  $handle = [DshDesktopIcons]::WhiteSquare($size)
+  $icon = $null; $bitmap = $null
+  try {
+    $icon = [Drawing.Icon]::FromHandle($handle)
+    $bitmap = $icon.ToBitmap()
+    if ($bitmap.Width -ne $size -or $bitmap.Height -ne $size) { throw "Wrong icon dimensions: $size" }
+    for ($y=0; $y -lt $size; $y++) {
+      for ($x=0; $x -lt $size; $x++) {
+        if ($bitmap.GetPixel($x,$y).ToArgb() -ne -1) { throw "Icon pixel must be opaque white: size=$size x=$x y=$y" }
+      }
+    }
+  } finally {
+    if ($bitmap) { $bitmap.Dispose() }
+    if ($icon) { $icon.Dispose() }
+    [DshDesktopIcons]::DestroyIcon($handle) | Out-Null
+  }
+}`
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand',
+    Buffer.from(command, 'utf16le').toString('base64')], { encoding: 'utf8', timeout: 20000, windowsHide: true })
+  assert.equal(result.status, 0, result.stderr || result.error?.message)
+})
+
 test('native helper rejects an ordinary process before any icon mutation', { skip: process.platform !== 'win32' }, () => {
   const script = fileURLToPath(new URL('../src/desktop-icons.ps1', import.meta.url))
   const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script,

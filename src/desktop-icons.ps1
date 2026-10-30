@@ -10,7 +10,6 @@ Add-Type @'
 using System;
 using System.Text;
 using System.Drawing;
-using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 public static class DshDesktopIcons {
@@ -60,12 +59,9 @@ public static class DshDesktopIcons {
     var data = new NotifyData { cbSize=(uint)Marshal.SizeOf(typeof(NotifyData)),hWnd=h,uID=3,uFlags=2,hIcon=icon };
     return Shell_NotifyIcon(1,ref data);
   }
-  public static IntPtr Circle(int size) {
+  public static IntPtr WhiteSquare(int size) {
     using(var bitmap=new Bitmap(size,size,PixelFormat.Format32bppArgb)) {
-      using(var graphics=Graphics.FromImage(bitmap)) {
-        graphics.Clear(Color.Transparent); graphics.SmoothingMode=SmoothingMode.AntiAlias;
-        using(var brush=new SolidBrush(Color.FromArgb(0x1e,0x3a,0x8a))) graphics.FillEllipse(brush,0.5f,0.5f,size-1,size-1);
-      }
+      using(var graphics=Graphics.FromImage(bitmap)) graphics.Clear(Color.White);
       return bitmap.GetHicon();
     }
   }
@@ -127,8 +123,8 @@ try {
   if ($originalTray -eq [IntPtr]::Zero) { throw 'Could not load original DSH tray icon' }
   $originalSmall = [DshDesktopIcons]::Message($main,0x7f,0,[IntPtr]::Zero)
   $originalLarge = [DshDesktopIcons]::Message($main,0x7f,1,[IntPtr]::Zero)
-  $small = [DshDesktopIcons]::Circle($smallSize)
-  $large = [DshDesktopIcons]::Circle($largeSize)
+  $small = [DshDesktopIcons]::WhiteSquare($smallSize)
+  $large = [DshDesktopIcons]::WhiteSquare($largeSize)
   if ($Probe) {
     if (-not $EvidenceDirectory) { throw 'Probe requires an evidence directory' }
     [IO.Directory]::CreateDirectory($EvidenceDirectory) | Out-Null

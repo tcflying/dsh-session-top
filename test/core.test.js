@@ -392,42 +392,34 @@ test('an unknown sidebar is observe-only in the contextmenu chain', async () => 
   assert.ok(start > 0 && end > start, 'onContextMenu must exist')
   const handler = source.slice(start, end)
 
-  // Exactly two suppressions: our own rows (which no host menu competes for, and
-  // which must be preempted eagerly) and the deferred fallback for a host row
-  // nobody else handled.
-  assert.equal(
-    (handler.match(/preventDefault\(\)/g) ?? []).length,
-    2,
-    'exactly two branches may suppress the native menu: own rows, and the deferred host-row fallback',
-  )
-  assert.equal(
-    (handler.match(/stopPropagation\(\)/g) ?? []).length,
-    1,
-    'only the own-row branch may stop propagation',
-  )
+  // Own rows and known native sessions without a shared owner may claim eagerly.
+  // The remaining host fallback must wait for dispatch. Unknown rows never claim.
+  assert.equal((handler.match(/preventDefault\(\)/g) ?? []).length, 3)
+  assert.equal((handler.match(/stopPropagation\(\)/g) ?? []).length, 2)
 
-  // Order: already-handled bail → own-row match → own-row suppression → flavor
-  // bail → the deferred fallback, which must re-check what the dispatch did.
   const ownRow = handler.indexOf("[data-stp-row]")
   const handledBail = handler.indexOf('if (event.defaultPrevented === true) return')
   const nullBail = handler.indexOf('if (flavor === null) return')
+  const nativeGuard = handler.indexOf('if (flavor.nativeContextMenu === true')
   const deferred = handler.indexOf('afterDispatch(() => {')
   const suppressions = []
   for (const m of handler.matchAll(/preventDefault\(\)/g)) suppressions.push(m.index)
-  assert.equal(suppressions.length, 2)
-  const [ownSuppress, fallbackSuppress] = suppressions
-  assert.ok(ownRow > 0 && ownRow < ownSuppress, 'the own-row branch suppresses right after its match')
-  assert.ok(handledBail < ownSuppress, 'the already-handled bail runs before anything else')
-  assert.ok(ownSuppress < nullBail, 'the flavor bail comes after the own-row branch')
-  assert.ok(nullBail < deferred, 'the deferred fallback is the last branch')
-  assert.ok(deferred < fallbackSuppress, 'the fallback suppresses inside its deferred callback')
+  const [ownSuppress, nativeSuppress, fallbackSuppress] = suppressions
+  assert.ok(ownRow > 0 && ownRow < ownSuppress, 'own-row suppression follows its match')
+  assert.ok(handledBail < ownSuppress, 'already-handled events bail before any suppression')
+  assert.ok(ownSuppress < nullBail && nullBail < nativeGuard, 'unknown sidebars bail before native fallback')
+  assert.ok(nativeGuard < nativeSuppress && nativeSuppress < deferred, 'native fallback claims before React dispatch')
+  const nativeCondition = handler.slice(nativeGuard, nativeSuppress)
+  assert.ok(nativeCondition.includes('Object.hasOwn(sessionById(), id)'), 'unknown native IDs must not be claimed')
+  assert.ok(nativeCondition.includes('sharedMenuServing(sharedMenuApi()) === false'), 'live shared menus retain their full owner')
+  assert.ok(handler.indexOf('publishSharedMenu()') < nativeGuard, 'publish entries before probing either load order')
+  assert.ok(deferred < fallbackSuppress, 'remaining fallback suppresses inside its deferred callback')
   assert.ok(
     handler.slice(deferred, fallbackSuppress).includes('if (event.defaultPrevented === true) return'),
-    'the deferred fallback must re-read defaultPrevented: ownership is decided by the dispatch, not by a probe',
+    'deferred fallback must re-read event ownership after dispatch',
   )
 
-  // Nothing between the own-row branch and the fallback may touch the event.
-  const observeOnly = handler.slice(handler.indexOf('openOwnRowMenu(ownRow'), deferred)
+  const observeOnly = handler.slice(handler.indexOf('openOwnRowMenu(ownRow'), nativeGuard)
   for (const forbidden of ['preventDefault', 'stopPropagation', 'stopImmediatePropagation']) {
     assert.ok(!observeOnly.includes(forbidden), `observe-only span must not call ${forbidden}`)
   }

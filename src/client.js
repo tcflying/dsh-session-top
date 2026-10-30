@@ -952,10 +952,9 @@ window.__ModuleLoader__.load({
   font-size: 13px; font-weight: 400; line-height: 20px;
   pointer-events: auto;
 }
-/* The two items this plugin contributes to its own fallback menu. One rule for
-   both, so the colour entry cannot read as a different kind of row from the pin
-   entry sitting directly above it. */
+/* Tier and colour actions share one fallback-menu row style. */
 [data-stp-menu] [data-stp-pin-item],
+[data-stp-menu] [data-stp-absolute-item],
 [data-stp-menu] [data-stp-color-item] {
   display: block; box-sizing: border-box; width: 100%;
   min-height: 24px; margin: 0; padding: 2px 8px;
@@ -965,10 +964,12 @@ window.__ModuleLoader__.load({
   text-align: start; cursor: pointer;
 }
 [data-stp-menu] [data-stp-pin-item]:hover,
+[data-stp-menu] [data-stp-absolute-item]:hover,
 [data-stp-menu] [data-stp-color-item]:hover {
   background: var(--stp-token-hover, rgba(127,127,127,.10));
 }
 [data-stp-menu] [data-stp-pin-item]:focus-visible,
+[data-stp-menu] [data-stp-absolute-item]:focus-visible,
 [data-stp-menu] [data-stp-color-item]:focus-visible {
   outline: 2px solid var(--stp-token-primary, currentColor); outline-offset: -2px;
 }
@@ -2047,6 +2048,10 @@ window.__ModuleLoader__.load({
         return officialPinCache.ids
       }
 
+      // Ordinary and super actions share one order per session, across every surface.
+      const pinOperations = new Map()
+      disposers.push(() => pinOperations.clear())
+
       /**
        * Write a pin through the official RPC and report a refusal. No optimistic
        * update and no private-store fallback: the official list subscription is
@@ -2055,7 +2060,13 @@ window.__ModuleLoader__.load({
        * @param {boolean} want - true to pin, false to unpin.
        * @returns {Promise<{ok: boolean}>} what the host said.
        */
-      const applyOfficialPin = async (id, want) => {
+      const applyOfficialPin = async (id, want, operation = {}) => {
+        if (!alive()) return { ok: false }
+        pinOperations.set(id, operation)
+        if (!want && absolutePins.has(id) && pinSet().has(id)) {
+          await toggleAbsolutePin(id, false)
+          return { ok: true }
+        }
         const action = want ? pinSession : unpinSession
         if (action === undefined) {
           surfaceError(translate(
@@ -2067,7 +2078,7 @@ window.__ModuleLoader__.load({
         try {
           const result = await action(id)
           if (result?.ok === false) throw new Error(result.error?.message ?? '宿主拒绝了置顶操作')
-          if (!want && alive()) forgetAbsolutePins([id])
+          if (!want && alive() && pinOperations.get(id) === operation) forgetAbsolutePins([id])
           return { ok: true }
         } catch (error) {
           if (alive()) {
@@ -2286,7 +2297,7 @@ window.__ModuleLoader__.load({
       shadowOfficialCounts()
 
       /**
-       * Add ONE item to the stock sidebar's own session-row menu.
+       * Add tier actions and colour to the stock sidebar's session-row menu.
        *
        * The stock sidebar serves that menu from
        * `sidebar.workspaces.session.menu.item` (`rows/Rows.tsx:681-685`), and
@@ -2296,11 +2307,10 @@ window.__ModuleLoader__.load({
        * on this host: there is no `contextmenu` surface to claim and the
        * plugin-owned fallback only opens where no host menu can be borrowed.
        *
-       * WHAT IT IS NOT. The host's Pin entry is not mutated, shadowed or
-       * replaced — it is left exactly as registered, and a SECOND, namespaced id
-       * is added next to it. The adapter reuses the host's own component and the
-       * host's own `inject` verbatim, so every hook, prop and behaviour is the
-       * host's; the adapter only swaps two functions and one label:
+       * The original Pin registration stays intact. A higher-priority view of
+       * its cell routes cancellation through the tier rules; a namespaced item
+       * promotes ordinary sessions. All reuse the host component and its hook
+       * order. The colour item swaps two functions and one label:
        *
        *   - `pinSession` AND `unpinSession` both become "open the colour dialog
        *     for this session". The host's component calls `setMenuOpen(false)`
@@ -2492,10 +2502,49 @@ window.__ModuleLoader__.load({
                 },
               }
               try {
-                releases.set(original, registry.register(options, function DshSessionTopRowColor(props) {
-                  return original.component({ ...props, t: colorMenuT(props?.t) })
-                }))
+                const added = []
+                try {
+                  added.push(registry.register(options, function DshSessionTopRowColor(props) {
+                    return original.component({ ...props, t: colorMenuT(props?.t) })
+                  }))
+                  added.push(registry.register({
+                    ...options, id: 'pin', order: original.options?.order,
+                    priority: (original.options?.priority ?? 0) - 1,
+                    inject: (...args) => ({ ...original.inject(...args),
+                      pinSession: id => { if (alive()) void togglePin(id, true) },
+                    }),
+                  }, function DshSessionTopOrdinaryPin(props) {
+                    const superPinned = absolutePins.has(props.sessionId) && pinSet().has(props.sessionId)
+                    return original.component({ ...props, unpinSession: id => {
+                      if (!alive()) return
+                      if (superPinned) void toggleAbsolutePin(id, false)
+                      else void togglePin(id, false)
+                    }, t: (key, ...rest) => {
+                      if (key === 'menu.pinSession') return '普通置顶'
+                      if (key === 'menu.unpinSession') return superPinned
+                        ? '取消超级置顶（保留普通置顶）' : '取消置顶'
+                      return props.t?.(key, ...rest) ?? key
+                    } })
+                  }))
+                  added.push(registry.register({
+                    ...options, id: 'dsh-session-top.super-pin', order: (original.options?.order ?? 100) + 10,
+                    inject: (...args) => ({ ...original.inject(...args),
+                      pinSession: id => { if (alive()) void toggleAbsolutePin(id, true) },
+                      unpinSession: id => { if (alive()) void toggleAbsolutePin(id, true) },
+                    }),
+                  }, function DshSessionTopSuperPin(props) {
+                    const rendered = original.component({ ...props, t: () => '超级置顶' })
+                    // The ordinary shadow already exposes demotion for a super pin.
+                    return absolutePins.has(props.sessionId) && pinSet().has(props.sessionId) ? null : rendered
+                  }))
+                } catch (error) {
+                  for (const remove of added.reverse()) remove()
+                  throw error
+                }
+                releases.set(original, () => { for (const remove of added.reverse()) remove() })
               } catch (error) {
+                // Rollback notifies this watcher too; retry only on a later host change.
+                resync = false
                 warn(`could not register the official row-colour item: ${describeError(error)}`)
               }
             } while (resync)
@@ -2689,6 +2738,7 @@ window.__ModuleLoader__.load({
       }
       let previousPins = null
       const refreshAbsolutePins = () => {
+        if (!alive()) return
         let snapshot
         try { snapshot = workspaces.list.getSnapshot() } catch { return }
         if (!Array.isArray(snapshot?.pinnedSessionIds) || connectionUnavailable()
@@ -2696,6 +2746,9 @@ window.__ModuleLoader__.load({
         const next = new Set(snapshot.pinnedSessionIds.map(String))
         if (previousPins !== null) forgetAbsolutePins([...previousPins].filter(id => !next.has(id)))
         previousPins = next
+        for (const [id, operation] of pinOperations) {
+          if (operation.confirmedPromotion && next.has(id)) void toggleAbsolutePin(id, true)
+        }
       }
       let runtimeState = { sessions: {}, runningSessions: 0, runningAgents: 0 }
       let runtimePhase = 'loading'
@@ -2774,7 +2827,8 @@ window.__ModuleLoader__.load({
           const previous = observedActivity.get(id)
           const active = execution.running || execution.runningChildren > 0
           const timestamp = Math.max(previous?.time ?? 0, hostActivity.get(id) ?? 0,
-            Number.isFinite(summary?.updatedAt) ? summary.updatedAt : 0)
+            Number.isFinite(summary?.updatedAt) ? summary.updatedAt : 0,
+            Number.isFinite(summary?.createdAt) ? summary.createdAt : 0)
           // A legacy summary without running cannot establish a new activity fact.
           if (typeof summary?.running === 'boolean' && (
             (active && (previous === undefined || !previous.active || timestamp > previous.time))
@@ -2802,22 +2856,31 @@ window.__ModuleLoader__.load({
         const editing = renameEdit?.row.hasAttribute('data-stp-row') ? [renameEdit.id] : []
         const fixed = [...new Set([...pinned, ...editing])].filter(isAbsoluteRow)
         const rest = [...new Set([...pinned, ...active, ...editing])].filter(id => !fixed.includes(id))
-        rest.sort((a, b) => {
+        const byActivity = (a, b) => {
           const left = floatedActivity.get(a)
           const right = floatedActivity.get(b)
           return Math.max(right?.time ?? 0, observedActivity.get(b)?.time ?? 0)
             - Math.max(left?.time ?? 0, observedActivity.get(a)?.time ?? 0)
             || (right?.sequence ?? 0) - (left?.sequence ?? 0)
-        })
+        }
+        fixed.sort(byActivity)
+        rest.sort(byActivity)
         visibleSessions = [...fixed, ...rest]
       }
 
-      const toggleAbsolutePin = async (id) => {
+      const toggleAbsolutePin = async (id, want = !(absolutePins.has(id) && pinSet().has(id))) => {
         if (!alive()) return
-        const want = !(absolutePins.has(id) && pinSet().has(id))
+        const operation = {}
+        pinOperations.set(id, operation)
         if (want && !pinSet().has(id)) {
-          const result = await applyOfficialPin(id, true)
-          if (!result.ok || !alive()) return
+          const result = await applyOfficialPin(id, true, operation)
+          if (!result.ok || !alive() || pinOperations.get(id) !== operation) return
+          if (!pinSet().has(id)) {
+            // The model's global request sequence can defer this pin's echo
+            // behind another session. Only this still-current action may promote.
+            operation.confirmedPromotion = true
+            return
+          }
         }
         // Merge with another window before writing this local priority.
         const latest = readAbsolutePins()
@@ -2872,13 +2935,13 @@ window.__ModuleLoader__.load({
           row.insertBefore(ordinary, button)
         }
         const pinned = pinSet().has(id)
-        const pinLabel = pinned ? '取消置顶' : '普通置顶'
+        const fixed = absolutePins.has(id) && pinned
+        const pinLabel = fixed ? '取消超级置顶（保留普通置顶）' : pinned ? '取消置顶' : '普通置顶'
         if (ordinary.getAttribute('aria-label') !== pinLabel) ordinary.setAttribute('aria-label', pinLabel)
         if (ordinary.getAttribute('title') !== pinLabel) ordinary.setAttribute('title', pinLabel)
         if (ordinary.getAttribute('aria-pressed') !== String(pinned)) ordinary.setAttribute('aria-pressed', String(pinned))
         const pinGlyph = pinned ? '−' : '+'
         if (ordinary.textContent !== pinGlyph) ordinary.textContent = pinGlyph
-        const fixed = absolutePins.has(id) && pinned
         const label = fixed ? '取消超级置顶（保留普通置顶）' : '超级置顶'
         if (button.getAttribute('aria-label') !== label) button.setAttribute('aria-label', label)
         if (button.getAttribute('title') !== label) button.setAttribute('title', label)
@@ -5439,6 +5502,8 @@ window.__ModuleLoader__.load({
       const CTX_MENU_KEY = Symbol.for('dsh.session-context-menu.extensions')
       const PIN_ENTRY_ID = 'dsh-session-top.pin'
       const UNPIN_ENTRY_ID = 'dsh-session-top.unpin'
+      const SUPER_PIN_ENTRY_ID = 'dsh-session-top.super-pin'
+      const UNSUPER_PIN_ENTRY_ID = 'dsh-session-top.unsuper-pin'
       const COLOR_ENTRY_ID = 'dsh-session-top.row-color'
       /** Order within the owner's extension list; the owner appends us after its own items. */
       const ENTRY_ORDER = 50
@@ -5456,21 +5521,25 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * Are WE in that table right now? Read from the owner's own `list()`
-       * rather than remembered from registration time: the owner can dispose
-       * and drop its listener while our entry survives, and a plugin that keeps
-       * believing it is registered would then hand the menu to nobody.
+       * Are all our entries in that table right now? This checks registration
+       * only; a surviving table does not prove the owner's listener is alive.
        * @param {object | undefined} api - the owner's table.
-       * @returns {boolean} true when both entries are present.
+       * @returns {boolean} true when all tier and colour entries are present.
        */
       const sharedMenuRegistered = (api) => {
         if (api === undefined) return false
         try {
           const ids = new Set(api.list().map(entry => entry?.id))
-          return ids.has(PIN_ENTRY_ID) && ids.has(UNPIN_ENTRY_ID) && ids.has(COLOR_ENTRY_ID)
+          return [PIN_ENTRY_ID, UNPIN_ENTRY_ID, SUPER_PIN_ENTRY_ID, UNSUPER_PIN_ENTRY_ID, COLOR_ENTRY_ID].every(id => ids.has(id))
         } catch {
           return false
         }
+      }
+
+      // Patched owners expose their live lease; older owners retain event-based handoff.
+      const sharedMenuServing = (api) => {
+        try { return sharedMenuRegistered(api) && api.active?.() !== false }
+        catch { return false }
       }
 
       /**
@@ -5496,7 +5565,7 @@ window.__ModuleLoader__.load({
        * @param {boolean} want - true to pin, false to unpin.
        * @param {(() => void) | undefined} close - the owner's menu closer.
        */
-      const runSharedAction = (session, want, close) => {
+      const runSharedAction = (session, want, close, superPin = false) => {
         // The owner's table can invoke a `run` it was handed one tick before we
         // released it. A released entry must not go on to write.
         if (!alive()) return
@@ -5507,7 +5576,8 @@ window.__ModuleLoader__.load({
         } catch (error) {
           warn(`closing the shared menu failed: ${describeError(error)}`)
         }
-        void togglePin(id, want)
+        if (superPin) void toggleAbsolutePin(id, want)
+        else void togglePin(id, want)
       }
 
       /**
@@ -5523,7 +5593,7 @@ window.__ModuleLoader__.load({
       const pinEntry = () => ({
         id: PIN_ENTRY_ID,
         order: ENTRY_ORDER,
-        label: translate('menu.pin', '置顶该会话'),
+        label: translate('menu.pin', '普通置顶'),
         visible: ({ session } = {}) => {
           try {
             const id = sessionIdOfEntry(session)
@@ -5542,12 +5612,26 @@ window.__ModuleLoader__.load({
         visible: ({ session } = {}) => {
           try {
             const id = sessionIdOfEntry(session)
-            return id !== undefined && pinSet().has(id) === true && unpinSession !== undefined
+            return id !== undefined && pinSet().has(id) === true && !absolutePins.has(id) && unpinSession !== undefined
           } catch {
             return false
           }
         },
         run: ({ session, close } = {}) => { runSharedAction(session, false, close) },
+      })
+
+      const superPinEntry = (want) => ({
+        id: want ? SUPER_PIN_ENTRY_ID : UNSUPER_PIN_ENTRY_ID,
+        order: ENTRY_ORDER + (want ? 2 : 3),
+        label: want ? '超级置顶' : '取消超级置顶（保留普通置顶）',
+        visible: ({ session } = {}) => {
+          try {
+            const id = sessionIdOfEntry(session)
+            return id !== undefined && (pinSet().has(id) || pinSession !== undefined)
+              && (absolutePins.has(id) && pinSet().has(id)) !== want
+          } catch { return false }
+        },
+        run: ({ session, close } = {}) => { runSharedAction(session, want, close, true) },
       })
 
       /**
@@ -5589,7 +5673,7 @@ window.__ModuleLoader__.load({
        */
       const colorEntry = () => ({
         id: COLOR_ENTRY_ID,
-        order: ENTRY_ORDER + 2,
+        order: ENTRY_ORDER + 4,
         label: translate('menu.color', '自定义行背景颜色…'),
         visible: ({ session } = {}) => {
           try {
@@ -5605,7 +5689,7 @@ window.__ModuleLoader__.load({
       let releaseSharedMenu = null
 
       /**
-       * (Re)publish the two entries, if the owner's table exists right now.
+       * (Re)publish the tier and colour entries if the owner's table exists.
        *
        * Apply order between two plugins is not guaranteed, so "we ran, therefore
        * the owner ran" is not evidence of anything. Both directions are covered:
@@ -5629,6 +5713,8 @@ window.__ModuleLoader__.load({
         try {
           releases.push(api.register(pinEntry()))
           releases.push(api.register(unpinEntry()))
+          releases.push(api.register(superPinEntry(true)))
+          releases.push(api.register(superPinEntry(false)))
           releases.push(api.register(colorEntry()))
         } catch (error) {
           for (const release of releases) {
@@ -5649,7 +5735,7 @@ window.__ModuleLoader__.load({
             }
           }
         }
-        console.info('[dsh-session-top] pin/unpin/row colour published into the shared session context menu')
+        console.info('[dsh-session-top] pin tiers and row colour published into the shared session context menu')
         return true
       }
 
@@ -5743,6 +5829,7 @@ window.__ModuleLoader__.load({
         if (!alive()) return
         if (anchorEl === null) return
         const pinned = pinSet().has(sessionId)
+        const superPinned = pinned && absolutePins.has(sessionId)
         closeMenu()
         menuState = { sessionId, pinned }
 
@@ -5755,16 +5842,31 @@ window.__ModuleLoader__.load({
         item.setAttribute('role', 'menuitem')
         item.setAttribute('data-stp-pin-item', '')
         item.textContent = (pinned ? PIN_GLYPH_OUTLINE : PIN_GLYPH_FILLED)
-          + (pinned ? translate('menu.unpin', '取消置顶') : translate('menu.pin', '置顶该会话'))
+          + (superPinned ? '取消超级置顶（保留普通置顶）' : pinned ? translate('menu.unpin', '取消置顶') : translate('menu.pin', '普通置顶'))
         item.addEventListener('click', (event) => {
           event.preventDefault()
           event.stopPropagation()
           closeMenu()
           if (!alive()) return
-          void togglePin(sessionId, !pinned)
+          if (superPinned) void toggleAbsolutePin(sessionId, false)
+          else void togglePin(sessionId, !pinned)
         })
 
         surface.appendChild(item)
+        if (!superPinned) {
+          const superItem = document.createElement('button')
+          superItem.type = 'button'
+          superItem.setAttribute('role', 'menuitem')
+          superItem.setAttribute('data-stp-absolute-item', '')
+          superItem.textContent = '超级置顶'
+          superItem.addEventListener('click', event => {
+            event.preventDefault()
+            event.stopPropagation()
+            closeMenu()
+            if (alive()) void toggleAbsolutePin(sessionId, true)
+          })
+          surface.appendChild(superItem)
+        }
 
         // The colour item, on the SAME dialog the row's colour point opens. This
         // menu is the fallback for a row with nothing to borrow, so a session
@@ -5856,34 +5958,14 @@ window.__ModuleLoader__.load({
       /**
        * Right-click on a session row.
        *
-       * THE EVENT OWNERSHIP RULE, in one place. React delegates its listeners
-       * at the root container, so any interruption during document-capture stops
-       * a host menu from ever opening. And ownership is decided by WHAT THE
-       * EVENT DOES, never by asking whether the shared owner happens to be
-       * loaded:
+       * Already handled events stay with their owner. Our own region rows use
+       * `openOwnRowMenu`. A recognized native row without registered shared
+       * entries gets our pin menu during capture, before React can claim it.
        *
-       *   - the shared owner claims a gesture by handling it — it calls
-       *     `preventDefault()` and `stopPropagation()` inside its own
-       *     document-capture listener before it builds `.dshcm-menu`;
-       *   - we are on the same node in the same phase, so at the moment this
-       *     handler runs we cannot know whether its listener already ran or is
-       *     still queued ahead of us in registration order.
-       *
-       * So the fallback is deferred by one microtask, which is after the whole
-       * dispatch, and acts only on the observable outcome: an event somebody
-       * else prevented is not ours. That holds when the owner is loaded, when it
-       * was never loaded, and — the case a registry probe could never get right
-       * — when it loaded, unloaded, and our entries are still sitting in its
-       * table with nobody left to render them.
-       *
-       * Preconditions for each outcome:
-       *   1. already handled           → observe only (whoever built a menu, wins)
-       *   2. our own region row        → serve the gesture here
-       *                                    (`openOwnRowMenu`, which borrows a
-       *                                    host menu only when that host's own
-       *                                    menu is richer than ours)
-      *   3. flavor === null           → observe only
-      *   4. a positively identified host session row, still unhandled → own menu
+       * Otherwise wait until dispatch ends: the shared owner can register its
+       * capture listener before or after ours, and its prevented event wins.
+       * Native rows outside the no-owner fallback keep their native handler;
+       * stock rows borrow the host "…" control or use our pin menu.
        *
        * @param {MouseEvent} event - the contextmenu event.
        */
@@ -5923,13 +6005,21 @@ window.__ModuleLoader__.load({
         const { id } = found
         if (pinSession === undefined && pinSet().has(id) === false) return
 
-        // Keep the shared table topped up for an owner that came up late; this
-        // says nothing about ownership.
+        // Publish before the owner probe so either plugin load order works.
         publishSharedMenu()
 
-        // (4) A real host session row of a recognized sidebar.
         const x = event.clientX
         const y = event.clientY
+        // React claims native context menus synchronously. Serve known sessions
+        // here only when no shared owner has our entries to build the full menu.
+        if (flavor.nativeContextMenu === true
+          && Object.hasOwn(sessionById(), id)
+          && sharedMenuServing(sharedMenuApi()) === false) {
+          event.preventDefault()
+          event.stopPropagation()
+          openMenu(id, x, y)
+          return
+        }
         afterDispatch(() => {
           // The microtask is already queued by the time teardown can run, and a
           // queued microtask cannot be cancelled. What can be checked is the
@@ -5937,10 +6027,7 @@ window.__ModuleLoader__.load({
           // unmount must not claim the gesture and open a menu afterwards.
           if (!alive()) return
           if (event.defaultPrevented === true) return
-          // codex-ui serves its own session menu on right-click, with its own
-          // actions in it. That menu is the host's and stays the host's: the
-          // gesture is left alone rather than covered by a plugin menu that
-          // could only ever hold this plugin's own entry.
+          // A registered owner or an unknown native id keeps the host gesture.
           if (flavor.nativeContextMenu === true) return
           event.preventDefault()
           // The host's own "…" control, when the row has one. The plugin's
@@ -6491,9 +6578,8 @@ window.__ModuleLoader__.load({
        * circuiting while it is there would take all of that away from a pinned
        * row, which is why the guard also asks whether the owner is present.
        *
-       * The host's own ordinary rows are untouched either way: they keep their
-       * native menu, observed but never claimed, because claiming one would
-       * take away eight working actions this plugin cannot replace.
+       * Recognized native host rows use the same no-owner pin fallback in
+       * `onContextMenu`; registered shared owners keep their full menu.
        *
        * @param {Element} row - a `[data-stp-row]` element.
        * @param {number} x - viewport x.
@@ -6509,7 +6595,7 @@ window.__ModuleLoader__.load({
         // menu outside this flavor's slot and carries our two actions plus the
         // host's, so its presence is exactly the condition that makes
         // forwarding the better answer again.
-        const ownerPresent = sharedMenuRegistered(sharedMenuApi())
+        const ownerPresent = sharedMenuServing(sharedMenuApi())
         if (flavor !== null && flavor.nativeContextMenu === true && ownerPresent === false) {
           openMenu(id, x, y)
           return

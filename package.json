@@ -11,6 +11,7 @@
   },
   "files": [
     "src",
+    "scripts/patch-context-menu.mjs",
     "cordis.patch.yml",
     "README.md"
   ],
