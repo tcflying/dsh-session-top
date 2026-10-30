@@ -1594,6 +1594,72 @@ const doubleClick = (run, target) => {
   for (const fn of [...(run.listeners.get('dblclick') ?? [])]) fn(event)
 }
 
+// Idle pins already have activity on mount; priority is a separate cancellable group.
+for (const makeScaffold of [officialScaffold, codexScaffold]) {
+  const sc = makeScaffold()
+  const run = await runBundle(sc, { pinned: [S2, S1], mutable: true })
+  assert.deepEqual(idsInRegion(sc), [S1, S2], 'idle pins sort by existing activity on first paint')
+  const row = sc.body.querySelector('[data-stp-session="' + S2 + '"]')
+  row.querySelector('[data-stp-absolute-button]').click()
+  await settle()
+  const priority = sc.body.querySelector('[data-stp-tier="absolute"]')
+  assert.equal(priority?.getAttribute('aria-label'), '超级置顶')
+  assert.equal(row.parentElement, priority, 'super pins have their own group above ordinary pins')
+  run.live.byId[S1].updatedAt += 1000
+  run.nudge()
+  await settle()
+  assert.deepEqual(idsInRegion(sc), [S2, S1], 'ordinary activity cannot overtake the super group')
+  row.querySelector('[data-stp-absolute-button]').click()
+  await settle()
+  assert.deepEqual(idsInRegion(sc), [S1, S2], 'cancel super pin returns to ordinary activity order')
+  row.querySelector('[data-stp-pin-button]').click()
+  await settle()
+  assert.deepEqual(run.services.workspaces.list.getSnapshot().pinnedSessionIds, [S1], 'cancel ordinary pin removes it from the official set')
+  assert.equal(run.store.get(absoluteKey), '[]', 'unpin forgets old priority before a future repin')
+  run.dispose()
+  console.log('✔ pins: idle recency, separate super group, demotion and ordinary cancellation')
+}
+
+// A newly observed idle pin must outrank an older session with cached activity.
+for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
+  const sc = makeScaffold()
+  const run = await runBundle(sc, { pinned: [S1, S2], mutable: true })
+  run.live.byId[S2] = { ...run.live.byId[S2], running: true, updatedAt: 100 }
+  run.nudge()
+  await settle()
+  run.live.byId[S2].running = false
+  run.live.byId[S9] = { id: S9, displayTitle: 'new idle pin', running: false, updatedAt: 200 }
+  run.live.pinned.push(S9)
+  run.nudge()
+  await settle()
+  assert.deepEqual(idsInRegion(sc), [S9, S2, S1], 'new idle activity outranks an old floated cache')
+  run.dispose()
+}
+
+// Active rows stay visible when unpinned, but their controls must become ordinary-pin actions.
+for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
+  const sc = makeScaffold()
+  const run = await runBundle(sc, { pinned: [S1], mutable: true })
+  run.live.byId[S1].running = true
+  run.nudge()
+  await settle()
+  const row = sc.body.querySelector('[data-stp-row][data-stp-session="' + S1 + '"]')
+  row.querySelector('[data-stp-pin-button]').click()
+  await settle()
+  assert.deepEqual(run.live.pinned, [])
+  assert.deepEqual(idsInRegion(sc), [S1])
+  assert.equal(row.querySelector('[data-stp-pin-button]').getAttribute('aria-label'), '普通置顶')
+  assert.equal(row.querySelector('[data-stp-pin-button]').getAttribute('aria-pressed'), 'false')
+  assert.match(sc.body.querySelector('[data-stp-region-header]').getAttribute('aria-label'), /活跃/)
+  row.querySelector('[data-stp-pin-button]').click()
+  await settle()
+  assert.deepEqual(run.live.pinned, [S1])
+  assert.equal(row.querySelector('[data-stp-pin-button]').getAttribute('aria-label'), '取消置顶')
+  assert.equal(row.querySelector('[data-stp-pin-button]').getAttribute('aria-pressed'), 'true')
+  assert.equal(sc.body.querySelector('[data-stp-region-header]').getAttribute('aria-label').includes('活跃'), false)
+  run.dispose()
+}
+
 // Coalesced snapshots must rank by the Host timestamp, never object insertion order.
 {
   const sc = codexScaffold()
@@ -1726,18 +1792,36 @@ for (const makeScaffold of [officialScaffold, codexScaffold]) {
 }
 
 // An ordinary host row can be made absolute through the official pin API.
-{
-  const sc = codexScaffold()
+for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
+  const sc = makeScaffold()
   const run = await runBundle(sc, { pinned: [], mutable: true })
   const button = sc.row.querySelector('[data-stp-absolute-button]')
   button.click()
   await settle()
   assert.deepEqual(run.pinCalls, [['pin', S1]])
   assert.deepEqual(idsInRegion(sc), [S1])
+  const snapshot = run.services.workspaces.list.getSnapshot
+  for (const unavailable of [() => ({ ...snapshot(), phase: 'loading', pinnedSessionIds: [] }), () => undefined]) {
+    run.services.workspaces.list.getSnapshot = unavailable
+    run.nudge()
+    await settle()
+    assert.equal(run.store.get(absoluteKey), JSON.stringify([S1]), 'unavailable pins cannot erase priority')
+  }
+  run.services.workspaces.list.getSnapshot = snapshot
+  run.nudge()
+  await settle()
   run.live.pinned = []
   run.nudge()
   await settle()
   assert.equal(idsInRegion(sc).length, 0, 'official unpin still removes an absolute pin')
+  assert.equal(run.store.get(absoluteKey), '[]', 'external unpin forgets priority')
+  run.live.pinned = [S1]
+  run.nudge()
+  await settle()
+  assert.equal(sc.body.querySelector('[data-stp-row]').hasAttribute('data-stp-absolute'), false, 'external repin stays ordinary')
+  run.live.pinned = []
+  run.nudge()
+  await settle()
   run.services.workspaces.pinSession = async () => ({ ok: false, error: { message: 'refused' } })
   sc.row.querySelector('[data-stp-absolute-button]').click()
   await settle()
@@ -1750,6 +1834,9 @@ for (const makeScaffold of [officialScaffold, codexScaffold]) {
 for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
   const sc = makeScaffold()
   const run = await runBundle(sc, { pinned: [S2, S1], mutable: true })
+  run.live.byId[S2].updatedAt = 3
+  run.nudge()
+  await settle()
   const calls = []
   let releases = 0
   let refused = false
@@ -1821,6 +1908,52 @@ for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
   input.dispatch('keydown', { key: 'Escape' })
   run.dispose()
   console.log('✔ inline rename: Chinese input, Enter/Escape, refusal, stable draft and release')
+}
+
+// Foreign tier changes cannot detach an active editor, including another row's demotion.
+for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
+  for (const [initial, next] of [[[], [S1]], [[S1], []], [[S2], []]]) {
+    const sc = makeScaffold()
+    const run = await runBundle(sc, { pinned: [S1, S2], mutable: true })
+    writeFromOtherWindow(run, absoluteKey, JSON.stringify(initial))
+    await settle()
+    const row = sc.body.querySelector('[data-stp-row][data-stp-session="' + S1 + '"]')
+    doubleClick(run, row.querySelector('[data-stp-row-title]'))
+    const input = row.querySelector('[data-stp-rename-input]')
+    input.value = '尚未确认的中文'
+    input.selectionStart = 2
+    input.selectionEnd = 4
+    const focusCalls = input.focusCalls
+    const parent = row.parentElement
+    const insertBefore = El.prototype.insertBefore
+    let detached = 0
+    El.prototype.insertBefore = function (node, before) {
+      if (node === row && input.parentElement === row) {
+        detached += 1
+        input.dispatch('blur')
+      }
+      return insertBefore.call(this, node, before)
+    }
+    try {
+      writeFromOtherWindow(run, absoluteKey, JSON.stringify(next))
+      await settle()
+      assert.equal(detached, 0, 'tier reconciliation never detaches the editor')
+      assert.equal(row.parentElement, parent, 'tier changes wait until the editor closes')
+      assert.equal(row.querySelector('[data-stp-rename-input]'), input)
+      assert.equal(input.value, '尚未确认的中文')
+      assert.equal(input.focusCalls, focusCalls)
+      assert.deepEqual([input.selectionStart, input.selectionEnd], [2, 4])
+      input.dispatch('keydown', { key: 'Enter', isComposing: true })
+      assert.equal(row.querySelector('[data-stp-rename-input]'), input)
+      input.dispatch('keydown', { key: 'Escape' })
+      await settle()
+      assert.equal(row.parentElement.getAttribute('data-stp-tier') === 'absolute', next.includes(S1), 'deferred tier change applies after editing')
+      assert.deepEqual(idsInRegion(sc), [...next, ...[S1, S2].filter(id => !next.includes(id))])
+    } finally {
+      El.prototype.insertBefore = insertBefore
+      run.dispose()
+    }
+  }
 }
 
 // A temporary active row stays editable after execution ends, then leaves on save or cancel.
@@ -2558,8 +2691,8 @@ function headerTextOf(region) {
     !headerText.includes('region.pinned'),
     `the raw key must never reach the header; got ${JSON.stringify(headerText)}`,
   )
-  assert.match(headerText, /已置顶/, 'a key-echoing locale must fall back to the built-in label')
-  assert.equal(region.getAttribute('aria-label'), '已置顶', 'the group name is the same readable label')
+  assert.match(headerText, /普通置顶/, 'a key-echoing locale must fall back to the built-in label')
+  assert.equal(region.getAttribute('aria-label'), '普通置顶', 'the group name is the same readable label')
   console.log('✔ a locale that echoes the key back falls back to the built-in label')
   run.dispose()
 }
@@ -2821,6 +2954,7 @@ function attributeShape(rows) {
   await settle()
 
   const nodes = [...region.querySelectorAll('[data-stp-row]')]
+  const nodeById = new Map(nodes.map(row => [row.getAttribute('data-stp-session'), row]))
   const listenersBefore = listenersOf(nodes)
   assert.equal(listenersBefore, MANY * 2, 'each row registers its own click and keydown pair')
   const titlesBefore = nodes.map(row => row.querySelector('[data-stp-row-title]').textContent)
@@ -2831,21 +2965,17 @@ function attributeShape(rows) {
   await settle()
   const afterSummary = [...region.querySelectorAll('[data-stp-row]')]
   assert.equal(afterSummary.length, MANY, 'the row count does not move')
-  let rebuilt = -1
-  for (let i = 0; i < MANY; i += 1) {
-    if (afterSummary[i] !== nodes[i]) { rebuilt = i; break }
+  assert.equal(afterSummary[0], nodeById.get(many[500]), 'latest activity moves first')
+  for (const row of afterSummary) {
+    const id = row.getAttribute('data-stp-session')
+    assert.equal(row, nodeById.get(id), `the row for ${id} survives its activity reorder`)
   }
-  assert.equal(
-    rebuilt,
-    -1,
-    `every row must survive a single summary change; row ${rebuilt} was recreated`,
-  )
   assert.equal(
     listenersOf(afterSummary),
     listenersBefore,
     'an in-place update must not add a single listener',
   )
-  const titlesAfter = afterSummary.map(row => row.querySelector('[data-stp-row-title]').textContent)
+  const titlesAfter = nodes.map(row => row.querySelector('[data-stp-row-title]').textContent)
   assert.deepEqual(titlesAfter, titlesBefore, 'and it must not rewrite unrelated titles')
   console.log(`✔ R08: one summary change in ${MANY} pinned rows rebuilds nothing and adds no listener`)
 
@@ -2860,10 +2990,11 @@ function attributeShape(rows) {
   run.nudge()
   await settle()
   const afterCurrent = [...region.querySelectorAll('[data-stp-row]')]
-  for (let i = 0; i < MANY; i += 1) {
-    assert.equal(afterCurrent[i], nodes[i], `row ${i} must keep its node across a current switch`)
+  for (const row of afterCurrent) {
+    const id = row.getAttribute('data-stp-session')
+    assert.equal(row, nodeById.get(id), `the row for ${id} keeps its node across a current switch`)
   }
-  const shapeAfter = attributeShape(afterCurrent)
+  const shapeAfter = attributeShape(nodes)
   const changed = []
   for (let i = 0; i < MANY; i += 1) {
     if (shapeBefore[i] !== shapeAfter[i]) changed.push(i)
@@ -2884,7 +3015,7 @@ function attributeShape(rows) {
   run.nudge()
   await settle()
   assert.equal(
-    region.querySelectorAll('[data-stp-row]')[7],
+    region.querySelector(`[data-stp-row][data-stp-session="${many[7]}"]`),
     pressed,
     'the node the pointer went down on must still be there at pointerup',
   )
@@ -2897,7 +3028,7 @@ function attributeShape(rows) {
   run.nudge()
   await settle()
   assert.equal(
-    region.querySelectorAll('[data-stp-row]')[8],
+    region.querySelector(`[data-stp-row][data-stp-session="${many[8]}"]`),
     keyed,
     'keyboard focus lives on the node, so it survives the same kind of update',
   )
@@ -2906,9 +3037,9 @@ function attributeShape(rows) {
   assert.equal(run.opened[run.opened.length - 1], many[8], 'Enter still opens that session')
   console.log('✔ R08: a click split by a re-render, and a keypress, both reach the pressed row')
 
-  // ---- (4) Official pin add/remove: insert in the official order, keep the rest.
+  // ---- (4) Official pin add/remove: newest activity first, keep existing nodes.
   const extra = 'session-ffffffff-ffff-4fff-8fff-ffffffffffff'
-  run.live.byId[extra] = { id: extra, displayTitle: 'extra', updatedAt: 1 }
+  run.live.byId[extra] = { id: extra, displayTitle: 'extra', updatedAt: 4 }
   run.live.pinned = [extra, ...many]
   run.nudge()
   await settle()
@@ -2917,17 +3048,21 @@ function attributeShape(rows) {
   assert.equal(
     added[0].getAttribute('data-stp-session'),
     extra,
-    'the official pin sequence is the only ordering source',
+    'the newest pinned session comes first',
   )
-  for (let i = 1; i <= MANY; i += 1) {
-    assert.equal(added[i], nodes[i - 1], `row ${i} must keep its node when one pin is added`)
+  for (const row of added.slice(1)) {
+    const id = row.getAttribute('data-stp-session')
+    assert.equal(row, nodeById.get(id), `the row for ${id} survives adding a pin`)
   }
   run.live.pinned = [...many]
   run.nudge()
   await settle()
   const removed = [...region.querySelectorAll('[data-stp-row]')]
   assert.equal(removed.length, MANY, 'an unpinned session leaves the region')
-  for (let i = 0; i < MANY; i += 1) assert.equal(removed[i], nodes[i], 'and the others keep their nodes')
+  for (const row of removed) {
+    const id = row.getAttribute('data-stp-session')
+    assert.equal(row, nodeById.get(id), 'and the others keep their nodes')
+  }
   assert.equal(region.querySelectorAll(`[data-stp-session="${extra}"]`).length, 0)
   console.log('✔ R08: official pin add/remove inserts and drops one row, and preserves every other')
 
@@ -5520,9 +5655,10 @@ const colorSurfaceOf = (row) => {
     child.getAttribute('data-stp-row-slot') !== null ? 'slot'
       : child.getAttribute('data-stp-row-title') !== null ? 'title'
         : child.getAttribute('data-stp-row-time') !== null ? 'time'
-          : child.hasAttribute('data-stp-absolute-button') ? 'absolute'
-            : child.getAttribute('data-stp-row-color') !== null ? 'color' : '?')
-  assert.deepEqual(order, ['slot', 'title', 'time', 'absolute', 'color'], 'exactly what a first render produces')
+          : child.hasAttribute('data-stp-pin-button') ? 'pin'
+            : child.hasAttribute('data-stp-absolute-button') ? 'absolute'
+              : child.getAttribute('data-stp-row-color') !== null ? 'color' : '?')
+  assert.deepEqual(order, ['slot', 'title', 'time', 'pin', 'absolute', 'color'], 'exactly what a first render produces')
   assert.equal(rowsOf(region)[0], row, 'and the row is updated in place')
   assert.equal(swatchOf(row), swatch, 'the colour control is not rebuilt either')
   assert.equal(listenersOf([row]), 2, 'and no listener was added')
@@ -6734,6 +6870,7 @@ function importantOf(css, selector) {
     assert.deepEqual([...new Set(importantOf(css, selector))], ['background'],
       `${selector} must override only the row background`)
   }
+  assert.match(declsOf(css, BACKGROUND_RULES[2]).background, /#ef4444 28%/, 'selected rows stay red above personal and execution colors')
   const NATIVE_PIN_SECTION = '[data-stp-typography] .dcu-wb-section:is([aria-label="置顶"], [aria-label="Pinned"])'
   assert.equal(declsOf(css, NATIVE_PIN_SECTION)['display'], 'none')
   assert.deepEqual(importantOf(css, NATIVE_PIN_SECTION), ['display'])

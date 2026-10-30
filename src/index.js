@@ -31,6 +31,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { planFloatDirty } from './core.js'
 import { isLoopbackRequest } from './routes.js'
+import { installDesktopIcons } from './desktop-icons.js'
 
 /** Stable cordis plugin name. */
 export const name = 'session-top'
@@ -1759,6 +1760,7 @@ function applyImpl(ctx, config = {}) {
 
   const disposers = []
   if (enabled) {
+    installDesktopIcons(ctx)
     try {
       ctx.effect(() => {
         // `global: true` admits the listener for every session regardless of

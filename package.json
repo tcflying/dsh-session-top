@@ -15,7 +15,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --test test/core.test.js && node --test test/host-state.test.js && node --test test/runtime.test.js && node test/bundle-smoke.mjs && node test/cordis-activation.mjs && node test/client-lifecycle.mjs && node test/pin-integration.mjs && node test/sidebar-dom.mjs && node test/shared-menu.mjs && node test/owner-menu-real.mjs"
+    "test": "node --test test/desktop-icons.test.js && node --test test/core.test.js && node --test test/host-state.test.js && node --test test/runtime.test.js && node test/bundle-smoke.mjs && node test/cordis-activation.mjs && node test/client-lifecycle.mjs && node test/pin-integration.mjs && node test/sidebar-dom.mjs && node test/shared-menu.mjs && node test/owner-menu-real.mjs"
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0"

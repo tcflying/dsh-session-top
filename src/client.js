@@ -769,12 +769,13 @@ window.__ModuleLoader__.load({
 }
 [data-stp-region] { max-height: 55vh; overflow-y: auto; flex: none; }
 [data-stp-row][data-stp-absolute] [data-stp-row-slot] { color: #eab308; }
-[data-stp-absolute-button] {
+[data-stp-absolute-button], [data-stp-pin-button] {
   border: 0; padding: 2px 4px; min-height: 24px; background: transparent;
   color: var(--stp-token-secondary, inherit); cursor: pointer; flex: none;
   display: inline-flex; align-items: center; justify-content: center; min-width: 24px; box-sizing: border-box;
 }
-[data-stp-absolute-button]:focus-visible { outline: 2px solid currentColor; outline-offset: -2px; }
+[data-stp-absolute-button]:focus-visible, [data-stp-pin-button]:focus-visible { outline: 2px solid currentColor; outline-offset: -2px; }
+[data-stp-pin-button][aria-pressed='true'] { color: var(--stp-token-primary, inherit); }
 [data-stp-absolute-button][aria-pressed='true'] { color: #eab308; }
 [data-stp-rename-input] {
   flex: 1 1 auto; min-width: 30px; width: 50%; padding: 2px 4px;
@@ -804,6 +805,12 @@ window.__ModuleLoader__.load({
   color: var(--stp-token-tertiary, currentColor);
   user-select: none; cursor: pointer;
 }
+[data-stp-tier-header] {
+  min-height: 24px; padding: 1px 4px 1px 6px; box-sizing: border-box;
+  display: flex; align-items: center; font-size: 12px; font-weight: 600;
+  color: var(--stp-token-secondary, inherit);
+}
+[data-stp-tier='absolute'] { margin-bottom: 6px; padding-bottom: 4px; border-bottom: 1px solid var(--stp-token-border, rgba(127,127,127,.2)); }
 [data-stp-region-header]:hover { background: var(--stp-token-hover, rgba(127,127,127,.10)); }
 [data-stp-region-header]:focus-visible {
   outline: 2px solid var(--stp-token-primary, currentColor); outline-offset: -2px;
@@ -1069,12 +1076,12 @@ window.__ModuleLoader__.load({
 [data-stp-typography] [data-dcu-session][data-stp-color]:hover {
   background: color-mix(in srgb, var(--stp-row-color, transparent) 34%, var(--stp-token-hover, rgba(127,127,127,.10)));
 }
-/* Selection stays blue above personal and execution backgrounds. */
+/* Selection stays red above personal and execution backgrounds. */
 [data-stp-typography] [data-row-key^='session:'][aria-selected='true'],
 [data-stp-typography] [data-dcu-session][aria-selected='true'],
 [data-stp-row][aria-current='true'] {
-  background: rgba(59,130,246,.25) !important;
-  background: color-mix(in srgb, #3b82f6 28%, var(--stp-token-background, transparent)) !important;
+  background: rgba(239,68,68,.25) !important;
+  background: color-mix(in srgb, #ef4444 28%, var(--stp-token-background, transparent)) !important;
 }
 /* ---------------------------------------------------------------------------
    THE PLUGIN'S OWN COLOUR DIALOG. Needed because a hidden
@@ -2060,6 +2067,7 @@ window.__ModuleLoader__.load({
         try {
           const result = await action(id)
           if (result?.ok === false) throw new Error(result.error?.message ?? '宿主拒绝了置顶操作')
+          if (!want && alive()) forgetAbsolutePins([id])
           return { ok: true }
         } catch (error) {
           if (alive()) {
@@ -2652,7 +2660,7 @@ window.__ModuleLoader__.load({
       const onDoubleClick = (event) => {
         if (!alive() || !(event.target instanceof Element)) return
         const target = event.target
-        if (target.closest('button, input, textarea, [data-stp-row-color], [data-stp-absolute-button]')) return
+        if (target.closest('button, input, textarea, [data-stp-row-color], [data-stp-absolute-button], [data-stp-pin-button]')) return
         const own = target.closest('[data-stp-row]')
         const flavor = currentFlavor(Date.now())
         const found = own === null ? findSessionRow(target, flavor) : { row: own, id: ownRowId(own) }
@@ -2669,6 +2677,26 @@ window.__ModuleLoader__.load({
       }
 
       const absolutePins = readAbsolutePins()
+      const forgetAbsolutePins = ids => {
+        if (ids.length === 0) return
+        const latest = readAbsolutePins()
+        let changed = false
+        for (const id of ids) { changed = latest.delete(id) || changed; absolutePins.delete(id) }
+        if (changed) {
+          try { globalThis.localStorage?.setItem?.(ABSOLUTE_STORAGE_KEY, JSON.stringify([...latest])) }
+          catch { surfaceError('超级置顶状态无法保存', 'refused') }
+        }
+      }
+      let previousPins = null
+      const refreshAbsolutePins = () => {
+        let snapshot
+        try { snapshot = workspaces.list.getSnapshot() } catch { return }
+        if (!Array.isArray(snapshot?.pinnedSessionIds) || connectionUnavailable()
+          || (snapshot.phase !== undefined && snapshot.phase !== 'ready')) return
+        const next = new Set(snapshot.pinnedSessionIds.map(String))
+        if (previousPins !== null) forgetAbsolutePins([...previousPins].filter(id => !next.has(id)))
+        previousPins = next
+      }
       let runtimeState = { sessions: {}, runningSessions: 0, runningAgents: 0 }
       let runtimePhase = 'loading'
       let summaryEl = null
@@ -2723,6 +2751,11 @@ window.__ModuleLoader__.load({
         void poll()
       }
 
+      // Keep an editor attached until it closes; reparenting would blur it and end IME.
+      const isAbsoluteRow = id => renameEdit?.id === id && renameEdit.row.hasAttribute('data-stp-row')
+        ? renameEdit.row.parentElement?.getAttribute('data-stp-tier') === 'absolute'
+        : absolutePins.has(id) && pinSet().has(id)
+
       // Capture one coherent Host snapshot for colors, counts and list ordering.
       const refreshRuntime = () => {
         let state
@@ -2734,6 +2767,8 @@ window.__ModuleLoader__.load({
           : { sessions: {}, runningSessions: 0, runningAgents: 0 }
         const roots = runtimeState.sessions
         const changed = []
+        let latestTime = 0
+        for (const entry of observedActivity.values()) latestTime = Math.max(latestTime, entry.time)
         for (const [id, execution] of Object.entries(roots)) {
           const summary = byId[id]
           const previous = observedActivity.get(id)
@@ -2744,7 +2779,12 @@ window.__ModuleLoader__.load({
           if (typeof summary?.running === 'boolean' && (
             (active && (previous === undefined || !previous.active || timestamp > previous.time))
             || (previous !== undefined && timestamp > previous.time && summary.blank !== true)
-          )) changed.push([id, timestamp])
+          )) {
+            // Without a Host clock, a start wins ties at the latest known time.
+            // Keep that inference out of observed clocks so later Host facts can replace it.
+            const clocklessStart = active && previous && !previous.active && timestamp === previous.time && !hostActivity.has(id)
+            changed.push([id, clocklessStart ? Math.max(timestamp, latestTime) : timestamp])
+          }
           observedActivity.set(id, { time: timestamp, active })
         }
         if (changed.length > 0) {
@@ -2757,15 +2797,16 @@ window.__ModuleLoader__.load({
           floatedActivity.delete(id)
         }
         const pinned = [...pinSet()]
-        const fixed = pinned.filter(id => absolutePins.has(id))
         const active = Object.keys(roots).filter(id => roots[id].running || roots[id].runningChildren > 0)
         // Keep a temporary row until its editor closes, even when execution ends.
         const editing = renameEdit?.row.hasAttribute('data-stp-row') ? [renameEdit.id] : []
+        const fixed = [...new Set([...pinned, ...editing])].filter(isAbsoluteRow)
         const rest = [...new Set([...pinned, ...active, ...editing])].filter(id => !fixed.includes(id))
         rest.sort((a, b) => {
           const left = floatedActivity.get(a)
           const right = floatedActivity.get(b)
-          return (right?.time ?? 0) - (left?.time ?? 0)
+          return Math.max(right?.time ?? 0, observedActivity.get(b)?.time ?? 0)
+            - Math.max(left?.time ?? 0, observedActivity.get(a)?.time ?? 0)
             || (right?.sequence ?? 0) - (left?.sequence ?? 0)
         })
         visibleSessions = [...fixed, ...rest]
@@ -2813,8 +2854,32 @@ window.__ModuleLoader__.load({
           row.insertBefore(button, row.querySelector('[data-stp-row-color]'))
         }
         absoluteRows.add(row)
-        const fixed = absolutePins.has(id) && pinSet().has(id)
-        const label = fixed ? '取消绝对置顶' : '绝对最顶'
+        let ordinary = row.querySelector('[data-stp-pin-button]')
+        if (ordinary === null) {
+          ordinary = document.createElement('span')
+          ordinary.setAttribute('role', 'button')
+          ordinary.setAttribute('tabindex', '0')
+          ordinary.setAttribute('data-stp-pin-button', '')
+          const activate = event => {
+            if (event.type === 'keydown' && event.key !== 'Enter' && event.key !== ' ') return
+            event.preventDefault()
+            event.stopPropagation()
+            void togglePin(id, !pinSet().has(id))
+          }
+          ordinary.addEventListener('click', activate)
+          ordinary.addEventListener('keydown', activate)
+          ordinary.addEventListener('dblclick', event => { event.stopPropagation() })
+          row.insertBefore(ordinary, button)
+        }
+        const pinned = pinSet().has(id)
+        const pinLabel = pinned ? '取消置顶' : '普通置顶'
+        if (ordinary.getAttribute('aria-label') !== pinLabel) ordinary.setAttribute('aria-label', pinLabel)
+        if (ordinary.getAttribute('title') !== pinLabel) ordinary.setAttribute('title', pinLabel)
+        if (ordinary.getAttribute('aria-pressed') !== String(pinned)) ordinary.setAttribute('aria-pressed', String(pinned))
+        const pinGlyph = pinned ? '−' : '+'
+        if (ordinary.textContent !== pinGlyph) ordinary.textContent = pinGlyph
+        const fixed = absolutePins.has(id) && pinned
+        const label = fixed ? '取消超级置顶（保留普通置顶）' : '超级置顶'
         if (button.getAttribute('aria-label') !== label) button.setAttribute('aria-label', label)
         if (button.getAttribute('title') !== label) button.setAttribute('title', label)
         if (button.getAttribute('aria-pressed') !== String(fixed)) button.setAttribute('aria-pressed', String(fixed))
@@ -2855,6 +2920,7 @@ window.__ModuleLoader__.load({
         runtimeRows.clear()
         for (const row of absoluteRows) {
           row.querySelector('[data-stp-absolute-button]')?.remove()
+          row.querySelector('[data-stp-pin-button]')?.remove()
           row.removeAttribute('data-stp-absolute')
         }
         absoluteRows.clear()
@@ -3163,7 +3229,7 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const PINNED_LABEL = () => translate('region.pinned', '已置顶')
+      const PINNED_LABEL = () => translate('region.pinned', '普通置顶')
 
 /** Decorative pin glyphs, standing in for the ui-primitives icons. */
       const PIN_GLYPH_FILLED = '\u{1F4CC}'
@@ -3999,6 +4065,7 @@ window.__ModuleLoader__.load({
       /** The region header and its label cell, kept across renders. */
       let regionHeaderEl = null
       let regionHeaderLabelEl = null
+      let absoluteRegionEl = null
 
       /**
        * The remembered fold for this mount, or `null` until a header exists.
@@ -4073,7 +4140,7 @@ window.__ModuleLoader__.load({
           // Ahead of the trailing colour point, exactly where a first render
           // puts it: appending here would land the time AFTER it on the rows
           // whose summary arrived without a timestamp.
-          row.insertBefore(cell, row.querySelector('[data-stp-runtime-label], [data-stp-absolute-button], [' + SWATCH_ATTR + ']'))
+          row.insertBefore(cell, row.querySelector('[data-stp-runtime-label], [data-stp-pin-button], [data-stp-absolute-button], [' + SWATCH_ATTR + ']'))
           return
         }
         if (cell.textContent !== time) cell.textContent = time
@@ -4234,23 +4301,26 @@ window.__ModuleLoader__.load({
        * @param {number} index - its index within the official pin sequence.
        * @param {number} firstRowAt - the DOM slot the first row occupies.
        */
-      const placeRow = (row, index, firstRowAt) => {
+      const placeRow = (row, index, firstRowAt, fixed) => {
         const id = row.getAttribute('data-stp-session')
         const at = renderedOrder.indexOf(id)
-        if (at === index) return
-        if (renameEdit?.row === row && at >= 0) {
+        const isFixed = fixed.includes(id)
+        const target = isFixed ? absoluteRegionEl : regionEl
+        const slot = isFixed ? index + 1 : firstRowAt + index - fixed.length
+        if (at === index && row.parentElement === target && target.children[slot] === row) return
+        const from = [...target.children].indexOf(row)
+        if (renameEdit?.row === row && from >= 0) {
           // Moving the editor itself blurs it and interrupts IME composition.
           // Move the intervening siblings around it, keeping its subtree attached.
           const after = row.nextElementSibling
-          for (let cursor = index; cursor < at; cursor += 1) {
-            regionEl.insertBefore(regionEl.children[firstRowAt + index], after)
+          for (let cursor = slot; cursor < from; cursor += 1) {
+            target.insertBefore(target.children[slot], after)
           }
-          for (let cursor = at; cursor < index; cursor += 1) {
-            regionEl.insertBefore(row.nextElementSibling, row)
+          for (let cursor = from; cursor < slot; cursor += 1) {
+            target.insertBefore(row.nextElementSibling, row)
           }
         } else {
-          const want = firstRowAt + index
-          regionEl.insertBefore(row, regionEl.children[want] ?? null)
+          target.insertBefore(row, target.children[slot] ?? null)
         }
         if (at >= 0) renderedOrder.splice(at, 1)
         renderedOrder.splice(index, 0, id)
@@ -4272,6 +4342,7 @@ window.__ModuleLoader__.load({
         renderedOrder = []
         regionHeaderEl = null
         regionHeaderLabelEl = null
+        absoluteRegionEl = null
         clearChildren(regionEl)
       }
 
@@ -4296,7 +4367,8 @@ window.__ModuleLoader__.load({
         const pinned = visibleSessions
         const byId = sessionById()
         const current = currentSessionId()
-        const signature = regionSignature(pinned, byId, current) + JSON.stringify([runtimeState, [...absolutePins]])
+        const fixed = pinned.filter(isAbsoluteRow)
+        const signature = regionSignature(pinned, byId, current) + JSON.stringify([runtimeState, [...absolutePins], fixed, [...pinSet()]])
         if (signature === renderedRegionSignature) return
         renderedRegionSignature = signature
 
@@ -4351,16 +4423,32 @@ window.__ModuleLoader__.load({
           regionEl.setAttribute('role', 'group')
           regionEl.appendChild(regionHeaderEl)
         }
-        const label = PINNED_LABEL() + (pinned.some(id => !pinSet().has(id)) ? ' · ' + translate('region.active', '活跃') : '')
-        if (regionEl.getAttribute('aria-label') !== label) regionEl.setAttribute('aria-label', label)
-        if (regionHeaderEl.getAttribute('aria-label') !== label) regionHeaderEl.setAttribute('aria-label', label)
-        if (regionHeaderLabelEl.textContent !== label) regionHeaderLabelEl.textContent = label
         applyRegionFold()
         const count = regionHeaderEl.querySelector('[data-stp-region-count]')
-        if (count.textContent !== String(pinned.length)) count.textContent = String(pinned.length)
         // `children` is an HTMLCollection in a real document, so the header's
         // slot is materialized once here rather than per row.
+        if (fixed.length > 0 && absoluteRegionEl === null) {
+          absoluteRegionEl = document.createElement('div')
+          absoluteRegionEl.setAttribute('data-stp-tier', 'absolute')
+          absoluteRegionEl.setAttribute('role', 'group')
+          absoluteRegionEl.setAttribute('aria-label', '超级置顶')
+          const heading = document.createElement('div')
+          heading.setAttribute('data-stp-tier-header', '')
+          absoluteRegionEl.appendChild(heading)
+          regionEl.insertBefore(absoluteRegionEl, regionHeaderEl)
+        }
+        if (absoluteRegionEl !== null) {
+          const heading = absoluteRegionEl.querySelector('[data-stp-tier-header]')
+          const title = '★ 超级置顶 · ' + fixed.length
+          if (heading.textContent !== title) heading.textContent = title
+        }
+        const ordinary = pinned.filter(id => !fixed.includes(id))
         const firstRowAt = [...regionEl.children].indexOf(regionHeaderEl) + 1
+        const normalLabel = PINNED_LABEL() + (ordinary.some(id => !pinSet().has(id)) ? ' · ' + translate('region.active', '活跃') : '')
+        if (regionEl.getAttribute('aria-label') !== normalLabel) regionEl.setAttribute('aria-label', normalLabel)
+        if (regionHeaderLabelEl.textContent !== normalLabel) regionHeaderLabelEl.textContent = normalLabel
+        if (regionHeaderEl.getAttribute('aria-label') !== normalLabel) regionHeaderEl.setAttribute('aria-label', normalLabel)
+        if (count.textContent !== String(ordinary.length)) count.textContent = String(ordinary.length)
 
         for (const [index, id] of pinned.entries()) {
           const existing = renderedRows.get(id)
@@ -4369,11 +4457,15 @@ window.__ModuleLoader__.load({
             // the region does not flicker between renders.
             const row = makeRow(id, byId[id], id === current)
             renderedRows.set(id, row)
-            placeRow(row, index, firstRowAt)
+            placeRow(row, index, firstRowAt, fixed)
           } else {
             updateRow(existing, byId[id], id === current)
-            placeRow(existing, index, firstRowAt)
+            placeRow(existing, index, firstRowAt, fixed)
           }
+        }
+        if (fixed.length === 0 && absoluteRegionEl !== null) {
+          absoluteRegionEl.remove()
+          absoluteRegionEl = null
         }
         scheduleTimeLabelRefresh()
       }
@@ -5150,6 +5242,7 @@ window.__ModuleLoader__.load({
           // is already happening.
           refreshSessions()
           refreshConnection()
+          refreshAbsolutePins()
           reconcileRightSidebar()
           invalidateFlavor()
           const flavor = currentFlavor(Date.now())
@@ -5277,7 +5370,7 @@ window.__ModuleLoader__.load({
         if (!(node instanceof Element)) return false
         if (node === regionEl || node === anchorEl) return true
         if (node.getAttribute?.('data-plugin') === PLUGIN_ID) return true
-        return node.closest?.('[data-stp-region], [data-stp-anchor], [data-stp-notice], [data-stp-color-dialog], [data-stp-runtime-summary], [data-stp-runtime-label], [data-stp-absolute-button], [data-stp-rename-input]') != null
+        return node.closest?.('[data-stp-region], [data-stp-anchor], [data-stp-notice], [data-stp-color-dialog], [data-stp-runtime-summary], [data-stp-runtime-label], [data-stp-absolute-button], [data-stp-pin-button], [data-stp-rename-input]') != null
       }
 
       /**
@@ -5749,8 +5842,8 @@ window.__ModuleLoader__.load({
         // would re-create hosts on a page this instance no longer serves.
         if (!alive()) return
         try {
-          await action(sessionId)
-          if (!alive()) return
+          const result = await applyOfficialPin(sessionId, want)
+          if (!result.ok || !alive()) return
           scheduleReconcile()
         } catch (error) {
           if (!alive()) return
@@ -6510,7 +6603,7 @@ window.__ModuleLoader__.load({
 
         // Re-run on every list/broadcast change: the pin set, the group
         // membership and the session summaries all drive the projection.
-        const onWorkspaces = () => { scheduleReconcile() }
+        const onWorkspaces = () => { refreshAbsolutePins(); scheduleReconcile() }
         try {
           disposers.push(workspaces.list.subscribe(onWorkspaces))
         } catch (error) {
