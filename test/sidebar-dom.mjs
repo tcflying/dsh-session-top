@@ -239,6 +239,8 @@ class El {
       // restores a property that still carries the value IT wrote.
       getPropertyValue: (k) => this.style.props.get(k) ?? '',
       getPropertyPriority: (k) => this.style.priorities.get(k) ?? '',
+      get gridTemplateColumns() { return this.props.get('grid-template-columns') ?? '' },
+      set gridTemplateColumns(value) { this.setProperty('grid-template-columns', value) },
     }
     this.sheet = { cssRules: [], deleteRule(i) { this.cssRules.splice(i, 1) }, insertRule(c) { this.cssRules.push(c); return 0 } }
     /**
@@ -752,6 +754,34 @@ function officialUiScaffold({ rail = false, folded = false, hostRowMenu = true, 
      */
     liveRow: () => s.tree.querySelector(`[data-row-key="session:${S1}"]`),
   }
+}
+
+/** Build the host AppFrame shape used by the layout-memory bridge. */
+function layoutScaffold({
+  grid = '280px minmax(400px, 1fr) minmax(0px, 640px)',
+  width = 1600,
+  sidebarCollapsed = false,
+  rightbarCollapsed = false,
+} = {}) {
+  const s = officialUiScaffold()
+  const frame = new El('div')
+  frame.className = 'ZZIitW_frame host-frame'
+  // The real CSSStyleDeclaration also exposes a style attribute; keep the
+  // marker explicit because this fake does not serialize property writes.
+  frame.setAttribute('style', 'grid-template-columns: ' + grid)
+  frame.style.gridTemplateColumns = grid
+  frame._rect = { left: 0, top: 0, width, height: 900, right: width, bottom: 900 }
+  if (sidebarCollapsed) frame.setAttribute('data-sidebar-collapsed', 'true')
+  if (rightbarCollapsed) frame.setAttribute('data-rightbar-collapsed', 'true')
+  const sidebarHandle = new El('div')
+  sidebarHandle.setAttribute('data-side', 'sidebar')
+  const rightbarHandle = new El('div')
+  rightbarHandle.setAttribute('data-side', 'rightbar')
+  frame.appendChild(s.root)
+  frame.appendChild(sidebarHandle)
+  frame.appendChild(rightbarHandle)
+  s.body.appendChild(frame)
+  return { ...s, frame, sidebarHandle, rightbarHandle }
 }
 
 /**
@@ -7392,6 +7422,79 @@ function importantOf(css, selector) {
   assert.equal(stockTree.getAttribute('data-stp-typography'), null)
   run.dispose()
   console.log('✔ flavor: the official positive marker outranks codex, and the correction reaches both ways')
+}
+
+// --- LAYOUT MEMORY. The real host owns this frame; the plugin only remembers
+// the two draggable edge tracks and derives the center from the live viewport.
+{
+  const sc = layoutScaffold({
+    grid: '320px minmax(400px, 1fr) minmax(0px, 640px)',
+    width: 1600,
+  })
+  const run = await runBundle(sc, { pinned: [] })
+  await settle()
+
+  // A pointerup elsewhere is not a drag completion and must not write a
+  // preference. The positive data-side marker is the ownership boundary.
+  const unrelated = new El('button')
+  sc.body.appendChild(unrelated)
+  unrelated.dispatchEvent(new MouseEvent('pointerup'))
+  await settle()
+  assert.equal(run.storageCalls.writes.length, 0, 'unrelated pointerup must not write layout memory')
+
+  // The host has just committed the drag to its inline grid. Deliver the same
+  // document-capture pointerup the browser delivers after pointer capture.
+  sc.frame.style.gridTemplateColumns = '360px minmax(400px, 1fr) minmax(0px, 720px)'
+  sc.sidebarHandle.dispatchEvent(new MouseEvent('pointerup'))
+  await settle()
+  assert.equal(run.storageCalls.writes.length, 1, 'a positive sidebar handle pointerup writes once')
+  assert.deepEqual(JSON.parse(run.storageCalls.writes[0][1]), {
+    version: 1,
+    viewport: 1600,
+    sidebar: 360,
+    rightbar: 720,
+  })
+
+  sc.frame.style.gridTemplateColumns = '370px minmax(400px, 1fr) minmax(0px, 740px)'
+  sc.rightbarHandle.dispatchEvent(new MouseEvent('pointerup'))
+  await settle()
+  assert.equal(run.storageCalls.writes.length, 2, 'a positive rightbar handle pointerup writes once')
+  assert.deepEqual(JSON.parse(run.storageCalls.writes[1][1]), {
+    version: 1,
+    viewport: 1600,
+    sidebar: 370,
+    rightbar: 740,
+  })
+
+  // A fresh plugin generation sees the saved preference after the host has
+  // rendered its defaults again. It changes only the edge tracks; the center
+  // expression remains the host's own minmax(400px, 1fr).
+  run.dispose()
+  sc.frame.style.gridTemplateColumns = '280px minmax(400px, 1fr) minmax(0px, 640px)'
+  const remounted = await runBundle(sc, { pinned: [], storageFixture: run.storageFixture })
+  await settle()
+  assert.equal(
+    sc.frame.style.gridTemplateColumns,
+    '370px minmax(400px, 1fr) minmax(0px, 740px)',
+    'remount restores the latest saved left and right tracks and leaves center derived',
+  )
+
+  // Collapsed tracks stay collapsed while their saved widths remain in storage;
+  // once the host exposes both handles again, the next reconcile restores them.
+  sc.frame.style.gridTemplateColumns = '56px minmax(0px, 1fr) minmax(0px, 0px)'
+  sc.frame.setAttribute('data-sidebar-collapsed', 'true')
+  sc.frame.setAttribute('data-rightbar-collapsed', 'true')
+  remounted.nudge()
+  await settle()
+  assert.equal(sc.frame.style.gridTemplateColumns, '56px minmax(0px, 1fr) minmax(0px, 0px)')
+  sc.frame.removeAttribute('data-sidebar-collapsed')
+  sc.frame.removeAttribute('data-rightbar-collapsed')
+  sc.frame.style.gridTemplateColumns = '280px minmax(400px, 1fr) minmax(0px, 640px)'
+  remounted.nudge()
+  await settle()
+  assert.equal(sc.frame.style.gridTemplateColumns, '370px minmax(400px, 1fr) minmax(0px, 740px)')
+  remounted.dispose()
+  console.log('✔ layout memory: positive drag completion persists and remount recovery respects collapsed tracks')
 }
 
 console.log('\nALL SIDEBAR-FLAVOR DOM CHECKS PASSED')

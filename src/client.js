@@ -552,6 +552,130 @@ window.__ModuleLoader__.load({
       } catch { /* the fold still works, it just will not be remembered */ }
     }
 
+    // The host owns these tracks. Keep only the two draggable boundaries; the
+    // centre is derived from the current viewport on the next host render.
+    const LAYOUT_WIDTHS_STORAGE_KEY = 'dsh-session-top:layout-widths:v1'
+    const LAYOUT_MIN_SIDEBAR = 264
+    const LAYOUT_MAX_SIDEBAR = 420
+    const LAYOUT_MIN_RIGHTBAR = 300
+    const LAYOUT_MAX_RIGHTBAR_RATIO = 0.7
+    const LAYOUT_FRAME_SELECTOR = '[class*="_frame"][style]'
+    const LAYOUT_HANDLE_SELECTOR = '[data-side="sidebar"], [data-side="rightbar"]'
+
+    const layoutFinite = value => typeof value === 'number' && Number.isFinite(value)
+    const layoutClamp = (value, min, max) => Math.min(max, Math.max(min, Math.round(value)))
+
+    const parseLayoutGrid = (template, viewport) => {
+      if (typeof template !== 'string' || !layoutFinite(viewport) || viewport <= 0) return null
+      const tracks = [...template.matchAll(/(-?\d+(?:\.\d+)?)px/g)].map(match => Number(match[1]))
+      if (tracks.length < 2) return null
+      const sidebar = Math.max(0, Math.round(tracks[0]))
+      const rightbar = Math.max(0, Math.round(tracks[tracks.length - 1]))
+      return { sidebar, center: Math.max(0, Math.round(viewport) - sidebar - rightbar), rightbar }
+    }
+
+    const normalizeLayoutWidths = (viewport, sidebar, rightbar) => {
+      if (!layoutFinite(viewport) || viewport <= 0 || !layoutFinite(sidebar) || !layoutFinite(rightbar)) return null
+      return {
+        sidebar: layoutClamp(sidebar, LAYOUT_MIN_SIDEBAR, LAYOUT_MAX_SIDEBAR),
+        rightbar: rightbar === 0
+          ? 0
+          : layoutClamp(rightbar, LAYOUT_MIN_RIGHTBAR, Math.max(LAYOUT_MIN_RIGHTBAR, viewport * LAYOUT_MAX_RIGHTBAR_RATIO)),
+      }
+    }
+
+    const readLayoutPreference = () => {
+      try {
+        const value = JSON.parse(globalThis.localStorage?.getItem?.(LAYOUT_WIDTHS_STORAGE_KEY) ?? 'null')
+        if (value?.version !== 1) return null
+        if (!layoutFinite(value.viewport) || !layoutFinite(value.sidebar) || !layoutFinite(value.rightbar)) return null
+        return { viewport: value.viewport, sidebar: value.sidebar, rightbar: value.rightbar }
+      } catch {
+        return null
+      }
+    }
+
+    const writeLayoutPreference = (viewport, sidebar, rightbar) => {
+      const normalized = normalizeLayoutWidths(viewport, sidebar, rightbar)
+      if (normalized === null) return false
+      try {
+        globalThis.localStorage?.setItem?.(LAYOUT_WIDTHS_STORAGE_KEY, JSON.stringify({
+          version: 1, viewport, ...normalized,
+        }))
+        return true
+      } catch {
+        return false
+      }
+    }
+
+    // Positive host marker: the package's CSS-module frame token ends in
+    // '_frame', and the host puts the live grid in its inline style.
+    const layoutFrameFrom = node => {
+      let frame = null
+      try { frame = node?.closest?.(LAYOUT_FRAME_SELECTOR) ?? null } catch { /* stale DOM */ }
+      if (frame === null) {
+        try { frame = document.querySelector?.(LAYOUT_FRAME_SELECTOR) ?? null } catch { /* stale DOM */ }
+      }
+      if (frame === null || typeof frame.style?.gridTemplateColumns !== 'string') return null
+      const classes = String(frame.className ?? '').split(/\s+/)
+      return classes.some(token => token.endsWith('_frame')) ? frame : null
+    }
+
+    const layoutFrameMeasure = frame => {
+      if (frame === null || frame === undefined) return null
+      let rect = null
+      try { rect = frame.getBoundingClientRect?.() ?? null } catch { /* stale DOM */ }
+      const viewport = Number(rect?.width ?? frame.clientWidth)
+      const parsed = parseLayoutGrid(frame.style?.gridTemplateColumns, viewport)
+      return parsed === null ? null : { viewport, ...parsed }
+    }
+
+    const persistLayoutFrame = frame => {
+      const current = layoutFrameMeasure(frame)
+      if (current === null) return false
+      const saved = readLayoutPreference()
+      const sidebarCollapsed = frame.getAttribute?.('data-sidebar-collapsed') === 'true'
+      const rightbarCollapsed = frame.getAttribute?.('data-rightbar-collapsed') === 'true'
+      const sidebar = sidebarCollapsed ? saved?.sidebar : current.sidebar
+      const rightbar = rightbarCollapsed || current.rightbar < LAYOUT_MIN_RIGHTBAR
+        ? saved?.rightbar ?? 0
+        : current.rightbar
+      if (!layoutFinite(sidebar) || !layoutFinite(rightbar)) return false
+      return writeLayoutPreference(current.viewport, sidebar, rightbar)
+    }
+
+    const layoutGridWithEdges = (template, sidebar, rightbar) => {
+      const matches = [...String(template ?? '').matchAll(/(-?\d+(?:\.\d+)?)px/g)]
+      if (matches.length < 2) return null
+      let index = 0
+      return String(template).replace(/-?\d+(?:\.\d+)?px/g, () => {
+        const value = index === 0 ? sidebar : index === matches.length - 1 ? rightbar : Number(matches[index][1])
+        index += 1
+        return String(value) + 'px'
+      })
+    }
+
+    // Recover only a proven host frame. The host still owns its store, so this
+    // is a best-effort render bridge: its next React render may replace the
+    // inline grid, while a later reconcile can apply the preference again.
+    const restoreLayoutFrame = frame => {
+      const current = layoutFrameMeasure(frame)
+      const saved = readLayoutPreference()
+      if (current === null || saved === null) return false
+      const sidebarCollapsed = frame.getAttribute?.('data-sidebar-collapsed') === 'true'
+      const rightbarCollapsed = frame.getAttribute?.('data-rightbar-collapsed') === 'true'
+      const normalized = normalizeLayoutWidths(current.viewport, saved.sidebar, saved.rightbar)
+      if (normalized === null) return false
+      const sidebar = sidebarCollapsed ? current.sidebar : normalized.sidebar
+      const rightbar = rightbarCollapsed || current.rightbar < LAYOUT_MIN_RIGHTBAR
+        ? current.rightbar
+        : normalized.rightbar === 0 ? current.rightbar : normalized.rightbar
+      const next = layoutGridWithEdges(frame.style?.gridTemplateColumns, sidebar, rightbar)
+      if (next === null || next === frame.style.gridTemplateColumns) return false
+      frame.style.gridTemplateColumns = next
+      return true
+    }
+
     // Same pure derivation as runtime.js; the shipped factory cannot import it.
     function deriveRuntime(byId = {}, ids = Object.keys(byId ?? {})) {
       const summaries = byId ?? {}
@@ -1652,6 +1776,7 @@ window.__ModuleLoader__.load({
           releaseTimer(reconcileTimer)
           reconcileTimer = null
         }
+
         for (const timer of alertTimers) clearTimeout(timer)
         alertTimers.clear()
         // And the rest, whichever call site armed them and whichever variable
@@ -1683,6 +1808,16 @@ window.__ModuleLoader__.load({
       let observer
       let onDismiss
       let dynamicSheet = null
+      const onLayoutPointerUp = event => {
+        const handle = event?.target?.closest?.(LAYOUT_HANDLE_SELECTOR)
+        if (handle === null || handle === undefined) return
+        const frame = layoutFrameFrom(handle)
+        if (frame === null) return
+        const timer = ownTimer(setTimeout(() => {
+          mountTimers.delete(timer)
+          if (alive()) persistLayoutFrame(frame)
+        }, 0))
+      }
 
       // THE SHARED STYLES ARE CLAIMED BEFORE THEY ARE TOUCHED.
       //
@@ -5292,6 +5427,8 @@ window.__ModuleLoader__.load({
       const reconcile = () => {
         scheduled = false
         if (!alive()) return
+        const layoutFrame = layoutFrameFrom(null)
+        if (layoutFrame !== null) restoreLayoutFrame(layoutFrame)
         // Consumed here, at the only place that runs: a confirm pass that took
         // an early exit must not make the NEXT reconcile read-only too.
         const confirmOnly = confirmOnlyPass
@@ -6669,6 +6806,8 @@ window.__ModuleLoader__.load({
         disposers.push(releaseConnection)
         document.addEventListener('contextmenu', onContextMenu, true)
         document.addEventListener('dblclick', onDoubleClick, true)
+        document.addEventListener('pointerup', onLayoutPointerUp, true)
+        disposers.push(() => document.removeEventListener('pointerup', onLayoutPointerUp, true))
         for (const type of ['click', 'keydown']) {
           document.addEventListener(type, onGroupToggle, true)
           disposers.push(() => document.removeEventListener(type, onGroupToggle, true))
