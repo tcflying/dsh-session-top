@@ -6875,7 +6875,7 @@ window.__ModuleLoader__.load({
           }
           if (external.length > 0) scheduleReconcile()
         })
-        observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeOldValue: true, attributeFilter: ['aria-expanded'] })
+        observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeOldValue: true, attributeFilter: ['aria-expanded', 'style'] })
 
         // Dismiss the context menu on any outside interaction.
         onDismiss = (event) => {

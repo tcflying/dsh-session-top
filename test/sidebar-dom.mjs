@@ -230,11 +230,24 @@ class El {
       // un-hide look effective in tests and inert on the page.
       priorities: new Map(),
       setProperty: (k, v, priority) => {
-        this.style.props.set(k, v)
-        if (priority === undefined || priority === '') this.style.priorities.delete(k)
-        else this.style.priorities.set(k, priority)
+        const next = String(v)
+        const previous = this.style.props.get(k)
+        const previousPriority = this.style.priorities.get(k) ?? ''
+        const nextPriority = priority === undefined || priority === '' ? '' : priority
+        this.style.props.set(k, next)
+        if (nextPriority === '') this.style.priorities.delete(k)
+        else this.style.priorities.set(k, nextPriority)
+        if (previous !== next || previousPriority !== nextPriority) {
+          emitMutation(this, [], [], 'style', previous ?? null)
+        }
       },
-      removeProperty: (k) => { this.style.props.delete(k); this.style.priorities.delete(k) },
+      removeProperty: (k) => {
+        if (!this.style.props.has(k) && !this.style.priorities.has(k)) return
+        const previous = this.style.props.get(k) ?? null
+        this.style.props.delete(k)
+        this.style.priorities.delete(k)
+        emitMutation(this, [], [], 'style', previous)
+      },
       // Read-back is part of the contract the anchor undo depends on: it only
       // restores a property that still carries the value IT wrote.
       getPropertyValue: (k) => this.style.props.get(k) ?? '',
@@ -7477,6 +7490,17 @@ function importantOf(css, selector) {
     sc.frame.style.gridTemplateColumns,
     '370px minmax(400px, 1fr) minmax(0px, 740px)',
     'remount restores the latest saved left and right tracks and leaves center derived',
+  )
+
+  // The host writes its default grid again during the first React render after
+  // the plugin's restore. That style mutation must trigger a second reconcile;
+  // otherwise restart briefly restores the saved tracks and then loses them.
+  sc.frame.style.gridTemplateColumns = '280px minmax(400px, 1fr) minmax(0px, 640px)'
+  await settle()
+  assert.equal(
+    sc.frame.style.gridTemplateColumns,
+    '370px minmax(400px, 1fr) minmax(0px, 740px)',
+    'a host grid rewrite after restore must be corrected by the layout observer',
   )
 
   // Collapsed tracks stay collapsed while their saved widths remain in storage;
