@@ -6,4 +6,4 @@
 
 每次交付提供完整 GitHub 信息：仓库名与链接、远端名与地址、推送分支与链接、完整提交 SHA、提交标题与链接、改动文件与摘要、测试命令与结果、实际应用核验结果（如适用）、推送结果、远端分支 SHA 与本地提交是否一致、工作区状态。涉及 PR、Actions 或 Release 时提供链接和核验后的状态；未创建或未核验时明确说明。
 
-当前 desktop profile 加载的客户端入口是 `D:/mmx-project/dsh官方/dsh-plugins/dsh-session-top/src/client.js`。本工作区 `src/client.js` 就是完整客户端 bundle，无构建步骤。仅改客户端时，先完整备份当前入口，再应用工作区文件并比对 SHA-256；保留其他安装文件和 profile 映射，通过现有 HMR 加载并核验实际桌面行为。更换包路径涉及 Host 缓存，不把改链接或刷新页面当作已生效。
+当前 desktop profile 加载的客户端入口是 `G:/DeepSeekHarnessData/home/profiles/desktop/node_modules/dsh-session-top/src/client.js`（2026-11-19 核对：`D:/mmx-project/dsh官方/dsh-plugins/dsh-session-top/src/client.js` 已不存在，D 盘未挂载）。该 profile 的 package.json 把 `dsh-session-top` 固定到 `github:tcflying/dsh-session-top#<commit-sha>`，安装目录里的文件即该提交的内容。本工作区 `src/client.js` 就是完整客户端 bundle，无构建步骤。仅改客户端时，先完整备份当前入口，再应用工作区文件并比对 SHA-256（安装目录是 LF、工作区是 CRLF，必须先做行尾归一化再比对，否则永远对不上）；保留其他安装文件和 profile 映射，通过现有 HMR 加载并核验实际桌面行为。要让官方 profile 装到新提交，需改 profile 的 pin 并重跑 pnpm install——只刷新页面不算已生效。
