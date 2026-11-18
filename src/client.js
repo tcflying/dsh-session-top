@@ -681,7 +681,11 @@ window.__ModuleLoader__.load({
       const summaries = byId ?? {}
       const listed = new Set(ids)
       const engaged = new Set(engagedIds ?? [])
-      const isRunning = id => summaries[id]?.running === true || engaged.has(id)
+      const isRunning = id => {
+        const summary = summaries[id]
+        if (typeof summary?.running === 'boolean') return summary.running
+        return engaged.has(id)
+      }
       const sessions = new Map()
       let runningSessions = 0
       let runningAgents = 0

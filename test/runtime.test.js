@@ -8,6 +8,13 @@ const summary = (id, fields = {}) => ({
   id, updatedAt: 0, displayTitle: id, running: false, blank: false, retainedBy: {}, ...fields,
 })
 
+// A Host summary that carries no running flag at all: the only shape in which
+// the Host's engaged set can still speak, because it cannot contradict one.
+const unflagged = (id, fields = {}) => {
+  const { running, ...rest } = summary(id, fields)
+  return rest
+}
+
 test('counts executing roots independently from executing subagents', () => {
   assert.deepEqual(deriveRuntime({
     green: summary('green', { running: true }),
@@ -112,10 +119,10 @@ test('walks deep descendant chains iteratively', () => {
     runningSessions: 0, runningAgents: 12000,
   })
 })
-test('counts Host-engaged ids as running even without a summary running flag', () => {
+test('counts Host-engaged ids as running when the summary carries no running flag', () => {
   const byId = {
-    root: summary('root'),
-    child: summary('child', { origin: 'subagent', parentId: 'root' }),
+    root: unflagged('root'),
+    child: unflagged('child', { origin: 'subagent', parentId: 'root' }),
     idle: summary('idle'),
   }
   assert.deepEqual(deriveRuntime(byId, ['root', 'child', 'idle'], ['root']), {
@@ -125,6 +132,27 @@ test('counts Host-engaged ids as running even without a summary running flag', (
   assert.deepEqual(deriveRuntime(byId, ['root', 'child', 'idle'], ['child']), {
     sessions: { root: { running: false, runningChildren: 1 }, idle: { running: false, runningChildren: 0 } },
     runningSessions: 0, runningAgents: 1,
+  })
+})
+
+test('an explicit idle summary overrides a stale Host-engaged id', () => {
+  // The Host's engaged set only ever grows: an id stays engaged after the
+  // session stopped, so a summary that says idle is the truth that wins.
+  const byId = {
+    stopped: summary('stopped'),
+    idle: summary('idle'),
+  }
+  assert.deepEqual(deriveRuntime(byId, ['stopped', 'idle'], ['stopped']), {
+    sessions: { stopped: { running: false, runningChildren: 0 }, idle: { running: false, runningChildren: 0 } },
+    runningSessions: 0, runningAgents: 0,
+  })
+})
+
+test('an explicit running summary counts even when the Host never engaged it', () => {
+  const byId = { live: summary('live', { running: true }) }
+  assert.deepEqual(deriveRuntime(byId, ['live'], []), {
+    sessions: { live: { running: true, runningChildren: 0 } },
+    runningSessions: 1, runningAgents: 0,
   })
 })
 

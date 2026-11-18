@@ -6,8 +6,16 @@
 /**
  * Derive root execution and descendant counts without consulting resident Agents.
  * Only ids in the Host list establish running status; retained byId fallbacks
- * may connect ancestry but cannot contribute execution counts. A Host-engaged
- * id counts as running even when its summary carries no running flag.
+ * may connect ancestry but cannot contribute execution counts.
+ *
+ * The Host's engaged set is MONOTONIC: the Host adds an id when a session
+ * starts and never removes it while the session stays in the list, so "engaged"
+ * really means "ran at some point since this client connected". Treating it as
+ * a running signal paints every session that ever ran green for the rest of
+ * the page's life. The summary's own boolean is the live flag (the Host's
+ * session/status event rewrites it on every start and stop), so an explicit
+ * boolean wins in BOTH directions and the engaged set only fills in the one
+ * case it cannot contradict: a summary that carries no flag at all.
  * @param {Record<string, {origin?: string, parentId?: string, running?: boolean}> | null} byId - client summaries.
  * @param {readonly string[]} ids - authoritative Host list membership.
  * @param {readonly string[]} engagedIds - ids the Host reports as engaged.
@@ -17,7 +25,11 @@ export function deriveRuntime(byId = {}, ids = Object.keys(byId ?? {}), engagedI
   const summaries = byId ?? {}
   const listed = new Set(ids)
   const engaged = new Set(engagedIds ?? [])
-  const isRunning = id => summaries[id]?.running === true || engaged.has(id)
+  const isRunning = id => {
+    const summary = summaries[id]
+    if (typeof summary?.running === 'boolean') return summary.running
+    return engaged.has(id)
+  }
   const sessions = new Map()
   let runningSessions = 0
   let runningAgents = 0
