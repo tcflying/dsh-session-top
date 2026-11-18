@@ -1,2 +1,5 @@
 .local/
 .codegraph/
+/tmp/
+# stray Windows cache files written by a process with an unexpanded %SystemDrive%
+/%SystemDrive%/

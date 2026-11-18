@@ -895,13 +895,12 @@ window.__ModuleLoader__.load({
 }
 [data-stp-region] { max-height: 55vh; overflow-y: auto; flex: none; }
 [data-stp-row][data-stp-absolute] [data-stp-row-slot] { color: #eab308; }
-[data-stp-absolute-button], [data-stp-pin-button] {
+[data-stp-absolute-button] {
   border: 0; padding: 2px 4px; min-height: 24px; background: transparent;
   color: var(--stp-token-secondary, inherit); cursor: pointer; flex: none;
   display: inline-flex; align-items: center; justify-content: center; min-width: 24px; box-sizing: border-box;
 }
-[data-stp-absolute-button]:focus-visible, [data-stp-pin-button]:focus-visible { outline: 2px solid currentColor; outline-offset: -2px; }
-[data-stp-pin-button][aria-pressed='true'] { color: var(--stp-token-primary, inherit); }
+[data-stp-absolute-button]:focus-visible { outline: 2px solid currentColor; outline-offset: -2px; }
 [data-stp-absolute-button][aria-pressed='true'] { color: #eab308; }
 [data-stp-rename-input] {
   flex: 1 1 auto; min-width: 30px; width: 50%; padding: 2px 4px;
@@ -989,6 +988,14 @@ window.__ModuleLoader__.load({
   background: transparent;
 }
 [data-stp-row-color][data-stp-row-color-set]::after { background: var(--stp-row-color, transparent); }
+/* A row with no colour of its own has nothing to show in the colour point,
+   and an empty 24px box in every row is the difference between a readable
+   title and a title squeezed out of existence. The point collapses to
+   nothing; a row that DOES carry a colour keeps it, and the shared menu
+   (自定义行背景颜色…) still opens the picker. */
+[data-stp-row-color]:not([data-stp-row-color-set]) {
+  width: 0; padding: 0; overflow: hidden;
+}
 [data-stp-row-color]:hover::after { border-color: var(--stp-token-primary, currentColor); }
 [data-stp-row-color]:focus-visible {
   outline: 2px solid var(--stp-token-primary, currentColor); outline-offset: 1px;
@@ -2864,7 +2871,7 @@ window.__ModuleLoader__.load({
       const onDoubleClick = (event) => {
         if (!alive() || !(event.target instanceof Element)) return
         const target = event.target
-        if (target.closest('button, input, textarea, [data-stp-row-color], [data-stp-absolute-button], [data-stp-pin-button]')) return
+        if (target.closest('button, input, textarea, [data-stp-row-color], [data-stp-absolute-button]')) return
         const own = target.closest('[data-stp-row]')
         const flavor = currentFlavor(Date.now())
         const found = own === null ? findSessionRow(target, flavor) : { row: own, id: ownRowId(own) }
@@ -3072,31 +3079,8 @@ window.__ModuleLoader__.load({
           row.insertBefore(button, row.querySelector('[data-stp-row-color]'))
         }
         absoluteRows.add(row)
-        let ordinary = row.querySelector('[data-stp-pin-button]')
-        if (ordinary === null) {
-          ordinary = document.createElement('span')
-          ordinary.setAttribute('role', 'button')
-          ordinary.setAttribute('tabindex', '0')
-          ordinary.setAttribute('data-stp-pin-button', '')
-          const activate = event => {
-            if (event.type === 'keydown' && event.key !== 'Enter' && event.key !== ' ') return
-            event.preventDefault()
-            event.stopPropagation()
-            void togglePin(id, !pinSet().has(id))
-          }
-          ordinary.addEventListener('click', activate)
-          ordinary.addEventListener('keydown', activate)
-          ordinary.addEventListener('dblclick', event => { event.stopPropagation() })
-          row.insertBefore(ordinary, button)
-        }
         const pinned = pinSet().has(id)
         const fixed = absolutePins.has(id) && pinned
-        const pinLabel = fixed ? '取消超级置顶（保留普通置顶）' : pinned ? '取消置顶' : '普通置顶'
-        if (ordinary.getAttribute('aria-label') !== pinLabel) ordinary.setAttribute('aria-label', pinLabel)
-        if (ordinary.getAttribute('title') !== pinLabel) ordinary.setAttribute('title', pinLabel)
-        if (ordinary.getAttribute('aria-pressed') !== String(pinned)) ordinary.setAttribute('aria-pressed', String(pinned))
-        const pinGlyph = pinned ? '−' : '+'
-        if (ordinary.textContent !== pinGlyph) ordinary.textContent = pinGlyph
         const label = fixed ? '取消超级置顶（保留普通置顶）' : '超级置顶'
         if (button.getAttribute('aria-label') !== label) button.setAttribute('aria-label', label)
         if (button.getAttribute('title') !== label) button.setAttribute('title', label)
@@ -3138,7 +3122,6 @@ window.__ModuleLoader__.load({
         runtimeRows.clear()
         for (const row of absoluteRows) {
           row.querySelector('[data-stp-absolute-button]')?.remove()
-          row.querySelector('[data-stp-pin-button]')?.remove()
           row.removeAttribute('data-stp-absolute')
         }
         absoluteRows.clear()
@@ -4358,7 +4341,7 @@ window.__ModuleLoader__.load({
           // Ahead of the trailing colour point, exactly where a first render
           // puts it: appending here would land the time AFTER it on the rows
           // whose summary arrived without a timestamp.
-          row.insertBefore(cell, row.querySelector('[data-stp-runtime-label], [data-stp-pin-button], [data-stp-absolute-button], [' + SWATCH_ATTR + ']'))
+          row.insertBefore(cell, row.querySelector('[data-stp-runtime-label], [data-stp-absolute-button], [' + SWATCH_ATTR + ']'))
           return
         }
         if (cell.textContent !== time) cell.textContent = time
@@ -5590,7 +5573,7 @@ window.__ModuleLoader__.load({
         if (!(node instanceof Element)) return false
         if (node === regionEl || node === anchorEl) return true
         if (node.getAttribute?.('data-plugin') === PLUGIN_ID) return true
-        return node.closest?.('[data-stp-region], [data-stp-anchor], [data-stp-notice], [data-stp-color-dialog], [data-stp-runtime-summary], [data-stp-runtime-label], [data-stp-absolute-button], [data-stp-pin-button], [data-stp-rename-input]') != null
+        return node.closest?.('[data-stp-region], [data-stp-anchor], [data-stp-notice], [data-stp-color-dialog], [data-stp-runtime-summary], [data-stp-runtime-label], [data-stp-absolute-button], [data-stp-rename-input]') != null
       }
 
       /**

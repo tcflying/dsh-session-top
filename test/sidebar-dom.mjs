@@ -1656,12 +1656,48 @@ for (const makeScaffold of [officialScaffold, codexScaffold]) {
   row.querySelector('[data-stp-absolute-button]').click()
   await settle()
   assert.deepEqual(idsInRegion(sc), [S1, S2], 'cancel super pin returns to ordinary activity order')
-  row.querySelector('[data-stp-pin-button]').click()
+  assert.equal(row.querySelector('[data-stp-pin-button]'), null, 'the row carries no inline ordinary-pin control')
+  run.dispose()
+  console.log('✔ pins: idle recency, separate super group and demotion')
+}
+
+// The ordinary pin control is no longer IN the row: it cost 24px in a 186px
+// strip, and the row's title is what the user reads. Ordinary pinning is a
+// menu action now — so THIS is where the tier bookkeeping has to be proven:
+// a super pin demotes before it unpins, and unpinning forgets the priority.
+{
+  const sc = codexScaffold()
+  const run = await runBundle(sc, {
+    pinned: [S2, S1], mutable: true,
+    storageSeed: { [absoluteKey]: JSON.stringify([S2]) },
+  })
+  const row = sc.body.querySelector('[data-stp-session="' + S2 + '"]')
+  assert.ok(row !== null, 'precondition: the super-pinned row is on screen')
+  assert.equal(row.querySelector('[data-stp-pin-button]'), null, 'the row carries no inline ordinary-pin control')
+
+  rightClickAt(run, row, 120, 200)
+  await settle()
+  const menu = sc.body.querySelector('[data-stp-menu]')
+  assert.ok(menu !== null, "the row menu opens for the plugin's own row")
+  const item = menu.querySelector('[data-stp-pin-item]')
+  assert.ok(item !== null, 'and it carries the pin action')
+  assert.match(item.textContent, /取消超级置顶（保留普通置顶）/, 'a super pin demotes before it unpins')
+  item.click()
+  await settle()
+  assert.deepEqual(run.services.workspaces.list.getSnapshot().pinnedSessionIds, [S2, S1], 'demotion keeps the ordinary pin')
+  assert.equal(sc.body.querySelector('[data-stp-tier="absolute"]'), null, 'and the super group is gone')
+
+  rightClickAt(run, row, 120, 200)
+  await settle()
+  const unpin = sc.body.querySelector('[data-stp-menu]').querySelector('[data-stp-pin-item]')
+  assert.ok(unpin !== null, 'the menu still carries the pin action')
+  assert.match(unpin.textContent, /取消置顶/, 'an ordinary pin offers unpin')
+  unpin.click()
   await settle()
   assert.deepEqual(run.services.workspaces.list.getSnapshot().pinnedSessionIds, [S1], 'cancel ordinary pin removes it from the official set')
   assert.equal(run.store.get(absoluteKey), '[]', 'unpin forgets old priority before a future repin')
   run.dispose()
-  console.log('✔ pins: idle recency, separate super group, demotion and ordinary cancellation')
+  console.log('✔ pins: ordinary pin and unpin are menu actions, and unpin forgets the super pin')
 }
 
 // Both tiers use recency on mount and on activity, including a newly created idle pin.
@@ -1682,9 +1718,9 @@ for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
   await settle()
   assert.deepEqual(idsInRegion(sc), [S2, S9, S1], 'demotion retains membership and joins ordinary recency')
   assert.deepEqual(run.live.pinned, [S2, S1, S9], 'demotion never unpins the official session')
-  sc.body.querySelector('[data-stp-session="' + S2 + '"] [data-stp-pin-button]').click()
+  sc.body.querySelector('[data-stp-session="' + S2 + '"] [data-stp-absolute-button]').click()
   await settle()
-  assert.deepEqual(idsInRegion(sc), [S9, S2, S1], 'the minus control also demotes a super pin first')
+  assert.deepEqual(idsInRegion(sc), [S9, S2, S1], 'the star control also demotes a super pin first')
   assert.deepEqual(run.live.pinned, [S2, S1, S9])
   assert.equal(sc.body.querySelector('[data-stp-tier="absolute"]'), null)
   run.dispose()
@@ -1725,25 +1761,38 @@ for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
 }
 
 // Active rows stay visible when unpinned, but their controls must become ordinary-pin actions.
-for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
+// The control is the row MENU now: the inline pin button cost 24px in a
+// 186px strip, and the row's title is what the user reads.
+//
+// The official-UI scaffold is not in this pair on purpose: its host row
+// carries a real "…" menu, and with no shared owner that menu is the host's
+// own — the plugin's own menu is the fallback for a host row that has none.
+for (const makeScaffold of [officialScaffold, codexScaffold]) {
   const sc = makeScaffold()
   const run = await runBundle(sc, { pinned: [S1], mutable: true })
   run.live.byId[S1].running = true
   run.nudge()
   await settle()
   const row = sc.body.querySelector('[data-stp-row][data-stp-session="' + S1 + '"]')
-  row.querySelector('[data-stp-pin-button]').click()
+  assert.equal(row.querySelector('[data-stp-pin-button]'), null, 'the row carries no inline ordinary-pin control')
+  rightClickAt(run, row, 100, 200)
+  await settle()
+  const item = sc.body.querySelector('[data-stp-pin-item]')
+  assert.ok(item !== null, 'the row menu carries the pin action')
+  assert.match(item.textContent, /取消置顶/, 'a pinned session offers unpin')
+  item.click()
   await settle()
   assert.deepEqual(run.live.pinned, [])
   assert.deepEqual(idsInRegion(sc), [S1])
-  assert.equal(row.querySelector('[data-stp-pin-button]').getAttribute('aria-label'), '普通置顶')
-  assert.equal(row.querySelector('[data-stp-pin-button]').getAttribute('aria-pressed'), 'false')
   assert.match(sc.body.querySelector('[data-stp-region-header]').getAttribute('aria-label'), /活跃/)
-  row.querySelector('[data-stp-pin-button]').click()
+  rightClickAt(run, row, 100, 200)
+  await settle()
+  const again = sc.body.querySelector('[data-stp-pin-item]')
+  assert.ok(again !== null, 'the row menu still carries the pin action')
+  assert.match(again.textContent, /普通置顶/, 'and the action became an ordinary pin again')
+  again.click()
   await settle()
   assert.deepEqual(run.live.pinned, [S1])
-  assert.equal(row.querySelector('[data-stp-pin-button]').getAttribute('aria-label'), '取消置顶')
-  assert.equal(row.querySelector('[data-stp-pin-button]').getAttribute('aria-pressed'), 'true')
   assert.equal(sc.body.querySelector('[data-stp-region-header]').getAttribute('aria-label').includes('活跃'), false)
   run.dispose()
 }
@@ -5798,7 +5847,7 @@ const colorSurfaceOf = (row) => {
           : child.hasAttribute('data-stp-pin-button') ? 'pin'
             : child.hasAttribute('data-stp-absolute-button') ? 'absolute'
               : child.getAttribute('data-stp-row-color') !== null ? 'color' : '?')
-  assert.deepEqual(order, ['slot', 'title', 'time', 'pin', 'absolute', 'color'], 'exactly what a first render produces')
+  assert.deepEqual(order, ['slot', 'title', 'time', 'absolute', 'color'], 'exactly what a first render produces')
   assert.equal(rowsOf(region)[0], row, 'and the row is updated in place')
   assert.equal(swatchOf(row), swatch, 'the colour control is not rebuilt either')
   assert.equal(listenersOf([row]), 2, 'and no listener was added')
