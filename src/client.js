@@ -677,16 +677,18 @@ window.__ModuleLoader__.load({
     }
 
     // Same pure derivation as runtime.js; the shipped factory cannot import it.
-    function deriveRuntime(byId = {}, ids = Object.keys(byId ?? {})) {
+    function deriveRuntime(byId = {}, ids = Object.keys(byId ?? {}), engagedIds = []) {
       const summaries = byId ?? {}
       const listed = new Set(ids)
+      const engaged = new Set(engagedIds ?? [])
+      const isRunning = id => summaries[id]?.running === true || engaged.has(id)
       const sessions = new Map()
       let runningSessions = 0
       let runningAgents = 0
       for (const id of listed) {
         const summary = Object.hasOwn(summaries, id) ? summaries[id] : undefined
         if (summary == null || summary.origin === 'subagent') continue
-        const running = summary.running === true
+        const running = isRunning(id)
         sessions.set(id, { running, runningChildren: 0 })
         if (running) runningSessions += 1
       }
@@ -695,7 +697,7 @@ window.__ModuleLoader__.load({
       const roots = new Map([...sessions.keys()].map(id => [id, id]))
       for (const id of listed) {
         const summary = Object.hasOwn(summaries, id) ? summaries[id] : undefined
-        if (summary?.origin !== 'subagent' || summary.running !== true) continue
+        if (summary?.origin !== 'subagent' || !isRunning(id)) continue
         runningAgents += 1
         const path = new Set()
         let current = id
@@ -2754,6 +2756,24 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /**
+       * The ids the Host reports as engaged: sessions it is actually running.
+       * The per-session summary flag does not always carry that state, so the
+       * Host's own engaged set is read as the second source of truth.
+       * @returns {string[]} engaged session ids.
+       */
+      const engagedSessionIds = () => {
+        try {
+          const engaged = sessionsService()?.manager?.engagedSessions
+          if (engaged == null) return []
+          const values = engaged instanceof Map ? engaged.keys() : engaged
+          if (typeof values?.[Symbol.iterator] !== 'function') return []
+          return [...values].filter(id => typeof id === 'string')
+        } catch {
+          return []
+        }
+      }
+
       let renameEdit = null
       const closeRename = () => {
         const edit = renameEdit
@@ -2951,7 +2971,7 @@ window.__ModuleLoader__.load({
         const byId = state?.byId ?? {}
         runtimePhase = connectionUnavailable() ? 'error' : state?.phase ?? 'loading'
         runtimeState = runtimePhase === 'ready'
-          ? deriveRuntime(byId, Array.isArray(state?.ids) ? state.ids : [])
+          ? deriveRuntime(byId, Array.isArray(state?.ids) ? state.ids : [], engagedSessionIds())
           : { sessions: {}, runningSessions: 0, runningAgents: 0 }
         const roots = runtimeState.sessions
         const changed = []

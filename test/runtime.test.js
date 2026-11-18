@@ -112,3 +112,27 @@ test('walks deep descendant chains iteratively', () => {
     runningSessions: 0, runningAgents: 12000,
   })
 })
+test('counts Host-engaged ids as running even without a summary running flag', () => {
+  const byId = {
+    root: summary('root'),
+    child: summary('child', { origin: 'subagent', parentId: 'root' }),
+    idle: summary('idle'),
+  }
+  assert.deepEqual(deriveRuntime(byId, ['root', 'child', 'idle'], ['root']), {
+    sessions: { root: { running: true, runningChildren: 0 }, idle: { running: false, runningChildren: 0 } },
+    runningSessions: 1, runningAgents: 0,
+  })
+  assert.deepEqual(deriveRuntime(byId, ['root', 'child', 'idle'], ['child']), {
+    sessions: { root: { running: false, runningChildren: 1 }, idle: { running: false, runningChildren: 0 } },
+    runningSessions: 0, runningAgents: 1,
+  })
+})
+
+test('keeps the Host list authoritative over the engaged set', () => {
+  assert.deepEqual(deriveRuntime({
+    idle: summary('idle'),
+  }, ['idle'], ['ghost']), {
+    sessions: { idle: { running: false, runningChildren: 0 } },
+    runningSessions: 0, runningAgents: 0,
+  })
+})
