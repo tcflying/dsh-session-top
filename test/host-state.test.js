@@ -343,7 +343,7 @@ const waitForStatus = async (h, predicate, timeoutMs = 4000) => {
   }
 }
 
-const activity = time => ({ type: 'agent/message', time, data: { source: { kind: 'agent' } } })
+const activity = time => ({ type: 'user/message', time, data: { source: { kind: 'user' } } })
 const session = id => ({ id, header: { origin: 'main' } })
 
 // ------------------------------------------------------------ R12 test tools
@@ -415,6 +415,28 @@ function logTree(dir) {
       return { name, size, lines }
     })
 }
+
+test('by default only a committed human prompt moves its workspace session', async (t) => {
+  const workspaces = [account('A', ['a1', 'a2'], [])]
+  const h = harness({ workspaces, webServer: true })
+  t.after(() => h.dispose())
+  await applyPlugin({ ctx: h.ctx })
+  assertApplied(h)
+
+  const background = time => ({ type: 'agent/message', time, data: { source: { kind: 'agent' } } })
+  h.emit(session('a2'), background(200))
+  h.emit(session('a2'), { type: 'user/message', time: 210, data: { source: { kind: 'plugin' } } })
+  await settle()
+  assert.deepEqual(workspaces[0].sessionIds, ['a1', 'a2'])
+
+  h.emit(session('a2'), { type: 'user/message', time: 220, data: { source: { kind: 'user' } } })
+  await settle()
+  assert.deepEqual(workspaces[0].sessionIds, ['a2', 'a1'])
+
+  h.emit(session('a1'), background(230))
+  await settle()
+  assert.deepEqual(workspaces[0].sessionIds, ['a2', 'a1'])
+})
 
 test('status exposes the complete bounded root activity clock beyond the diagnostic top 25', async (t) => {
   const h = harness({ workspaces: [], webServer: true })
@@ -2773,7 +2795,7 @@ apply(ctx, { enabled: true, debounceMs: 5, logFile: logPath })
 // AFTER the refusal, and not merely present.
 for (const { event, handler } of [...listeners]) {
   if (event !== 'session/event') continue
-  handler({ id: 's1', header: { origin: 'main' } }, { type: 'agent/message', time: 1000, data: { source: { kind: 'agent' } } })
+  handler({ id: 's1', header: { origin: 'main' } }, { type: 'user/message', time: 1000, data: { source: { kind: 'user' } } })
 }
 
 // Long enough for the debounce window, a pass, and any promise that was going

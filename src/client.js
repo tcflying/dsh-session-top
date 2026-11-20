@@ -22,10 +22,9 @@
  *
  * What it does, against the five acceptance points:
  *
- *  1. Active float-up — the durable order itself is re-sorted by the host half
- *     through `insertSessionBefore`, so a session with new activity is above
- *     its inactive neighbours in BOTH the sidebar's "recent" and "manual"
- *     order modes. The temporary region follows root activity, below absolute pins.
+ *  1. User prompts move the sent session to the top of the sidebar, below
+ *     absolute pins. The host half uses `insertSessionBefore` to remember its
+ *     position in the workspace's manual ordering.
  *  2. Right-click to pin — the pin actions are published into the SHARED
  *     session context menu that `@baihejiangnan/dsh-session-context-menu`
  *     renders, so a right-clicked row offers Pin / Unpin next to the host's own
@@ -2922,52 +2921,21 @@ window.__ModuleLoader__.load({
       let visibleSessions = []
       const runtimeRows = new Set()
       const absoluteRows = new Set()
-      const observedActivity = new Map()
-      const floatedActivity = new Map()
-      let activitySequence = 0
-      let hostActivity = new Map()
+      let latestPromptId
+      let latestPromptAt = Number.NEGATIVE_INFINITY
 
-      // rc.3 summary.updatedAt only advances on user prompts; use the Host's
-      // existing filtered root-event clock for assistant/tool commits as well.
-      const watchActivity = () => {
-        const transport = globalThis.__DSH_TRANSPORT__
-        const fetchActivity = typeof transport?.fetch === 'function'
-          ? transport.fetch.bind(transport)
-          : typeof window.fetch === 'function' ? window.fetch.bind(window) : null
-        if (fetchActivity === null) return
-        let controller
-        disposers.push(() => controller?.abort())
-        const poll = async () => {
-          if (!alive()) return
-          let deadline
-          try {
-            if (connectionUnavailable()) return
-            controller = new AbortController()
-            deadline = ownTimer(setTimeout(() => controller.abort(), 10000))
-            const response = await fetchActivity('api/dsh-session-top/status', { signal: controller.signal, cache: 'no-store' })
-            if (!response.ok) return
-            const status = await response.json()
-            if (!alive()) return
-            // Older Host installations only expose the diagnostic top 25.
-            const entries = status.enabled === true
-              ? status.activityBySession != null
-                ? Object.entries(status.activityBySession)
-                : (status.ranked ?? []).map(row => [row.id, row.rank])
-              : []
-            const next = new Map(entries.filter(([id, time]) => typeof id === 'string' && Number.isFinite(time)))
-            const changed = next.size !== hostActivity.size || [...next].some(([id, time]) => hostActivity.get(id) !== time)
-            hostActivity = next
-            if (changed) scheduleReconcile()
-          } catch { /* offline/older Hosts retain the last usable clock and summary fallback */ }
-          finally {
-            releaseTimer(deadline)
-            controller?.abort()
-            if (alive()) {
-              const timer = ownTimer(setTimeout(() => { mountTimers.delete(timer); void poll() }, 1000))
-            }
-          }
-        }
-        void poll()
+      const watchPrompts = () => {
+        // DSH publishes this only for a committed user/message authored by the user.
+        const remote = ctx.get('remote')
+        const off = remote?.$on?.('api-session/activity', (id, time) => {
+          if (!alive() || typeof id !== 'string' || !id || !Number.isFinite(time)) return
+          if (time < latestPromptAt || sessionById()[id]?.origin === 'subagent') return
+          latestPromptAt = time
+          if (latestPromptId === id) return
+          latestPromptId = id
+          scheduleReconcile()
+        })
+        if (typeof off === 'function') disposers.push(off)
       }
 
       // Keep an editor attached until it closes; reparenting would blur it and end IME.
@@ -2984,54 +2952,18 @@ window.__ModuleLoader__.load({
         runtimeState = runtimePhase === 'ready'
           ? deriveRuntime(byId, Array.isArray(state?.ids) ? state.ids : [], engagedSessionIds())
           : { sessions: {}, runningSessions: 0, runningAgents: 0 }
-        const roots = runtimeState.sessions
-        const changed = []
-        let latestTime = 0
-        for (const entry of observedActivity.values()) latestTime = Math.max(latestTime, entry.time)
-        for (const [id, execution] of Object.entries(roots)) {
-          const summary = byId[id]
-          const previous = observedActivity.get(id)
-          const active = execution.running || execution.runningChildren > 0
-          const timestamp = Math.max(previous?.time ?? 0, hostActivity.get(id) ?? 0,
-            Number.isFinite(summary?.updatedAt) ? summary.updatedAt : 0,
-            Number.isFinite(summary?.createdAt) ? summary.createdAt : 0)
-          // A legacy summary without running cannot establish a new activity fact.
-          if (typeof summary?.running === 'boolean' && (
-            (active && (previous === undefined || !previous.active || timestamp > previous.time))
-            || (previous !== undefined && timestamp > previous.time && summary.blank !== true)
-          )) {
-            // Without a Host clock, a start wins ties at the latest known time.
-            // Keep that inference out of observed clocks so later Host facts can replace it.
-            const clocklessStart = active && previous && !previous.active && timestamp === previous.time && !hostActivity.has(id)
-            changed.push([id, clocklessStart ? Math.max(timestamp, latestTime) : timestamp])
-          }
-          observedActivity.set(id, { time: timestamp, active })
-        }
-        if (changed.length > 0) {
-          activitySequence += 1
-          for (const [id, time] of changed) floatedActivity.set(id, { sequence: activitySequence, time })
-        }
-        for (const id of observedActivity.keys()) {
-          if (Object.hasOwn(roots, id)) continue
-          observedActivity.delete(id)
-          floatedActivity.delete(id)
-        }
-        const pinned = [...pinSet()]
-        const active = Object.keys(roots).filter(id => roots[id].running || roots[id].runningChildren > 0)
-        // Keep a temporary row until its editor closes, even when execution ends.
+        // Keep the last sent row in place while execution status changes.
         const editing = renameEdit?.row.hasAttribute('data-stp-row') ? [renameEdit.id] : []
-        const fixed = [...new Set([...pinned, ...editing])].filter(isAbsoluteRow)
-        const rest = [...new Set([...pinned, ...active, ...editing])].filter(id => !fixed.includes(id))
-        const byActivity = (a, b) => {
-          const left = floatedActivity.get(a)
-          const right = floatedActivity.get(b)
-          return Math.max(right?.time ?? 0, observedActivity.get(b)?.time ?? 0)
-            - Math.max(left?.time ?? 0, observedActivity.get(a)?.time ?? 0)
-            || (right?.sequence ?? 0) - (left?.sequence ?? 0)
+        const pinned = [...new Set([...pinSet(), ...editing])]
+        const promptTime = id => byId[id]?.updatedAt ?? byId[id]?.createdAt ?? 0
+        pinned.sort((a, b) => promptTime(b) - promptTime(a))
+        if (latestPromptId !== undefined && Object.hasOwn(byId, latestPromptId)
+          && byId[latestPromptId]?.origin !== 'subagent') {
+          const position = pinned.indexOf(latestPromptId)
+          if (position >= 0) pinned.splice(position, 1)
+          pinned.unshift(latestPromptId)
         }
-        fixed.sort(byActivity)
-        rest.sort(byActivity)
-        visibleSessions = [...fixed, ...rest]
+        visibleSessions = [...pinned.filter(isAbsoluteRow), ...pinned.filter(id => !isAbsoluteRow(id))]
       }
 
       const toggleAbsolutePin = async (id, want = !(absolutePins.has(id) && pinSet().has(id))) => {
@@ -4649,7 +4581,7 @@ window.__ModuleLoader__.load({
         }
         const ordinary = pinned.filter(id => !fixed.includes(id))
         const firstRowAt = [...regionEl.children].indexOf(regionHeaderEl) + 1
-        const normalLabel = PINNED_LABEL() + (ordinary.some(id => !pinSet().has(id)) ? ' · ' + translate('region.active', '活跃') : '')
+        const normalLabel = PINNED_LABEL() + (ordinary.some(id => !pinSet().has(id)) ? ' · ' + translate('region.latestSent', '最近发送') : '')
         if (regionEl.getAttribute('aria-label') !== normalLabel) regionEl.setAttribute('aria-label', normalLabel)
         if (regionHeaderLabelEl.textContent !== normalLabel) regionHeaderLabelEl.textContent = normalLabel
         if (regionHeaderEl.getAttribute('aria-label') !== normalLabel) regionHeaderEl.setAttribute('aria-label', normalLabel)
@@ -6845,7 +6777,7 @@ window.__ModuleLoader__.load({
         // the per-reconcile identity check both go through — NOT captured here,
         // because a service object captured here is the one that goes stale.
         attachSessionsTo(sessionsService())
-        watchActivity()
+        watchPrompts()
         disposers.push(releaseRightSidebar)
         // These children wake when a service arrives late and release their
         // subscriptions on revocation. Neither service gates plugin activation.

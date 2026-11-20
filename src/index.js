@@ -52,7 +52,7 @@ export const defaultConfig = Object.freeze({
    * task keeps bubbling), 'prompt' only on the user's own messages (the same
    * basis the GUI's "last updated" labels show).
    */
-  activity: 'any',
+  activity: 'prompt',
   /** Coalescing window for bursty activity, in milliseconds. */
   debounceMs: 400,
   /** Maximum activity entries retained in memory and in the log file. */

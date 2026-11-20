@@ -1112,8 +1112,6 @@ async function runBundle(scaffold, {
   slots = undefined,
   // Optional right-column services; the shipped bundle must also work without them.
   rightSidebar = {},
-  activityFetch = undefined,
-  activityTransport = true,
 } = {}) {
   // The previous generation goes first, so its bundle can no longer arm
   // anything into the set this run is about to start counting.
@@ -1216,9 +1214,7 @@ async function runBundle(scaffold, {
     addEventListener: addWindowListener,
     removeEventListener: removeWindowListener,
     dispatchEvent: () => false,
-    fetch: activityFetch,
   }
-  globalThis.__DSH_TRANSPORT__ = activityFetch === undefined || !activityTransport ? undefined : { fetch: activityFetch }
   globalThis.localStorage = fakeStorage
   globalThis.MutationObserver = FakeMutationObserver
   globalThis.Element = El
@@ -1305,6 +1301,9 @@ async function runBundle(scaffold, {
     slots,
   })) services[name] = value
   Object.assign(services, rightSidebar)
+  const remoteEvents = new Map()
+  services.remote = { $on(event, fn) { remoteEvents.set(event, fn); return () => remoteEvents.delete(event) } }
+  const prompt = (id, time) => remoteEvents.get('api-session/activity')?.(id, time)
 
   // Model cordis faithfully: the fiber activates NOW with nothing provided, and
   // `ctx.inject(deps, cb)` defers the callback until the dependency shows up.
@@ -1364,7 +1363,7 @@ async function runBundle(scaffold, {
   if (!alongside) previousRunDispose = dispose
   return {
     listeners, registration, logs, afterApply, dispose, services, pinCalls, nudge, live,
-    opened, panels, liveTimers, store, storageCalls, storageFixture: fixture, windowListeners,
+    opened, panels, liveTimers, store, storageCalls, storageFixture: fixture, windowListeners, prompt, remoteEvents,
   }
 }
 
@@ -1557,9 +1556,12 @@ for (const makeScaffold of [officialScaffold, codexScaffold]) {
   await settle()
   const region = sc.body.querySelector('[data-stp-region]')
   const first = region.querySelector(`[data-stp-session="${S1}"]`)
-  const second = region.querySelector(`[data-stp-session="${S2}"]`)
   assert.equal(first.getAttribute('data-stp-runtime'), 'running')
-  assert.equal(second?.getAttribute('data-stp-runtime'), 'children', 'an idle parent must float while children execute')
+  assert.equal(region.querySelector(`[data-stp-session="${S2}"]`), null, 'child execution alone does not move its parent')
+  run.prompt(S2, 100)
+  await settle()
+  const second = region.querySelector(`[data-stp-session="${S2}"]`)
+  assert.equal(second?.getAttribute('data-stp-runtime'), 'children')
   assert.equal(second.querySelector('[data-stp-runtime-label]').textContent, '子代理运行 1')
   assert.equal(sc.body.querySelector('[data-stp-runtime-summary]').textContent, '运行会话 1 · 子代理 1')
   assert.match(staticCss(sc), /data-stp-runtime='running'[\s\S]*?#22c55e/)
@@ -1571,12 +1573,13 @@ for (const makeScaffold of [officialScaffold, codexScaffold]) {
   run.nudge()
   await settle()
   assert.equal(first.hasAttribute('data-stp-runtime'), false)
-  assert.equal(region.querySelector(`[data-stp-session="${S2}"]`), null)
+  assert.equal(region.querySelector(`[data-stp-session="${S2}"]`), second, 'a sent row stays put when execution finishes')
+  assert.equal(second.hasAttribute('data-stp-runtime'), false)
   assert.equal(sc.body.querySelector('[data-stp-runtime-summary]').textContent, '运行会话 0 · 子代理 0')
   run.dispose()
   assert.equal(sc.body.querySelector('[data-stp-runtime-summary]'), null)
   assert.equal(sc.body.querySelector('[data-stp-runtime-label]'), null)
-  console.log('✔ runtime: real execution colors, idle-parent child counts, float-up and cleanup')
+  console.log('✔ runtime: execution indicators, prompt promotion and cleanup')
 }
 
 
@@ -1760,7 +1763,7 @@ for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
   run.dispose()
 }
 
-// Active rows stay visible when unpinned, but their controls must become ordinary-pin actions.
+// The last sent row stays visible when unpinned and offers ordinary-pin actions.
 // The control is the row MENU now: the inline pin button cost 24px in a
 // 186px strip, and the row's title is what the user reads.
 //
@@ -1771,6 +1774,7 @@ for (const makeScaffold of [officialScaffold, codexScaffold]) {
   const sc = makeScaffold()
   const run = await runBundle(sc, { pinned: [S1], mutable: true })
   run.live.byId[S1].running = true
+  run.prompt(S1, 100)
   run.nudge()
   await settle()
   const row = sc.body.querySelector('[data-stp-row][data-stp-session="' + S1 + '"]')
@@ -1784,7 +1788,7 @@ for (const makeScaffold of [officialScaffold, codexScaffold]) {
   await settle()
   assert.deepEqual(run.live.pinned, [])
   assert.deepEqual(idsInRegion(sc), [S1])
-  assert.match(sc.body.querySelector('[data-stp-region-header]').getAttribute('aria-label'), /活跃/)
+  assert.match(sc.body.querySelector('[data-stp-region-header]').getAttribute('aria-label'), /最近发送/)
   rightClickAt(run, row, 100, 200)
   await settle()
   const again = sc.body.querySelector('[data-stp-pin-item]')
@@ -1793,7 +1797,7 @@ for (const makeScaffold of [officialScaffold, codexScaffold]) {
   again.click()
   await settle()
   assert.deepEqual(run.live.pinned, [S1])
-  assert.equal(sc.body.querySelector('[data-stp-region-header]').getAttribute('aria-label').includes('活跃'), false)
+  assert.equal(sc.body.querySelector('[data-stp-region-header]').getAttribute('aria-label').includes('最近发送'), false)
   run.dispose()
 }
 
@@ -1826,76 +1830,41 @@ for (const makeScaffold of [officialScaffold, codexScaffold]) {
   console.log('✔ runtime: batched recency, unavailable snapshots and retained fallback')
 }
 
-// Assistant/tool commits advance Host activity, while rc.3 updatedAt stays prompt-only.
+// Only the live human-message event moves a background row into the top area.
 for (const makeScaffold of [officialScaffold, codexScaffold]) {
   const sc = makeScaffold()
-  let payload = { enabled: true, activityBySession: { [S1]: 100, [S2]: 200 } }
-  let reject = false
-  let hang = false
-  const requests = []
-  const run = await runBundle(sc, {
-    pinned: [S1, S2], mutable: true,
-    activityTransport: makeScaffold === officialScaffold,
-    activityFetch: async (path, options) => {
-      requests.push({ path, signal: options.signal })
-      if (hang) return new Promise((resolve, reject) => options.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }))
-      if (reject) throw new Error('offline')
-      return { ok: true, json: async () => payload }
-    },
-  })
-  run.live.byId[S1] = { ...run.live.byId[S1], running: true, updatedAt: 10 }
-  run.live.byId[S2] = { ...run.live.byId[S2], running: true, updatedAt: 20 }
+  const run = await runBundle(sc, { pinned: [], mutable: true })
+  run.live.byId[S1].running = true
+  run.live.mainSessionId = S2
   run.nudge()
   await settle()
-  assert.deepEqual(idsInRegion(sc), [S2, S1])
-  payload = { ...payload, activityBySession: { [S1]: 300, [S2]: 200 } }
-  await settle(1200)
-  assert.deepEqual(idsInRegion(sc), [S1, S2], 'assistant/tool activity floats a continuously running root without a prompt timestamp change')
-  assert.equal(run.live.byId[S1].updatedAt, 10)
-  assert.equal(requests[0].path, 'api/dsh-session-top/status')
-  sc.body.querySelector('[data-stp-session="' + S1 + '"] [data-stp-absolute-button]').click()
+  assert.deepEqual(idsInRegion(sc), [], 'execution and switching alone leave the list in place')
+
+  run.prompt(S2, 300)
   await settle()
-  payload = { ...payload, activityBySession: { [S1]: 300, [S2]: 400 } }
-  await settle(1200)
-  assert.deepEqual(idsInRegion(sc), [S1, S2], 'Host activity never overtakes an absolute pin')
-  sc.body.querySelector('[data-stp-session="' + S1 + '"] [data-stp-absolute-button]').click()
-  await settle()
-  assert.deepEqual(idsInRegion(sc), [S2, S1])
-  payload = { ...payload, activityBySession: { [S1]: 250, [S2]: 400, bad: 'invalid' } }
-  await settle(1200)
-  assert.deepEqual(idsInRegion(sc), [S2, S1], 'stale or malformed activity cannot create a new rank')
-  reject = true
-  await settle(1200)
-  assert.deepEqual(idsInRegion(sc), [S2, S1], 'activity transport failure preserves working rows')
-  reject = false
-  payload = { enabled: true, ranked: [{ id: S1, rank: 500 }, { id: S2, rank: 400 }] }
-  await waitUntil(() => idsInRegion(sc).join() === [S1, S2].join(), 'Host activity recovery', 3000)
-  assert.deepEqual(idsInRegion(sc), [S1, S2], 'polling recovers and reads the installed older Host payload')
-  run.live.byId[S2].updatedAt = 700
+  assert.deepEqual(idsInRegion(sc), [S2])
+  const sent = sc.body.querySelector('[data-stp-row]')
+  run.live.byId[S1].running = false
+  run.live.byId[S2].running = true
   run.nudge()
   await settle()
-  assert.deepEqual(idsInRegion(sc), [S2, S1])
-  payload = { enabled: true, activityBySession: { [S1]: 650, [S2]: 700 } }
-  await settle(1200)
-  assert.deepEqual(idsInRegion(sc), [S2, S1], 'a delayed Host clock cannot overtake a newer prompt already observed')
-  payload = { ...payload, activityBySession: { [S1]: 800, [S2]: 700 } }
-  await settle(1200)
-  assert.deepEqual(idsInRegion(sc), [S1, S2])
-  run.live.byId[S2].updatedAt = 750
+  run.live.byId[S2].running = false
   run.nudge()
+  run.prompt(S1, 200)
+  run.live.byId.child = { id: 'child', parentId: S2, origin: 'subagent', running: false }
+  run.prompt('child', 350)
   await settle()
-  assert.deepEqual(idsInRegion(sc), [S1, S2], 'a delayed summary cannot overtake a newer Host clock already observed')
-  hang = true
-  await settle(1200)
-  const pending = requests.length
-  await settle(1200)
-  assert.equal(requests.length, pending, 'only one activity request may be in flight')
+  assert.deepEqual(idsInRegion(sc), [S2], 'completion, stale events and subagents preserve the row')
+  assert.equal(sc.body.querySelector('[data-stp-row]'), sent)
+
+  run.prompt(S1, 400)
+  await settle()
+  assert.deepEqual(idsInRegion(sc), [S1], 'the next human prompt replaces the previous promotion')
+  assert.deepEqual(run.pinCalls, [], 'promotion never writes manual pins')
   run.dispose()
-  await settle(20)
-  assert.equal(run.liveTimers().length, 0, 'dispose cancels activity polling too')
-  assert.ok(requests.every(request => request.signal.aborted), 'dispose aborts its activity request scope')
-  console.log('✔ runtime: Host activity floats running roots independently of prompt timestamps')
+  assert.equal(run.remoteEvents.size, 0)
 }
+console.log('✔ sidebar: only user sends promote a row, through completion and the next send')
 
 // Absolute priority remains ahead of later activity, survives remount and syncs across windows.
 for (const makeScaffold of [officialScaffold, codexScaffold]) {
@@ -1908,10 +1877,9 @@ for (const makeScaffold of [officialScaffold, codexScaffold]) {
   assert.equal(run.store.get(absoluteKey), JSON.stringify([S1]))
   assert.deepEqual(run.opened, [], 'priority control cannot open the session')
   assert.equal(star.getAttribute('aria-pressed'), 'true')
-  run.live.byId[S2].running = true
-  run.nudge()
+  run.prompt(S2, 100)
   await settle()
-  assert.deepEqual(idsInRegion(sc), [S1, S2], 'new execution stays below the absolute pin')
+  assert.deepEqual(idsInRegion(sc), [S1, S2], 'a sent row stays below the absolute pin')
   row.querySelector('[data-stp-absolute-button]').click()
   await settle()
   assert.deepEqual(idsInRegion(sc), [S2, S1], 'releasing absolute priority restores latest activity order')
@@ -2008,8 +1976,7 @@ for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
   input.selectionStart = 2
   input.selectionEnd = 5
   assert.deepEqual(idsInRegion(sc), [S2, S1])
-  run.live.byId[S1].running = true
-  run.nudge()
+  run.prompt(S1, 100)
   await settle()
   assert.deepEqual(idsInRegion(sc), [S1, S2], 'activity really changes the edited row position')
   assert.equal(row.querySelector('[data-stp-rename-input]'), input, 'actual reorder preserves the editor')
@@ -2093,7 +2060,7 @@ for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
   }
 }
 
-// A temporary active row stays editable after execution ends, then leaves on save or cancel.
+// An edited sent row stays attached when a newer sent row replaces it.
 for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
   for (const finish of ['save', 'escape', 'blur']) {
     const sc = makeScaffold()
@@ -2108,6 +2075,7 @@ for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
         return { ok: true }
       } } },
     })
+    run.prompt(S1, 100)
     run.live.byId[S1].running = finish !== 'escape'
     if (finish === 'escape') {
       run.live.byId.child = { id: 'child', parentId: S1, origin: 'subagent', running: true }
@@ -2121,9 +2089,10 @@ for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
     input.value = '  执行结束后仍能改名  '
     run.live.byId[S1].running = false
     if (run.live.byId.child) run.live.byId.child.running = false
+    run.prompt(S2, 200)
     run.nudge()
     await settle()
-    assert.deepEqual(idsInRegion(sc), [S1], 'execution ending cannot retire the edited temporary row')
+    assert.deepEqual(idsInRegion(sc), [S2, S1], 'a newer prompt cannot retire the edited row')
     assert.equal(row.querySelector('[data-stp-rename-input]'), input)
     assert.equal(input.value, '  执行结束后仍能改名  ')
     assert.equal(row.hasAttribute('data-stp-runtime'), false, 'an edited idle row has no running color')
@@ -2132,14 +2101,14 @@ for (const makeScaffold of [officialUiScaffold, codexScaffold]) {
     else input.dispatch('keydown', { key: finish === 'save' ? 'Enter' : 'Escape' })
     await settle()
     assert.deepEqual(calls, finish === 'save' ? [[S1, '执行结束后仍能改名']] : [])
-    assert.deepEqual(idsInRegion(sc), [], 'closing the editor releases an ended temporary row')
+    assert.deepEqual(idsInRegion(sc), [S2], 'closing the editor releases the superseded row')
     assert.equal(input.parentElement, null)
     assert.equal(sheetRules(sc).some(rule => rule.includes(S1)), false, 'closing the editor restores the workspace row')
     assert.deepEqual(run.pinCalls, [], 'retaining a draft never pins the session')
     assert.deepEqual(run.opened, [])
     run.dispose()
   }
-  console.log('✔ inline rename: ended temporary rows stay editable until save, Escape or blur')
+  console.log('✔ inline rename: a superseded sent row stays editable until save, Escape or blur')
 }
 
 // --- official flavor

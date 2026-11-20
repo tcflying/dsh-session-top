@@ -1,7 +1,7 @@
 {
   "name": "dsh-session-top",
   "version": "0.1.2",
-  "description": "ZCode-style session list for the DeepSeek Harness sidebar: sessions float to the top of their list on any activity, a right-click session row offers Pin/Unpin, pinned sessions leave their workspace group for a flat 'Pinned' region at the top of the sidebar, and the pin state survives restarts. Dual-face (host + client) dsh plugin, zero core changes.",
+  "description": "ZCode-style session list for the DeepSeek Harness sidebar: sessions move to the top of the sidebar when the user sends a message, a right-click session row offers Pin/Unpin, pinned sessions leave their workspace group for a flat 'Pinned' region at the top of the sidebar, and the pin state survives restarts. Dual-face (host + client) dsh plugin, zero core changes.",
   "type": "module",
   "main": "./src/index.js",
   "exports": {
