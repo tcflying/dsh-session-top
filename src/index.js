@@ -6,11 +6,7 @@
  * 1. **Pin state lives where the Host already keeps it.** The registry-global
  *    pin set (`workspaceRegistry.pinnedSessionIds`) is durable, survives
  *    restarts, and is the same store the shipped sidebar pin action writes.
- *    This plugin deliberately does NOT keep a second copy: a plugin-local pin
- *    file would be a second source of truth that could disagree with the Host
- *    after a manual unpin elsewhere. Behavior 5 ("survives restarts") is
- *    therefore satisfied by reusing the official store rather than by writing
- *    our own.
+ *    The plugin stores only the super-pin tier, filtered by that official set.
  *
  * 2. **Activity tracking.** Every committed session event refreshes that
  *    session's recency rank. The rank map is what "active float-up" is
@@ -18,9 +14,7 @@
  *    confirm the plugin is actually seeing activity.
  *
  * 3. **A plugin-private state directory** under `$DSH_HOME/dsh-session-top/`
- *    holds the activity log (debuggable across restarts) and nothing else that
- *    matters for correctness. Losing or corrupting it costs ordering precision
- *    for sessions that have not run in this process, never the pin state.
+ *    holds the activity log and the super-pin tier shared by Web clients.
  *
  * Loopback-only diagnostics:
  *   GET  /api/dsh-session-top/status  → counters, pin set, top-ranked sessions
@@ -32,6 +26,7 @@ import { dirname, join } from 'node:path'
 import { planFloatDirty } from './core.js'
 import { isLoopbackRequest } from './routes.js'
 import { installDesktopIcons } from './desktop-icons.js'
+import { superPinRoute } from './super-pins.js'
 
 /** Stable cordis plugin name. */
 export const name = 'session-top'
@@ -1760,6 +1755,11 @@ function applyImpl(ctx, config = {}) {
 
   const disposers = []
   if (enabled) {
+    ctx.inject?.(['connection', 'workspaceRegistry'], child => {
+      child.effect(() => child.get('connection').fetch.register(
+        superPinRoute(join(pluginHome(), 'super-pins.json'), () => child.get('workspaceRegistry')),
+      ), 'dsh-session-top: authenticated super pin storage')
+    })
     installDesktopIcons(ctx)
     try {
       ctx.effect(() => {

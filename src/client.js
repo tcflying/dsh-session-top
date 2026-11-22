@@ -718,7 +718,7 @@ window.__ModuleLoader__.load({
       return { sessions: Object.fromEntries(sessions), runningSessions, runningAgents }
     }
 
-    // A local priority within the official durable pin set, never a second pin set.
+    // Local cache and legacy import for a priority within the official pin set.
     const ABSOLUTE_STORAGE_KEY = 'dsh-session-top:absolute-pins'
     const PIN_ORDER_STORAGE_KEY = 'dsh-session-top:pin-order'
     function readStoredSessionIds(key) {
@@ -2895,15 +2895,72 @@ window.__ModuleLoader__.load({
       }
 
       const absolutePins = readAbsolutePins()
-      const forgetAbsolutePins = ids => {
-        if (ids.length === 0) return
-        const latest = readAbsolutePins()
-        let changed = false
-        for (const id of ids) { changed = latest.delete(id) || changed; absolutePins.delete(id) }
-        if (changed) {
-          try { globalThis.localStorage?.setItem?.(ABSOLUTE_STORAGE_KEY, JSON.stringify([...latest])) }
-          catch { surfaceError('超级置顶状态无法保存', 'refused') }
+      const superPinLifetime = new AbortController()
+      const superPinUrl = 'api/dsh-session-top.super-pins'
+      const superPinFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null
+      let superPinQueue = Promise.resolve()
+      disposers.push(() => superPinLifetime.abort())
+
+      const acceptAbsolutePins = (ids, localOnly) => {
+        const cached = readAbsolutePins()
+        absolutePins.clear()
+        for (const id of ids) absolutePins.add(id)
+        if (cached.size !== absolutePins.size || ids.some(id => !cached.has(id))) {
+          try { globalThis.localStorage?.setItem?.(ABSOLUTE_STORAGE_KEY, JSON.stringify(ids)) }
+          catch { if (localOnly) surfaceError('超级置顶状态无法保存', 'refused') }
         }
+        scheduleReconcile()
+      }
+      const requestAbsolutePins = async change => {
+        const response = await superPinFetch(superPinUrl, {
+          signal: AbortSignal.any([superPinLifetime.signal, AbortSignal.timeout(6000)]),
+          ...(change === null ? { cache: 'no-store' } : {
+            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(change),
+          }),
+        })
+        if (response.status === 404 || response.status === 405 || response.status === 501) return null
+        if (!response.ok) throw new Error('HTTP ' + response.status)
+        const result = await response.json()
+        if (!Array.isArray(result?.ids) || typeof result.initialized !== 'boolean') {
+          throw new Error('Invalid super pin response')
+        }
+        return result
+      }
+      const updateAbsolutePins = change => {
+        const applyLocal = () => {
+          if (change === null) return
+          const latest = readAbsolutePins()
+          for (const id of change.ids) {
+            if (change.want) latest.add(id)
+            else latest.delete(id)
+          }
+          acceptAbsolutePins([...latest], true)
+        }
+        if (superPinFetch === null) {
+          applyLocal()
+          return Promise.resolve()
+        }
+        const run = superPinQueue.then(async () => {
+          if (!alive()) return
+          let result = await requestAbsolutePins(change)
+          if (!alive()) return
+          if (result === null) {
+            applyLocal()
+            return
+          }
+          if (change === null && !result.initialized && absolutePins.size > 0) {
+            result = await requestAbsolutePins({ import: true, ids: [...absolutePins] })
+          }
+          if (alive() && result !== null) acceptAbsolutePins(result.ids, false)
+        }).catch(error => {
+          if (alive() && change !== null) surfaceError('超级置顶状态无法保存：' + describeError(error), 'refused')
+        })
+        superPinQueue = run
+        return run
+      }
+      const syncAbsolutePins = () => { void updateAbsolutePins(null) }
+      const forgetAbsolutePins = ids => {
+        if (ids.length > 0) void updateAbsolutePins({ ids, want: false })
       }
       let previousPins = null
       const refreshAbsolutePins = () => {
@@ -2988,16 +3045,7 @@ window.__ModuleLoader__.load({
             return
           }
         }
-        // Merge with another window before writing this local priority.
-        const latest = readAbsolutePins()
-        if (want) latest.add(id)
-        else latest.delete(id)
-        try {
-          globalThis.localStorage?.setItem?.(ABSOLUTE_STORAGE_KEY, JSON.stringify([...latest]))
-        } catch { surfaceError('绝对置顶顺序无法保存，当前窗口仍可使用', 'refused') }
-        absolutePins.clear()
-        for (const one of latest) absolutePins.add(one)
-        scheduleReconcile()
+        await updateAbsolutePins({ ids: [id], want })
       }
 
       const paintAbsoluteControl = (row, id) => {
@@ -6941,6 +6989,11 @@ window.__ModuleLoader__.load({
         // repainting rows for a generation that no longer exists.
         window.addEventListener('storage', onRowColorsStorage)
         disposers.push(() => { window.removeEventListener('storage', onRowColorsStorage) })
+        if (superPinFetch !== null) {
+          syncAbsolutePins()
+          window.addEventListener('focus', syncAbsolutePins)
+          disposers.push(() => { window.removeEventListener('focus', syncAbsolutePins) })
+        }
 
         scheduleReconcile()
 

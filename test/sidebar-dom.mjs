@@ -15,7 +15,9 @@
  * Run: node test/sidebar-dom.mjs
  */
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { superPinRoute } from '../src/super-pins.js'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -1112,6 +1114,7 @@ async function runBundle(scaffold, {
   slots = undefined,
   // Optional right-column services; the shipped bundle must also work without them.
   rightSidebar = {},
+  fetch,
 } = {}) {
   // The previous generation goes first, so its bundle can no longer arm
   // anything into the set this run is about to start counting.
@@ -1211,6 +1214,7 @@ async function runBundle(scaffold, {
     dispatchEvent: () => {},
   }
   globalThis.window = {
+    fetch,
     addEventListener: addWindowListener,
     removeEventListener: removeWindowListener,
     dispatchEvent: () => false,
@@ -1662,6 +1666,53 @@ for (const makeScaffold of [officialScaffold, codexScaffold]) {
   assert.equal(row.querySelector('[data-stp-pin-button]'), null, 'the row carries no inline ordinary-pin control')
   run.dispose()
   console.log('✔ pins: idle recency, separate super group and demotion')
+}
+
+// Changing the Web origin and restarting the Host leave the tier intact.
+{
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-super-pins-'))
+  const path = join(directory, 'super-pins.json')
+  const registry = { pinnedSessionIds: [S1, S2] }
+  const mountAt = async (port, seed) => {
+    const router = superPinRoute(path, () => registry)
+    const sc = officialScaffold()
+    const fetch = (url, init) => router.fetch(new Request(new URL(url, 'http://127.0.0.1:' + port), init))
+    const run = await runBundle(sc, { pinned: [...registry.pinnedSessionIds], storageSeed: seed, fetch })
+    await settle()
+    const row = id => sc.body.querySelector('[data-stp-session="' + id + '"]')
+    return { run, fetch, tier: id => row(id).parentElement.getAttribute('data-stp-tier') ?? 'ordinary',
+      toggle: id => row(id).querySelector('[data-stp-absolute-button]').click() }
+  }
+  try {
+    const old = await mountAt(12345, { [absoluteKey]: JSON.stringify([S1, S9]) })
+    assert.equal(old.tier(S1), 'absolute')
+    old.run.dispose()
+    const fresh = await mountAt(54321)
+    assert.equal(fresh.tier(S1), 'absolute', 'new origin reads the migrated tier from disk')
+    assert.equal(fresh.tier(S2), 'ordinary')
+    const request = (ids, want) => fresh.fetch('api/dsh-session-top.super-pins', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ids, want }),
+    })
+    assert.equal((await request([S9], true)).status, 409)
+    const results = await Promise.all([request([S2], true), request([S1], false)])
+    assert.deepEqual(results.map(response => response.status), [200, 200])
+    assert.deepEqual(await (await fresh.fetch('api/dsh-session-top.super-pins')).json(), { ids: [S2], initialized: true })
+    fresh.run.dispose()
+    const stale = await mountAt(12345, { [absoluteKey]: JSON.stringify([S1]) })
+    assert.equal(stale.tier(S1), 'ordinary', 'stale local data cannot undo a saved demotion')
+    assert.equal(stale.tier(S2), 'absolute')
+    stale.toggle(S2)
+    await settle()
+    assert.equal(stale.tier(S2), 'ordinary')
+    stale.run.dispose()
+    const again = await mountAt(54322, { [absoluteKey]: JSON.stringify([S1, S2]) })
+    assert.equal(again.tier(S1), 'ordinary')
+    assert.equal(again.tier(S2), 'ordinary', 'a saved empty list survives the next origin')
+    again.run.dispose()
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+  console.log('✔ super pins: Host restart, new origins, migration and demotion')
 }
 
 // Dragging a pinned row uses its own tier and survives reload.
