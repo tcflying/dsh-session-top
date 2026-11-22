@@ -1664,6 +1664,40 @@ for (const makeScaffold of [officialScaffold, codexScaffold]) {
   console.log('✔ pins: idle recency, separate super group and demotion')
 }
 
+// Dragging a pinned row uses its own tier and survives reload.
+{
+  const sc = officialScaffold()
+  const fixture = newStorageFixture()
+  const run = await runBundle(sc, { pinned: [S1, S2], mutable: true, storageFixture: fixture })
+  const first = sc.body.querySelector(`[data-stp-session="${S1}"]`)
+  const second = sc.body.querySelector(`[data-stp-session="${S2}"]`)
+  const transfer = { setData() {} }
+  const dragEvent = (type, row, clientY = 0) =>
+    row.dispatch(type, { clientY, dataTransfer: transfer }, { bubble: true })
+  first._rect = { top: 10, height: 30 }
+  assert.equal(second.getAttribute('draggable'), 'true')
+  dragEvent('dragstart', second)
+  assert.equal(dragEvent('dragover', first, 14).defaultPrevented, true)
+  dragEvent('drop', first, 14)
+  await settle()
+  assert.deepEqual(idsInRegion(sc), [S2, S1])
+  run.dispose()
+
+  const reloaded = officialScaffold()
+  const restored = await runBundle(reloaded, { pinned: [S1, S2], mutable: true, storageFixture: fixture })
+  assert.deepEqual(idsInRegion(reloaded), [S2, S1])
+  const priority = reloaded.body.querySelector(`[data-stp-session="${S1}"]`)
+  const ordinary = reloaded.body.querySelector(`[data-stp-session="${S2}"]`)
+  priority.querySelector('[data-stp-absolute-button]').click()
+  await settle()
+  dragEvent('dragstart', ordinary)
+  assert.equal(dragEvent('dragover', priority).defaultPrevented, false)
+  dragEvent('drop', priority)
+  assert.equal(priority.parentElement.getAttribute('data-stp-tier'), 'absolute')
+  restored.dispose()
+  console.log('✔ pinned drag: persists order and rejects cross-tier drops')
+}
+
 // The ordinary pin control is no longer IN the row: it cost 24px in a 186px
 // strip, and the row's title is what the user reads. Ordinary pinning is a
 // menu action now — so THIS is where the tier bookkeeping has to be proven:
@@ -4965,6 +4999,11 @@ function rightClickAt(run, target, x, y) {
     labels.filter(label => label === '置顶' || label === '取消置顶').length, 1,
     'the host already carries Pin/Unpin — a second copy is a duplicate action',
   )
+  assert.equal(labels.filter(label => label === '超级置顶').length, 1)
+  hostMenu.querySelector('[data-stp-stock-tier-item]').click()
+  await settle()
+  assert.equal(own.parentElement.getAttribute('data-stp-tier'), 'absolute')
+  assert.deepEqual(run.pinCalls, [], 'promotion preserves the existing official pin')
 
   // Position. The hidden official row sits at y≈420; the user clicked y=96 on
   // the pinned region at the top. The host puts the menu at the anchor it

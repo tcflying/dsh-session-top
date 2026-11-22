@@ -720,12 +720,14 @@ window.__ModuleLoader__.load({
 
     // A local priority within the official durable pin set, never a second pin set.
     const ABSOLUTE_STORAGE_KEY = 'dsh-session-top:absolute-pins'
-    function readAbsolutePins() {
+    const PIN_ORDER_STORAGE_KEY = 'dsh-session-top:pin-order'
+    function readStoredSessionIds(key) {
       try {
-        const value = JSON.parse(globalThis.localStorage?.getItem?.(ABSOLUTE_STORAGE_KEY) ?? '[]')
-        return new Set(Array.isArray(value) ? value.filter(id => typeof id === 'string') : [])
-      } catch { return new Set() }
+        const value = JSON.parse(globalThis.localStorage?.getItem?.(key) ?? '[]')
+        return Array.isArray(value) ? [...new Set(value.filter(id => typeof id === 'string'))] : []
+      } catch { return [] }
     }
+    const readAbsolutePins = () => new Set(readStoredSessionIds(ABSOLUTE_STORAGE_KEY))
 
     // ------------------------------------------------------- row colours
 
@@ -962,6 +964,8 @@ window.__ModuleLoader__.load({
   outline: none;
 }
 [data-stp-row][aria-current='true'] { background: var(--stp-token-hover, rgba(127,127,127,.16)); }
+[data-stp-row][data-stp-drop='before'] { box-shadow: inset 0 2px Highlight; }
+[data-stp-row][data-stp-drop='after'] { box-shadow: inset 0 -2px Highlight; }
 /* A colour the user picked for one session. MIXED, never opaque: the host's own
    text token and its own hover/selected surfaces stay readable on top of it, and
    hover / focus / active each keep their own mix rather than painting it over.
@@ -2919,6 +2923,8 @@ window.__ModuleLoader__.load({
       let runtimePhase = 'loading'
       let summaryEl = null
       let visibleSessions = []
+      let pinOrder = readStoredSessionIds(PIN_ORDER_STORAGE_KEY)
+      let draggedPin = null
       const runtimeRows = new Set()
       const absoluteRows = new Set()
       let latestPromptId
@@ -2956,7 +2962,9 @@ window.__ModuleLoader__.load({
         const editing = renameEdit?.row.hasAttribute('data-stp-row') ? [renameEdit.id] : []
         const pinned = [...new Set([...pinSet(), ...editing])]
         const promptTime = id => byId[id]?.updatedAt ?? byId[id]?.createdAt ?? 0
-        pinned.sort((a, b) => promptTime(b) - promptTime(a))
+        const positions = new Map(pinOrder.map((id, index) => [id, index]))
+        const positionOf = id => positions.get(id) ?? Number.MAX_SAFE_INTEGER
+        pinned.sort((a, b) => positionOf(a) - positionOf(b) || promptTime(b) - promptTime(a))
         if (latestPromptId !== undefined && Object.hasOwn(byId, latestPromptId)
           && byId[latestPromptId]?.origin !== 'subagent') {
           const position = pinned.indexOf(latestPromptId)
@@ -3016,6 +3024,9 @@ window.__ModuleLoader__.load({
         }
         absoluteRows.add(row)
         const pinned = pinSet().has(id)
+        if (row.hasAttribute('data-stp-row') && row.getAttribute('draggable') !== String(pinned && renameEdit?.row !== row)) {
+          row.setAttribute('draggable', String(pinned && renameEdit?.row !== row))
+        }
         const fixed = absolutePins.has(id) && pinned
         const label = fixed ? '取消超级置顶（保留普通置顶）' : '超级置顶'
         if (button.getAttribute('aria-label') !== label) button.setAttribute('aria-label', label)
@@ -3297,6 +3308,9 @@ window.__ModuleLoader__.load({
         if (regionEl === null) {
           regionEl = document.createElement('div')
           regionEl.setAttribute('data-stp-region', '')
+          for (const type of ['dragstart', 'dragover', 'dragleave', 'drop', 'dragend']) {
+            regionEl.addEventListener(type, onPinnedDrag)
+          }
         }
         if (anchorEl === null) {
           anchorEl = document.createElement('div')
@@ -3599,6 +3613,11 @@ window.__ModuleLoader__.load({
        */
       const onRowColorsStorage = (event) => {
         if (!alive()) return
+        if (event?.key === PIN_ORDER_STORAGE_KEY || event?.key === null) {
+          pinOrder = readStoredSessionIds(PIN_ORDER_STORAGE_KEY)
+          scheduleReconcile()
+          if (event.key !== null) return
+        }
         if (event?.key === ABSOLUTE_STORAGE_KEY || event?.key === null) {
           const latest = readAbsolutePins()
           absolutePins.clear()
@@ -4116,6 +4135,59 @@ window.__ModuleLoader__.load({
        * @param {boolean} selected - whether this is the retained session.
        * @returns {Element} the row element.
        */
+      const onPinnedDrag = event => {
+        if (!alive()) return
+        if (event.type === 'dragend') {
+          draggedPin = null
+          regionEl.querySelector('[data-stp-drop]')?.removeAttribute('data-stp-drop')
+          return
+        }
+        const row = event.target?.closest?.('[data-stp-row]')
+        if (!row) return
+        const id = row.getAttribute('data-stp-session')
+        const pinned = pinSet()
+        if (event.type === 'dragstart') {
+          if (!pinned.has(id) || renameEdit?.row === row
+            || event.target.closest('[data-stp-absolute-button], [data-stp-row-color], input')) {
+            event.preventDefault()
+            return
+          }
+          if (!event.dataTransfer) return
+          // Firefox requires data to be set before it will start a native drag.
+          event.dataTransfer.setData('application/x-dsh-session-top', id)
+          event.dataTransfer.effectAllowed = 'move'
+          draggedPin = row
+          return
+        }
+        if (event.type === 'dragleave') {
+          if (!row.contains(event.relatedTarget)) row.removeAttribute('data-stp-drop')
+          return
+        }
+        if (draggedPin === null || draggedPin === row || draggedPin.parentElement !== row.parentElement) return
+        const sourceId = draggedPin.getAttribute('data-stp-session')
+        if (!pinned.has(id) || !pinned.has(sourceId)) return
+        event.preventDefault()
+        const rect = row.getBoundingClientRect()
+        const after = event.clientY >= rect.top + rect.height / 2
+        if (event.type === 'dragover') {
+          if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
+          row.setAttribute('data-stp-drop', after ? 'after' : 'before')
+          return
+        }
+        event.stopPropagation()
+        row.removeAttribute('data-stp-drop')
+        draggedPin = null
+        const tier = isAbsoluteRow(id)
+        const order = visibleSessions.filter(one => pinned.has(one) && isAbsoluteRow(one) === tier)
+        order.splice(order.indexOf(sourceId), 1)
+        order.splice(order.indexOf(id) + Number(after), 0, sourceId)
+        pinOrder = [...pinOrder.filter(one => pinned.has(one) && !order.includes(one)), ...order]
+        if (order.includes(latestPromptId)) latestPromptId = undefined
+        try { globalThis.localStorage?.setItem?.(PIN_ORDER_STORAGE_KEY, JSON.stringify(pinOrder)) }
+        catch { surfaceError('会话顺序无法保存，当前窗口仍可使用', 'refused') }
+        scheduleReconcile()
+      }
+
       const makeRow = (id, summary, selected) => {
         const { title, time } = rowFields(id, summary)
 
@@ -6448,6 +6520,7 @@ window.__ModuleLoader__.load({
         releaseTimer(tx.settle)
         tx.watch = null
         tx.settle = null
+        tx.tierItem?.remove()
         try {
           tx.restore?.()
         } catch (error) {
@@ -6460,6 +6533,34 @@ window.__ModuleLoader__.load({
         }
       }
 
+      const extendOfficialPinMenu = tx => {
+        if (!tx.menusBefore || !officialMenuOpenOn(tx.row)) return
+        const opened = [...document.querySelectorAll('[role="menu"]')].filter(menu => !tx.menusBefore.has(menu))
+        if (opened.length !== 1) return
+        const items = [...opened[0].querySelectorAll('button[role="menuitem"]')]
+        if (items.length === 0) return
+        tx.menusBefore = null
+        const superPinned = absolutePins.has(tx.id)
+        const label = superPinned ? '取消超级置顶（保留普通置顶）' : '超级置顶'
+        if (items.some(item => item.textContent.trim() === label)) return
+        const first = items[0]
+        const item = document.createElement('button')
+        item.type = 'button'
+        item.className = first.className
+        item.setAttribute('role', 'menuitem')
+        item.setAttribute('tabindex', '-1')
+        item.setAttribute('data-stp-stock-tier-item', '')
+        item.textContent = label
+        item.addEventListener('click', event => {
+          event.stopPropagation()
+          if (officialAnchor !== tx || !pinSet().has(tx.id)) return
+          tx.button.click()
+          void toggleAbsolutePin(tx.id, !superPinned)
+        })
+        first.parentElement.insertBefore(item, first.nextElementSibling)
+        tx.tierItem = item
+      }
+
       /** Watch for the host menu closing, then hand the row back. */
       const watchOfficialMenu = (tx) => {
         const poll = () => {
@@ -6469,6 +6570,7 @@ window.__ModuleLoader__.load({
             restoreOfficialAnchor()
             return
           }
+          extendOfficialPinMenu(tx)
           tx.watch = ownTimer(setTimeout(poll, OFFICIAL_MENU_POLL_MS))
         }
         tx.watch = ownTimer(setTimeout(poll, OFFICIAL_MENU_POLL_MS))
@@ -6519,7 +6621,8 @@ window.__ModuleLoader__.load({
         // One transaction at a time: a second gesture releases the first, and a
         // release puts back both the styled row and any group opened for it.
         restoreOfficialAnchor()
-        const tx = { row, restore: null, refold: null, watch: null, settle: null, openedAt: Date.now() }
+        const menusBefore = pinSet().has(id) ? new Set(document.querySelectorAll('[role="menu"]')) : null
+        const tx = { row, id, button: control.button, menusBefore, restore: null, refold: null, watch: null, settle: null, openedAt: Date.now() }
         if (pointerOutsideRow(row, x, y) === true) {
           tx.restore = anchorRowAtPointer(row, control.actions, control.button, x, y)
         }
@@ -6531,6 +6634,7 @@ window.__ModuleLoader__.load({
           restoreOfficialAnchor()
           return false
         }
+        extendOfficialPinMenu(tx)
         watchOfficialMenu(tx)
         return true
       }
